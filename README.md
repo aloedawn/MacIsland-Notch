@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/insta
 curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/install.sh | bash -s -- --uninstall
 ```
 
-Restores the files and preference values saved before the first install, including an existing MacIsland installation. It preserves unrelated files and settings. Keep `~/Library/MacIsland/notch-backup` until removal. Removal also works after an OS update and does not re-enable SIP or AMFI.
+Restores the files and preference values saved before the first install, including an existing MacIsland installation. It preserves unrelated files and settings. A small `~/Library/MacIsland/installer.lock` file remains so concurrent installer runs keep sharing the same lock. Keep `~/Library/MacIsland/notch-backup` until removal. Removal also works after an OS update and does not re-enable SIP or AMFI.
 
 ## Scope and validation
 

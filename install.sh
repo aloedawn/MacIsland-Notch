@@ -640,7 +640,6 @@ static BOOL nativeModifierEnabled(id modifier);
 @property(nonatomic) CGPoint nativePosition;
 @property(nonatomic) BOOL expandedFill;
 @property(nonatomic, strong) NSMutableArray *radiusModifiers;
-@property(nonatomic, strong) id nativeMaskGroup;
 @property(nonatomic, strong) id nativeMaskSize;
 - (instancetype)initWithLayer:(CALayer *)layer;
 - (void)refresh;
@@ -1014,7 +1013,6 @@ static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     if (observer.nativeMaskSize && originalRemovePresentationModifier)
         originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), observer.nativeMaskSize);
     observer.nativeMaskSize = nil;
-    observer.nativeMaskGroup = nil;
     for (id group in observer.nativeMaskGroups) {
         @synchronized(group) { [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) removeObject:observer]; }
     }
@@ -1024,6 +1022,7 @@ static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
 static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     if (!observer.applied || !originalAddPresentationModifier) return;
     id size = nil;
+    NSMutableArray *groups = [NSMutableArray array];
     for (id modifier in nativeModifierObject(observer.source, @"presentationModifiers")) {
         if (!nativeModifierEnabled(modifier)) continue;
         NSString *key = nativeModifierObject(modifier, @"keyPath");
@@ -1031,9 +1030,15 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         bindNativeGeometryModifier(observer, modifier);
         id group = nativeModifierObject(modifier, @"group");
         if (!group || !([key isEqual:@"bounds.size"] || [key isEqual:@"position"] || [key isEqual:@"anchorPoint"])) continue;
-        if (!observer.nativeMaskGroups) observer.nativeMaskGroups = [NSMutableArray array];
+        if (![groups containsObject:group]) [groups addObject:group];
+    }
+    for (id group in observer.nativeMaskGroups) {
+        if (![groups containsObject:group]) {
+            @synchronized(group) { [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) removeObject:observer]; }
+        }
+    }
+    for (id group in groups) {
         if (![observer.nativeMaskGroups containsObject:group]) {
-            [observer.nativeMaskGroups addObject:group];
             @synchronized(group) {
                 NSHashTable *observers = objc_getAssociatedObject(group, &nativeMaskGroupObserversKey);
                 if (!observers) {
@@ -1044,17 +1049,18 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
             }
         }
     }
+    observer.nativeMaskGroups = groups;
     if (size == observer.nativeMaskSize) return;
     if (observer.nativeMaskSize)
         originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), observer.nativeMaskSize);
     observer.nativeMaskSize = size;
-    observer.nativeMaskGroup = nativeModifierObject(size, @"group");
     if (size) originalAddPresentationModifier(observer.shapeMask, NSSelectorFromString(@"addPresentationModifier:"), size);
 }
 static _Thread_local NSUInteger nativeGroupFlushDepth;
-static void refreshNativeGroupMasks(id group) {
-    NSArray *observers;
-    @synchronized(group) { observers = [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) allObjects]; }
+static NSArray *nativeGroupMaskObservers(id group) {
+    @synchronized(group) { return [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) allObjects]; }
+}
+static void refreshNativeGroupMasks(NSArray *observers) {
     for (MacIslandNativeMaskObserver *observer in observers) [observer refreshMask];
 }
 static void installNativeGroupFlushHooks(void) {
@@ -1065,9 +1071,12 @@ static void installNativeGroupFlushHooks(void) {
         void (*previous)(id, SEL) = (void *)method_getImplementation(method);
         SEL selector = NSSelectorFromString(name);
         method_setImplementation(method, imp_implementationWithBlock(^(id group) {
-            if (nativeGroupFlushDepth++) { previous(group, selector); nativeGroupFlushDepth--; return; }
+            if (nativeGroupFlushDepth) { previous(group, selector); return; }
+            NSArray *observers = nativeGroupMaskObservers(group);
+            if (!observers.count) { previous(group, selector); return; }
+            nativeGroupFlushDepth++;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            refreshNativeGroupMasks(group);
+            refreshNativeGroupMasks(observers);
             previous(group, selector);
             [CATransaction commit]; nativeGroupFlushDepth--;
         }));
@@ -1078,9 +1087,12 @@ static void installNativeGroupFlushHooks(void) {
         void (*previous)(id, SEL, double) = (void *)method_getImplementation(method);
         SEL selector = NSSelectorFromString(name);
         method_setImplementation(method, imp_implementationWithBlock(^(id group, double time) {
-            if (nativeGroupFlushDepth++) { previous(group, selector, time); nativeGroupFlushDepth--; return; }
+            if (nativeGroupFlushDepth) { previous(group, selector, time); return; }
+            NSArray *observers = nativeGroupMaskObservers(group);
+            if (!observers.count) { previous(group, selector, time); return; }
+            nativeGroupFlushDepth++;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
-            refreshNativeGroupMasks(group);
+            refreshNativeGroupMasks(observers);
             previous(group, selector, time);
             [CATransaction commit]; nativeGroupFlushDepth--;
         }));
@@ -1388,17 +1400,14 @@ def install():
         agent = {
             'Label': 'com.macisland.loader',
             'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py')],
-            'RunAtLoad': True,
+            'RunAtLoad': False,
             'StandardOutPath': str(ROOT / 'loader.log'),
             'StandardErrorPath': str(ROOT / 'loader-error.log'),
         }
-        (SOURCE / 'agent.plist').write_bytes(plistlib.dumps(agent))
-        replace_file(SOURCE / 'agent.plist', AGENT, 0o644)
         for domain, key, value in PREFERENCES:
             write_preference(domain, key, {'present': True, 'value': value})
         run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
         # Bootstrap without RunAtLoad so injection can be checked synchronously.
-        agent['RunAtLoad'] = False
         (SOURCE / 'agent.plist').write_bytes(plistlib.dumps(agent))
         replace_file(SOURCE / 'agent.plist', AGENT, 0o644)
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
@@ -1416,23 +1425,18 @@ def install():
 
 
 def main():
-    if MODE == '--uninstall' and not STATE.is_file():
-        raise RuntimeError('No MacIsland Notch backup found; existing MacIsland files were left untouched')
     ROOT.mkdir(parents=True, exist_ok=True)
     lock_path = ROOT / 'installer.lock'
-    with lock_path.open('w') as lock:
+    # Keep this inode stable, including after removal, for concurrent waiters.
+    with lock_path.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if MODE == '--uninstall':
+            if not STATE.is_file():
+                raise RuntimeError('No MacIsland Notch backup found; existing MacIsland files were left untouched')
             restore_original(plistlib.loads(STATE.read_bytes()))
             print('Removed MacIsland Notch; restored the saved pre-install files and preferences.')
         else:
             install()
-    lock_path.unlink(missing_ok=True)
-    if MODE == '--uninstall':
-        try:
-            ROOT.rmdir()
-        except OSError:
-            pass  # Preserve unrelated or pre-existing files.
 
 
 if __name__ == '__main__':
