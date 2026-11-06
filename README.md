@@ -7,7 +7,7 @@ Enable Apple’s native Dynamic Island and adapt its background to a MacBook’s
 - Apple Silicon MacBook with a notch.
 - **macOS 27.3 beta, build `26C5035r`**. Other builds are rejected.
 - Xcode Command Line Tools and an active desktop login.
-- SIP already disabled and `amfi_get_out_of_my_way=0x1` active in the running boot. These reduce macOS protections; the installer does not change either setting.
+- SIP already disabled. The broad `amfi_get_out_of_my_way=0x1` boot argument is **not required**. SIP being disabled still reduces macOS protections; the installer does not change SIP or boot arguments.
 
 ## Install
 
@@ -19,7 +19,15 @@ curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/insta
 
 The installer contains all source, builds and signs the patch locally, saves existing MacIsland files and the three affected preferences, then reloads MenuBarAgent. It installs to `~/Library/MacIsland` and reuses `com.macisland.loader` for login injection. Existing MacIsland installations are supported; the original backup is retained across reinstalls.
 
-The loader temporarily sets `DYLD_INSERT_LIBRARIES`, waits for the new MenuBarAgent PID, and restores the previous launch environment. It runs once at login; it does not continuously restart a crashing process. Logs are `~/Library/MacIsland/loader.log` and `loader-error.log`.
+With the AMFI-disable flag absent, the loader requests a suspended MenuBarAgent launch, briefly attaches the system LLDB, and detaches to resume it. It verifies that `island.dylib` is mapped in the new process; a running PID alone is not treated as success. The launch environment is restored immediately after spawning the process. On debugger or load failure, the loader terminates the suspended instance and requests a normal restart. It refuses to restart MenuBarAgent while another debugger is attached.
+
+Existing boots with `amfi_get_out_of_my_way=1` or `=0x1` retain the legacy loading path. That flag can prevent Karabiner's DriverKit extension from loading; this installer does not remove it or reboot the Mac. If removing it separately, preserve any unrelated boot arguments and restart before testing.
+
+The loader runs once at login; it does not continuously restart a crashing process. No debugger remains running after injection. Logs are `~/Library/MacIsland/loader.log` and `loader-error.log`. Inspect the current boot and selected strategy without reloading MenuBarAgent:
+
+```bash
+/usr/bin/python3 ~/Library/MacIsland/loader.py --status
+```
 
 Build without installing or changing preferences:
 
@@ -39,7 +47,13 @@ Restores the files and preference values saved before the first install, includi
 
 The native implementation changes NSScreen’s CenterHUD geometry, both shared FBS scene-layout families, and the existing native background masks. Vector paths update within native presentation-modifier transactions; no independent enlargement animation, black filler, extra visual sibling, or system-binary replacement is added.
 
-Tested on a notched MacBook running `26C5035r`, with music visible and user confirmation of the hover/shrink-back outline correction. Local native regression checks covered modifier capacity, vector curves, pixel alignment, repeat-safe layout updates, and restoration. Full provider coverage is not established: some expanded AirDrop artwork/icons may still enter the physical notch; a complete provider-root safe-area remap remains unfinished. Other Macs, OS builds, and all transient UI states are unverified.
+Tested on a notched MacBook running `26C5035r`, with music visible and user confirmation of the hover/shrink-back outline correction. A real reboot with empty boot arguments and SIP still disabled verified automatic patch loading, healthy Karabiner virtual HID readiness, and user-confirmed Dynamic Island display. This establishes coexistence on the tested machine; it does not prove that debugger attachment is necessary on every startup. Local native regression checks covered modifier capacity, vector curves, pixel alignment, repeat-safe layout updates, and restoration. Full provider coverage is not established: some expanded AirDrop artwork/icons may still enter the physical notch; a complete provider-root safe-area remap remains unfinished. Other Macs, OS builds, and all transient UI states are unverified.
+
+The embedded loader has regression checks for AMFI-enabled strategy selection, preserving the prior launch environment, refusing an already-debugged process, verifying the actual library mapping, and recovering from debugger/load failure:
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ## Credits
 

@@ -28,8 +28,8 @@ if [[ "$MODE" != --uninstall ]]; then
     csrutil status | grep -q 'status: disabled' || {
       echo "SIP must already be disabled; no protection settings were changed." >&2; exit 1;
     }
-    sysctl -n kern.bootargs | grep -Eq '(^|[[:space:]])amfi_get_out_of_my_way=0x1([[:space:]]|$)' || {
-      echo "The running boot requires amfi_get_out_of_my_way=0x1; no boot settings were changed." >&2; exit 1;
+    /usr/bin/xcrun --find lldb >/dev/null 2>&1 || {
+      echo "The AMFI-compatible loader requires LLDB in the selected developer tools." >&2; exit 1;
     }
   fi
 
@@ -1177,11 +1177,14 @@ MACISLAND_MASK_M
   cat > "$SCRATCH/loader.py" <<'MACISLAND_LOADER_PY'
 """Inject the Dynamic Island interposer into the next MenuBarAgent process."""
 
+import argparse
+from contextlib import contextmanager
 import fcntl
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 
 
@@ -1201,7 +1204,7 @@ def menu_bar_agent_pid():
     return int(match.group(1)) if match else None
 
 
-def main():
+def legacy_main():
     library_path = Path(LIBRARY)
     if not library_path.is_file():
         raise RuntimeError("Missing island.dylib; no launch environment changed")
@@ -1254,10 +1257,142 @@ def main():
             print("Prior launch environment restored", flush=True)
 
 
+def current_boot_arguments():
+    # NVRAM describes the next boot; kern.bootargs describes this process's OS.
+    return subprocess.check_output(
+        ["/usr/sbin/sysctl", "-n", "kern.bootargs"], text=True
+    ).strip()
+
+
+@contextmanager
+def temporary_launch_environment(library_path):
+    domain = subprocess.check_output(
+        [LAUNCHCTL, "print", f"gui/{os.getuid()}"], text=True
+    )
+    environment = re.search(
+        r"^\tenvironment = \{\n(.*?)^\t\}", domain, re.MULTILINE | re.DOTALL
+    )
+    if environment is None:
+        raise RuntimeError("Cannot establish prior launch environment")
+    prior = re.search(
+        rf"^\t\t{re.escape(ENVIRONMENT_KEY)} => (.*)$",
+        environment.group(1), re.MULTILINE,
+    )
+    old_value = prior.group(1) if prior else None
+    value = f"{old_value}:{library_path}" if old_value else str(library_path)
+    try:
+        subprocess.run([LAUNCHCTL, "setenv", ENVIRONMENT_KEY, value], check=True)
+        yield
+    finally:
+        restore = (["unsetenv", ENVIRONMENT_KEY] if old_value is None else
+                   ["setenv", ENVIRONMENT_KEY, old_value])
+        subprocess.run([LAUNCHCTL, *restore], check=True)
+
+
+def debugger_load(service, library_path, lldb, *, timeout=30):
+    """Request a suspended launch, attach briefly, and verify the loaded library."""
+    if any(c in str(library_path) for c in "\n\r\0"):
+        raise ValueError("Invalid library path")
+    launched = False
+    try:
+        # Like the installed loader, stage the variable only until launchd has
+        # spawned the target. Restore it before waiting for debugger attachment.
+        # kickstart -s works as the service owner; launchctl debug needs root.
+        with temporary_launch_environment(library_path):
+            result = subprocess.run(
+                [LAUNCHCTL, "kickstart", "-k", "-p", "-s", service], check=True,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            launched = True
+        pid = int(result.stdout.strip())
+        with tempfile.TemporaryDirectory(prefix="macisland-debugger-") as scratch:
+            # Attach to the requested suspended launch and detach to resume it.
+            # Startup timing can vary; verify the mapping rather than assume
+            # attachment occurred before dyld. No debugger remains running.
+            result = subprocess.run(
+                [lldb, "--no-lldbinit", "--batch", "--attach-pid", str(pid),
+                 "--one-line-before-file",
+                 f"settings set symbols.clang-modules-cache-path {scratch}/modules",
+                 "--one-line", "process detach"],
+                check=True, capture_output=True, text=True, timeout=timeout,
+            )
+            print(result.stdout, end="", flush=True)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            mapped = subprocess.run(
+                ["/usr/bin/vmmap", "-w", str(pid)], capture_output=True,
+                text=True, timeout=timeout,
+            )
+            if mapped.returncode == 0 and str(library_path) in mapped.stdout:
+                print(f"Verified injected library in PID {pid}", flush=True)
+                return pid
+            time.sleep(0.2)
+        raise RuntimeError("Process started but injected library was not verified")
+    except BaseException:
+        if launched:
+            # No persistent launch overrides exist. Restart normally if attach
+            # or loading failed, rather than leave a suspended system service.
+            subprocess.run(
+                [LAUNCHCTL, "kill", "SIGKILL", service],
+                capture_output=True, timeout=timeout,
+            )
+            subprocess.run(
+                [LAUNCHCTL, "kickstart", service],
+                capture_output=True, timeout=timeout,
+            )
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--debugger", action="store_true",
+                        help="Force the process-scoped debugger loader")
+    args = parser.parse_args()
+    boot_arguments = current_boot_arguments()
+    globally_disabled = any(
+        token.startswith("amfi_get_out_of_my_way=")
+        and token.split("=", 1)[1] in ("1", "0x1")
+        for token in boot_arguments.split()
+    )
+    lldb = subprocess.check_output(["/usr/bin/xcrun", "--find", "lldb"],
+                                   text=True).strip()
+    if args.status:
+        print(f"AMFI-disable boot flag active: {globally_disabled}")
+        print(f"Selected loader: {'legacy' if globally_disabled and not args.debugger else 'debugger'}")
+        print(f"Debugger: {lldb}")
+        return
+    if globally_disabled and not args.debugger:
+        legacy_main()
+        return
+    library_path = Path(LIBRARY)
+    if not library_path.is_file():
+        raise RuntimeError("Missing island.dylib; service unchanged")
+    sip = subprocess.check_output(["/usr/bin/csrutil", "status"], text=True)
+    if "status: disabled" not in sip:
+        raise RuntimeError("This loader requires existing disabled SIP")
+    with (library_path.parent / "loader.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        pid = menu_bar_agent_pid()
+        if pid:
+            flags = subprocess.check_output(
+                ["/bin/ps", "-p", str(pid), "-o", "flags="], text=True
+            ).strip()
+            if int(flags, 16) & 0x800:  # Darwin P_TRACED
+                raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
+        debugger_load(SERVICE, library_path.resolve(), lldb)
+
+
 if __name__ == "__main__":
     main()
-
 MACISLAND_LOADER_PY
+
+  /usr/bin/python3 - "$SCRATCH/loader.py" <<'MACISLAND_LOADER_CHECK'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+compile(path.read_text(), str(path), 'exec')
+MACISLAND_LOADER_CHECK
 
   echo "Building native notch patch from embedded source..."
   /usr/bin/xcrun clang -arch arm64e -dynamiclib -fobjc-arc -Wall -Wextra -Werror \
@@ -1268,7 +1403,7 @@ MACISLAND_LOADER_PY
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/island.dylib"
   if [[ "$MODE" == --check ]]; then
-    echo "Build and signature check passed. No installation or preference changes."
+    echo "Loader syntax, native build, and signature checks passed. No installation or preference changes."
     exit 0
   fi
 fi
