@@ -129,6 +129,7 @@ static char sceneInsetsKey, originalLayoutPayloadKey;
 static void (*originalMargins)(id, SEL, id), (*originalMinimum)(id, SEL, id), (*originalMaximum)(id, SEL, id);
 static void (*originalHostedMargins)(id, SEL, id), (*originalHostedMinimum)(id, SEL, id), (*originalHostedMaximum)(id, SEL, id);
 static void (*originalObstruction)(id, SEL, id), (*originalSpace)(id, SEL, id), (*originalCorners)(id, SEL, id);
+static void (*originalHostedObstruction)(id, SEL, id), (*originalHostedSpace)(id, SEL, id), (*originalHostedCorners)(id, SEL, id);
 static void (*originalFrame)(id, SEL, CGRect);
 static void (*originalDisplayConfiguration)(id, SEL, id);
 
@@ -140,21 +141,29 @@ static void (*originalDisplayConfiguration)(id, SEL, id);
 @end
 @implementation MacIslandNativeLayout
 @end
-@interface MacIslandSceneInsets : NSObject
-@property(nonatomic, strong) NSArray<MacIslandNativeLayout *> *layouts;
-@property(nonatomic, strong) NSValue *obstruction;
+@interface MacIslandNativeObstruction : NSObject
+@property(nonatomic, strong) NSValue *rect;
 @property(nonatomic, strong) NSValue *space;
-@property(nonatomic) CGRect frame;
 @property(nonatomic, strong) id nativeCorners;
 @property(nonatomic, strong) id rectangularCorners;
 @property(nonatomic) BOOL cornersApplied;
 @property(nonatomic) BOOL obstructionApplied;
+@end
+@implementation MacIslandNativeObstruction
+@end
+@interface MacIslandSceneInsets : NSObject
+@property(nonatomic, strong) NSArray<MacIslandNativeLayout *> *layouts;
+@property(nonatomic, strong) NSArray<MacIslandNativeObstruction *> *obstructions;
+@property(nonatomic) CGRect frame;
 @property(nonatomic) BOOL updating;
 @end
 @implementation MacIslandSceneInsets
 - (instancetype)init {
     self = [super init];
-    if (self) _layouts = @[[MacIslandNativeLayout new], [MacIslandNativeLayout new]];
+    if (self) {
+        _layouts = @[[MacIslandNativeLayout new], [MacIslandNativeLayout new]];
+        _obstructions = @[[MacIslandNativeObstruction new], [MacIslandNativeObstruction new]];
+    }
     return self;
 }
 @end
@@ -210,17 +219,26 @@ static CGRect existingFrame(id settings) {
 static NSString *familySetting(NSUInteger family, NSString *suffix) {
     return [(family ? @"hosted" : @"elementView") stringByAppendingString:suffix];
 }
+static NSString *obstructionSetting(NSUInteger family, NSString *suffix) {
+    return [(family ? @"hostedIntegratedObstruction" : @"integratedObstruction") stringByAppendingString:suffix];
+}
+static NSString *obstructionSetter(NSUInteger family, NSString *suffix) {
+    return [[(family ? @"setHostedIntegratedObstruction" : @"setIntegratedObstruction") stringByAppendingString:suffix] stringByAppendingString:@":"];
+}
 static MacIslandSceneInsets *sceneState(id settings) {
     MacIslandSceneInsets *state = objc_getAssociatedObject(settings, &sceneInsetsKey);
     if (!state) {
         state = [MacIslandSceneInsets new];
         objc_setAssociatedObject(settings, &sceneInsetsKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        id rect = existingObjectSetting(settings, @"integratedObstructionRect");
-        id space = existingObjectSetting(settings, @"integratedObstructionRectCoordinateSpace");
-        state.obstruction = isRectValue(rect) ? rect : nil;
-        state.space = isSizeValue(space) ? space : nil;
+        for (NSUInteger family = 0; family < state.obstructions.count; family++) {
+            MacIslandNativeObstruction *native = state.obstructions[family];
+            id rect = existingObjectSetting(settings, obstructionSetting(family, @"Rect"));
+            id space = existingObjectSetting(settings, obstructionSetting(family, @"RectCoordinateSpace"));
+            native.rect = isRectValue(rect) ? rect : nil;
+            native.space = isSizeValue(space) ? space : nil;
+            native.nativeCorners = existingObjectSetting(settings, obstructionSetting(family, @"CornerRadii"));
+        }
         state.frame = existingFrame(settings);
-        state.nativeCorners = existingObjectSetting(settings, @"integratedObstructionCornerRadii");
     }
     return state;
 }
@@ -330,19 +348,23 @@ static void writeFamily(id settings, NSUInteger family, MacIslandNativeLayout *n
 static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     if (state.updating) return;
     state.updating = YES;
-    NSSize viewport = state.space ? state.space.sizeValue : state.frame.size;
     BOOL displayKnown = NO;
     NSScreen *screen = sceneDisplayScreen(settings, &displayKnown);
-    NSRect nativeRect = state.obstruction ? state.obstruction.rectValue : NSZeroRect;
-    NSRect rect = canonicalObstruction(nativeRect, screen);
-    BOOL correctedObstruction = !NSEqualRects(rect, nativeRect);
-    if (correctedObstruction && originalObstruction)
-        originalObstruction(settings, NSSelectorFromString(@"setIntegratedObstructionRect:"),
-            layoutPayload([NSValue valueWithRect:rect], state.obstruction));
-    else if (state.obstructionApplied && originalObstruction)
-        originalObstruction(settings, NSSelectorFromString(@"setIntegratedObstructionRect:"), state.obstruction);
-    state.obstructionApplied = correctedObstruction;
     BOOL physicalDisplay = !displayKnown || screenHasNotch(screen);
+    NSRect rects[2] = {NSZeroRect, NSZeroRect};
+    for (NSUInteger family = 0; family < state.obstructions.count; family++) {
+        MacIslandNativeObstruction *native = state.obstructions[family];
+        NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
+        NSRect rect = canonicalObstruction(original, screen);
+        rects[family] = rect;
+        void (*setter)(id, SEL, id) = family ? originalHostedObstruction : originalObstruction;
+        BOOL corrected = !NSEqualRects(rect, original);
+        if (corrected && setter)
+            setter(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), layoutPayload([NSValue valueWithRect:rect], native.rect));
+        else if (native.obstructionApplied && setter)
+            setter(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), native.rect);
+        native.obstructionApplied = corrected;
+    }
     for (NSUInteger family = 0; family < state.layouts.count; family++) {
         MacIslandNativeLayout *native = state.layouts[family];
         if (!native.margins) {
@@ -360,12 +382,18 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         // Optional geometry may be absent on early or legacy scene settings.
         // Native size constraints still describe whether the root can extend
         // below the cutout. Use that shared capability until its viewport arrives.
-        NSSize layoutViewport = viewport;
+        // The two native transports carry separate obstruction coordinates.
+        // Fall back to the other transport only when this one is absent;
+        // an explicitly empty rectangle must continue to mean no exclusion.
+        NSUInteger obstructionFamily = state.obstructions[family].rect ? family : 1 - family;
+        MacIslandNativeObstruction *obstruction = state.obstructions[obstructionFamily];
+        NSRect rect = rects[obstructionFamily];
+        NSSize layoutViewport = obstruction.space ? obstruction.space.sizeValue : state.frame.size;
         if (layoutViewport.width <= 0 || layoutViewport.height <= 0) {
             if (native.maximum) layoutViewport = native.maximum.sizeValue;
             else if (native.minimum) layoutViewport = native.minimum.sizeValue;
         }
-        MacIslandNotchAvoidance policy = state.obstruction && physicalDisplay ?
+        MacIslandNotchAvoidance policy = obstruction.rect && physicalDisplay ?
             notchAvoidance(rect, layoutViewport) : (MacIslandNotchAvoidance){0};
         NSData *margins = safeMargins(native.margins, policy);
         BOOL applies = margins != native.margins;
@@ -390,20 +418,24 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         if (applies || native.applied) writeFamily(settings, family, native, margins, minimumValue, maximumValue);
         native.applied = applies;
     }
-    NSSize obstructionExtent = NSMakeSize(MAX(NSMaxX(rect), rect.size.width) + 1,
-                                         MAX(NSMaxY(rect), rect.size.height) + 2);
-    BOOL rectangular = state.obstruction && physicalDisplay &&
-        notchAvoidance(rect, obstructionExtent).physical && originalCorners;
-    if (rectangular && !state.rectangularCorners) {
-        Class factory = NSClassFromString(@"BSCornerRadiusConfiguration");
-        if ([factory instancesRespondToSelector:@selector(initWithCornerRadius:)])
-            state.rectangularCorners = layoutPayload([(id<MacIslandCornerFactory>)[factory alloc] initWithCornerRadius:0], state.nativeCorners);
+    for (NSUInteger family = 0; family < state.obstructions.count; family++) {
+        MacIslandNativeObstruction *native = state.obstructions[family];
+        NSRect rect = rects[family];
+        void (*setter)(id, SEL, id) = family ? originalHostedCorners : originalCorners;
+        NSSize extent = NSMakeSize(MAX(NSMaxX(rect), rect.size.width) + 1,
+                                  MAX(NSMaxY(rect), rect.size.height) + 2);
+        BOOL rectangular = native.rect && physicalDisplay && notchAvoidance(rect, extent).physical && setter;
+        if (rectangular && !native.rectangularCorners) {
+            Class factory = NSClassFromString(@"BSCornerRadiusConfiguration");
+            if ([factory instancesRespondToSelector:@selector(initWithCornerRadius:)])
+                native.rectangularCorners = layoutPayload([(id<MacIslandCornerFactory>)[factory alloc] initWithCornerRadius:0], native.nativeCorners);
+        }
+        if (native.rectangularCorners && rectangular)
+            setter(settings, NSSelectorFromString(obstructionSetter(family, @"CornerRadii")), native.rectangularCorners);
+        else if (native.cornersApplied && setter)
+            setter(settings, NSSelectorFromString(obstructionSetter(family, @"CornerRadii")), native.nativeCorners);
+        native.cornersApplied = rectangular && native.rectangularCorners != nil;
     }
-    if (state.rectangularCorners && rectangular)
-        originalCorners(settings, NSSelectorFromString(@"setIntegratedObstructionCornerRadii:"), state.rectangularCorners);
-    else if (state.cornersApplied && originalCorners)
-        originalCorners(settings, NSSelectorFromString(@"setIntegratedObstructionCornerRadii:"), state.nativeCorners);
-    state.cornersApplied = rectangular && state.rectangularCorners != nil;
     state.updating = NO;
 }
 
@@ -434,27 +466,34 @@ static void setMaximum(id o, SEL s, id v) { setFamilyMaximum(o, s, v, 0); }
 static void setHostedMargins(id o, SEL s, id v) { setFamilyMargins(o, s, v, 1); }
 static void setHostedMinimum(id o, SEL s, id v) { setFamilyMinimum(o, s, v, 1); }
 static void setHostedMaximum(id o, SEL s, id v) { setFamilyMaximum(o, s, v, 1); }
-static void setObstruction(id settings, SEL selector, id value) {
+static void setFamilyObstruction(id settings, SEL selector, id value, NSUInteger family) {
     value = nativePayload(value);
-    originalObstruction(settings, selector, value);
+    (family ? originalHostedObstruction : originalObstruction)(settings, selector, value);
     MacIslandSceneInsets *state = sceneState(settings);
-    state.obstruction = isRectValue(value) ? value : nil;
+    state.obstructions[family].rect = isRectValue(value) ? value : nil;
     refreshSceneInsets(settings, state);
 }
-static void setSpace(id settings, SEL selector, id value) {
-    originalSpace(settings, selector, value);
-    MacIslandSceneInsets *state = sceneState(settings);
-    state.space = isSizeValue(value) ? value : nil;
-    refreshSceneInsets(settings, state);
-}
-static void setCorners(id settings, SEL selector, id value) {
+static void setFamilySpace(id settings, SEL selector, id value, NSUInteger family) {
     value = nativePayload(value);
-    originalCorners(settings, selector, value);
+    (family ? originalHostedSpace : originalSpace)(settings, selector, value);
     MacIslandSceneInsets *state = sceneState(settings);
-    state.nativeCorners = value;
-    state.rectangularCorners = nil;
+    state.obstructions[family].space = isSizeValue(value) ? value : nil;
     refreshSceneInsets(settings, state);
 }
+static void setFamilyCorners(id settings, SEL selector, id value, NSUInteger family) {
+    value = nativePayload(value);
+    (family ? originalHostedCorners : originalCorners)(settings, selector, value);
+    MacIslandSceneInsets *state = sceneState(settings);
+    state.obstructions[family].nativeCorners = value;
+    state.obstructions[family].rectangularCorners = nil;
+    refreshSceneInsets(settings, state);
+}
+static void setObstruction(id o, SEL s, id v) { setFamilyObstruction(o, s, v, 0); }
+static void setSpace(id o, SEL s, id v) { setFamilySpace(o, s, v, 0); }
+static void setCorners(id o, SEL s, id v) { setFamilyCorners(o, s, v, 0); }
+static void setHostedObstruction(id o, SEL s, id v) { setFamilyObstruction(o, s, v, 1); }
+static void setHostedSpace(id o, SEL s, id v) { setFamilySpace(o, s, v, 1); }
+static void setHostedCorners(id o, SEL s, id v) { setFamilyCorners(o, s, v, 1); }
 static void setFrame(id settings, SEL selector, CGRect value) {
     originalFrame(settings, selector, value);
     MacIslandSceneInsets *state = objc_getAssociatedObject(settings, &sceneInsetsKey);
@@ -486,6 +525,9 @@ static BOOL installContentInsetsHooks(void) {
     ready &= replaceObjectSetter(cls, @"setIntegratedObstructionRect:", (IMP)setObstruction, &originalObstruction);
     ready &= replaceObjectSetter(cls, @"setIntegratedObstructionRectCoordinateSpace:", (IMP)setSpace, &originalSpace);
     ready &= replaceObjectSetter(cls, @"setIntegratedObstructionCornerRadii:", (IMP)setCorners, &originalCorners);
+    ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRect:", (IMP)setHostedObstruction, &originalHostedObstruction);
+    ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRectCoordinateSpace:", (IMP)setHostedSpace, &originalHostedSpace);
+    ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionCornerRadii:", (IMP)setHostedCorners, &originalHostedCorners);
     ready &= replaceObjectSetter(cls, @"setDisplayConfiguration:", (IMP)setDisplayConfiguration, &originalDisplayConfiguration);
     if (!originalFrame) {
         Method method = class_getInstanceMethod(cls, NSSelectorFromString(@"setFrame:"));
