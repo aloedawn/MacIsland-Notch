@@ -559,7 +559,7 @@ MACISLAND_SAFEAREA_M
 #include <stdlib.h>
 #include <string.h>
 
-static char maskObserverKey;
+static char maskObserverKey, parentGeometryKey;
 static void (*originalSetCornerRadius)(id, SEL, CGFloat);
 static void (*baseSetBounds)(id, SEL, CGRect);
 static void (*baseSetPosition)(id, SEL, CGPoint);
@@ -670,6 +670,7 @@ static BOOL nativeModifierEnabled(id modifier);
 
 @interface MacIslandNativeMaskObserver : NSObject
 @property(nonatomic, weak) CALayer *source;
+@property(nonatomic, weak) CALayer *observedParent;
 @property(nonatomic, strong) CAShapeLayer *shapeMask;
 @property(nonatomic) CGFloat pixelInset;
 @property(nonatomic, strong) NSMutableArray *geometryModifiers;
@@ -753,6 +754,9 @@ static void observeNativeAnimations(CALayer *layer) {
         _shapeMask.fillColor = NSColor.whiteColor.CGColor;
         _shapeMask.name = @"MacIslandNativeNotchMask";
         _shapeMask.anchorPoint = CGPointZero;
+        // Match the native background: antialias the Bezier contour, not the
+        // mask's rectangular surface edge during fractional native motion.
+        _shapeMask.edgeAntialiasingMask = 0;
         _shapeMask.actions = @{@"path": NSNull.null, @"bounds": NSNull.null, @"position": NSNull.null};
         _keys = @[@"bounds", @"position", @"anchorPoint", @"transform",
                   @"superlayer", @"name", @"backgroundColor", @"shadowColor", @"shadowOpacity", @"masksToBounds", @"mask"];
@@ -768,6 +772,14 @@ static void observeNativeAnimations(CALayer *layer) {
     if (self.updating) return;
     self.updating = YES;
     CALayer *source = self.source;
+    // Native children may settle before their display parent gets its size.
+    // Eligibility must follow that existing parent's layout too.
+    CALayer *parent = source.superlayer;
+    if (parent != self.observedParent) {
+        [self.observedParent removeObserver:self forKeyPath:@"bounds" context:&parentGeometryKey];
+        self.observedParent = parent;
+        [parent addObserver:self forKeyPath:@"bounds" options:0 context:&parentGeometryKey];
+    }
     BOOL ownsMask = source.mask == self.shapeMask;
     BOOL eligible = source && (self.nativeRadius > 0 || self.applied) && isNotchBackground(source) &&
                     (ownsMask || !source.mask);
@@ -860,6 +872,7 @@ static void observeNativeAnimations(CALayer *layer) {
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                        change:(NSDictionary *)change context:(void *)context {
+    if (context == &parentGeometryKey) { [self refresh]; return; }
     if (context != &maskObserverKey) {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
         return;
@@ -874,6 +887,7 @@ static void observeNativeAnimations(CALayer *layer) {
 }
 
 - (void)dealloc {
+    [self.observedParent removeObserver:self forKeyPath:@"bounds" context:&parentGeometryKey];
     removeNativeMaskGeometry(self);
     restoreNativeCornerModifiers(self);
     CALayer *source = _source;
@@ -911,6 +925,7 @@ static id adjustedNativeGeometry(MacIslandGeometryModifierBinding *binding, id v
 static void restoreNativeGeometryModifiers(MacIslandNativeMaskObserver *observer);
 static void (*originalModifierValue)(id, SEL, id);
 static void (*originalModifierValueVelocity)(id, SEL, id, id);
+static void (*originalModifierEnabled)(id, SEL, BOOL);
 static void (*originalAddPresentationModifier)(id, SEL, id);
 static void (*originalSetPresentationModifiers)(id, SEL, id);
 static void (*originalRemovePresentationModifier)(id, SEL, id);
@@ -941,6 +956,15 @@ static void setModifierValueVelocity(id modifier, SEL selector, id value, id vel
     originalModifierValueVelocity(modifier, selector, [binding isKindOfClass:MacIslandGeometryModifierBinding.class] ? adjustedNativeGeometry((id)binding, value) : (notch ? @0 : value), notch ? @0 : velocity);
     modifierWriteDepth--;
 }
+// Native animations can stop by disabling a modifier before removing it.
+// Rebuild the vector contour at that exact handoff, using model geometry for
+// values that no longer participate in presentation.
+static void setModifierEnabled(id modifier, SEL selector, BOOL enabled) {
+    originalModifierEnabled(modifier, selector, enabled);
+    if (modifierWriteDepth) return;
+    MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey) ?: objc_getAssociatedObject(modifier, &geometryModifierBindingKey);
+    if (binding.observer.applied) [binding.observer refreshMask];
+}
 static void bindNativeCornerModifier(MacIslandNativeMaskObserver *observer, id modifier) {
     if (!originalModifierValue || ![nativeModifierObject(modifier, @"keyPath") isEqual:@"cornerRadius"]) return;
     MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey);
@@ -970,14 +994,14 @@ static void addPresentationModifier(CALayer *layer, SEL selector, id modifier) {
     MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
     if (observer) bindNativeCornerModifier(observer, modifier);
     originalAddPresentationModifier(layer, selector, modifier);
-    if (observer.applied) synchronizeNativeMaskGeometry(observer);
+    if (observer.applied) [observer refreshMask];
 }
 static void setPresentationModifiers(CALayer *layer, SEL selector, id modifiers) {
     MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
     if (observer && [modifiers isKindOfClass:NSArray.class])
         for (id modifier in modifiers) bindNativeCornerModifier(observer, modifier);
     originalSetPresentationModifiers(layer, selector, modifiers);
-    if (observer.applied) synchronizeNativeMaskGeometry(observer);
+    if (observer.applied) [observer refreshMask];
 }
 static void synchronizeNativeCornerModifiers(MacIslandNativeMaskObserver *observer) {
     id modifiers = nativeModifierObject(observer.source, @"presentationModifiers");
@@ -1066,10 +1090,12 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
     id size = nil;
     NSMutableArray *groups = [NSMutableArray array];
     for (id modifier in nativeModifierObject(observer.source, @"presentationModifiers")) {
+        // Retain the observer binding while disabled too, so re-enabling the
+        // same native modifier can refresh its mask before the next flush.
+        bindNativeGeometryModifier(observer, modifier);
         if (!nativeModifierEnabled(modifier)) continue;
         NSString *key = nativeModifierObject(modifier, @"keyPath");
         if ([key isEqual:@"bounds.size"]) size = modifier;
-        bindNativeGeometryModifier(observer, modifier);
         id group = nativeModifierObject(modifier, @"group");
         if (!group || !([key isEqual:@"bounds.size"] || [key isEqual:@"position"] || [key isEqual:@"anchorPoint"])) continue;
         if (![groups containsObject:group]) [groups addObject:group];
@@ -1107,6 +1133,15 @@ static void refreshNativeGroupMasks(NSArray *observers) {
 }
 static void installNativeGroupFlushHooks(void) {
     Class groupClass = NSClassFromString(@"CAPresentationModifierGroup");
+    SEL transactional = NSSelectorFromString(@"flushWithTransaction");
+    SEL transactionalTimed = NSSelectorFromString(@"flushWithTransactionAndTargetTime:");
+    Method transactionMethod = class_getInstanceMethod(groupClass, transactional);
+    Method transactionTimedMethod = class_getInstanceMethod(groupClass, transactionalTimed);
+    void (*transactionFlush)(id, SEL) = transactionMethod ? (void *)method_getImplementation(transactionMethod) : NULL;
+    void (*transactionTimedFlush)(id, SEL, double) = transactionTimedMethod ? (void *)method_getImplementation(transactionTimedMethod) : NULL;
+    // An ordinary native flush swaps shared-memory buffers immediately. The
+    // vector path is a transaction property: submit these together through
+    // Apple's transactional flush, retaining the original target time.
     for (NSString *name in @[@"flush", @"flushLocally", @"flushWithTransaction"]) {
         Method method = class_getInstanceMethod(groupClass, NSSelectorFromString(name));
         if (!method) continue;
@@ -1119,7 +1154,9 @@ static void installNativeGroupFlushHooks(void) {
             nativeGroupFlushDepth++;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
             refreshNativeGroupMasks(observers);
-            previous(group, selector);
+            if (selector == NSSelectorFromString(@"flush") && transactionFlush)
+                transactionFlush(group, transactional);
+            else previous(group, selector);
             [CATransaction commit]; nativeGroupFlushDepth--;
         }));
     }
@@ -1135,7 +1172,9 @@ static void installNativeGroupFlushHooks(void) {
             nativeGroupFlushDepth++;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
             refreshNativeGroupMasks(observers);
-            previous(group, selector, time);
+            if (selector == NSSelectorFromString(@"flushWithTargetTime:") && transactionTimedFlush)
+                transactionTimedFlush(group, transactionalTimed, time);
+            else previous(group, selector, time);
             [CATransaction commit]; nativeGroupFlushDepth--;
         }));
     }
@@ -1143,24 +1182,27 @@ static void installNativeGroupFlushHooks(void) {
 static void removePresentationModifier(CALayer *layer, SEL selector, id modifier) {
     originalRemovePresentationModifier(layer, selector, modifier);
     MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
-    if (observer.applied) synchronizeNativeMaskGeometry(observer);
+    if (observer.applied) [observer refreshMask];
 }
 
 static void installNativeCornerModifierHooks(void) {
     Class modifier = NSClassFromString(@"CAPresentationModifier");
     Method value = class_getInstanceMethod(modifier, NSSelectorFromString(@"setValue:"));
     Method velocity = class_getInstanceMethod(modifier, NSSelectorFromString(@"setValue:velocity:"));
+    Method enabled = class_getInstanceMethod(modifier, NSSelectorFromString(@"setEnabled:"));
     Method add = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"addPresentationModifier:"));
     Method set = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"setPresentationModifiers:"));
     Method remove = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"removePresentationModifier:"));
-    if (!value || !velocity || !add || !set || !remove || originalModifierValue) return;
+    if (!value || !velocity || !enabled || !add || !set || !remove || originalModifierValue) return;
     originalModifierValue = (void *)method_getImplementation(value);
     originalModifierValueVelocity = (void *)method_getImplementation(velocity);
+    originalModifierEnabled = (void *)method_getImplementation(enabled);
     originalAddPresentationModifier = (void *)method_getImplementation(add);
     originalSetPresentationModifiers = (void *)method_getImplementation(set);
     originalRemovePresentationModifier = (void *)method_getImplementation(remove);
     method_setImplementation(value, (IMP)setModifierValue);
     method_setImplementation(velocity, (IMP)setModifierValueVelocity);
+    method_setImplementation(enabled, (IMP)setModifierEnabled);
     method_setImplementation(add, (IMP)addPresentationModifier);
     method_setImplementation(set, (IMP)setPresentationModifiers);
     method_setImplementation(remove, (IMP)removePresentationModifier);
