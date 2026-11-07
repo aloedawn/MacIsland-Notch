@@ -22,7 +22,16 @@ if [[ "$MODE" != --uninstall ]]; then
     echo "Supported build: macOS 27.3 beta 26C5035r only." >&2; exit 1;
   }
   xcode-select -p >/dev/null 2>&1 || {
-    echo "Install Xcode Command Line Tools first: xcode-select --install" >&2; exit 1;
+    echo "Install Apple developer tools first (Xcode or: xcode-select --install)." >&2; exit 1;
+  }
+  for tool in clang swiftc; do
+    /usr/bin/xcrun --find "$tool" >/dev/null 2>&1 || {
+      echo "The selected developer tools have no $tool; select Xcode with: sudo xcode-select -s /Applications/Xcode.app" >&2; exit 1;
+    }
+  done
+  SDK_VERSION="$(/usr/bin/xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)"
+  /usr/bin/awk -v v="$SDK_VERSION" 'BEGIN { n = split(v, a, "."); exit !(n >= 1 && (a[1] > 27 || (a[1] == 27 && a[2] + 0 >= 2))) }' || {
+    echo "The macOS 27.2 SDK or later is required (selected SDK: ${SDK_VERSION:-none})." >&2; exit 1;
   }
   if [[ "$MODE" == install ]]; then
     csrutil status | grep -q 'status: disabled' || {
@@ -119,13 +128,17 @@ MACISLAND_NOTCH_M
   cat > "$SCRATCH/safearea.m" <<'MACISLAND_SAFEAREA_M'
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import "notch-layout.h"
+#include <os/log.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 // One physical exclusion policy at the shared FBS scene-settings boundary.
 // Both ElementRegistry and MenuBarClient receive it, regardless of provider.
 static char sceneInsetsKey, originalLayoutPayloadKey;
+extern BOOL MacIslandShortHostAvailable(void);
 static void (*originalMargins)(id, SEL, id), (*originalMinimum)(id, SEL, id), (*originalMaximum)(id, SEL, id);
 static void (*originalHostedMargins)(id, SEL, id), (*originalHostedMinimum)(id, SEL, id), (*originalHostedMaximum)(id, SEL, id);
 static void (*originalObstruction)(id, SEL, id), (*originalSpace)(id, SEL, id), (*originalCorners)(id, SEL, id);
@@ -179,6 +192,8 @@ typedef struct {
     CGFloat leading;
     CGFloat trailing;
     CGFloat notchWidth;
+    CGFloat notchHeight;
+    CGFloat centeredDisplayWidth;
 } MacIslandNotchAvoidance;
 
 static id nativePayload(id value) {
@@ -299,6 +314,9 @@ static MacIslandNotchAvoidance notchAvoidance(NSRect obstruction, NSSize viewpor
             fabs(obstruction.origin.y) > 3) continue;
         policy.physical = YES;
         policy.notchWidth = width;
+        policy.notchHeight = height;
+        CGFloat center = (NSMaxX(left) + NSMinX(right)) / 2;
+        policy.centeredDisplayWidth = 2 * MIN(center - NSMinX(screen.frame), NSMaxX(screen.frame) - center);
         NSRect physical = NSInsetRect(obstruction, (obstruction.size.width - width) / 2,
                                                   (obstruction.size.height - height) / 2);
         NSRect area = NSMakeRect(0, 0, viewport.width, viewport.height);
@@ -324,8 +342,7 @@ static NSDictionary *decodedMargins(NSData *data) {
         if (![decoded[key] isKindOfClass:NSNumber.class] || !isfinite([decoded[key] doubleValue])) return nil;
     return decoded;
 }
-static NSData *safeMargins(NSData *native, MacIslandNotchAvoidance policy) {
-    NSDictionary *decoded = decodedMargins(native);
+static NSData *safeMargins(NSData *native, NSDictionary *decoded, MacIslandNotchAvoidance policy) {
     if (!policy.physical || !decoded) return native;
     NSMutableDictionary *margins = [decoded mutableCopy];
     margins[@"top"] = @(MAX([decoded[@"top"] doubleValue], policy.top));
@@ -357,14 +374,8 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
         NSRect rect = canonicalObstruction(original, screen);
         rects[family] = rect;
-        void (*setter)(id, SEL, id) = family ? originalHostedObstruction : originalObstruction;
-        BOOL corrected = !NSEqualRects(rect, original);
-        if (corrected && setter)
-            setter(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), layoutPayload([NSValue valueWithRect:rect], native.rect));
-        else if (native.obstructionApplied && setter)
-            setter(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), native.rect);
-        native.obstructionApplied = corrected;
     }
+    CGFloat hostOffsets[2] = {0, 0};
     for (NSUInteger family = 0; family < state.layouts.count; family++) {
         MacIslandNativeLayout *native = state.layouts[family];
         if (!native.margins) {
@@ -395,20 +406,49 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         }
         MacIslandNotchAvoidance policy = obstruction.rect && physicalDisplay ?
             notchAvoidance(rect, layoutViewport) : (MacIslandNotchAvoidance){0};
-        NSData *margins = safeMargins(native.margins, policy);
+        NSDictionary *before = decodedMargins(native.margins);
+        // A short panel which settles at the host's minimum has no
+        // independent content-height proposal. Give it an intact row below
+        // the cutout. ClockAngel, for example, keeps a 260 x 60 local body
+        // inside that negotiated frame and only reports its buttons for
+        // obstruction clearance. A taller self-sizing panel keeps its layout.
+        CGFloat shortHeight = 0;
+        if (policy.extendsBelow && MacIslandShortHostAvailable() && before && native.minimum && native.maximum && obstruction.space &&
+            NSMinX(rect) >= -1 && NSMaxX(rect) <= layoutViewport.width + 1 &&
+            native.minimum.sizeValue.height <= policy.notchHeight + 1) {
+            CGFloat top = [before[@"top"] doubleValue], bottom = [before[@"bottom"] doubleValue];
+            CGFloat oldFloor = native.minimum.sizeValue.height + MAX(0, policy.top - top);
+            CGFloat proposed = policy.notchHeight + MAX(native.minimum.sizeValue.height, policy.notchHeight + top + bottom);
+            if (fabs(layoutViewport.height - oldFloor) <= 1 || fabs(layoutViewport.height - proposed) <= 1) {
+                shortHeight = proposed;
+                hostOffsets[obstructionFamily] = policy.notchHeight;
+                policy.top = 0;
+            }
+        }
+        NSData *margins = safeMargins(native.margins, before, policy);
         BOOL applies = margins != native.margins;
         NSValue *minimumValue = native.minimum, *maximumValue = native.maximum;
-        if (policy.physical && decodedMargins(native.margins) && native.minimum && native.maximum) {
-            NSDictionary *before = decodedMargins(native.margins), *after = decodedMargins(margins);
+        if (policy.physical && before && native.minimum && native.maximum) {
+            NSDictionary *after = margins == native.margins ? before : decodedMargins(margins);
             CGFloat extraX = [after[@"leading"] doubleValue] - [before[@"leading"] doubleValue] +
                              [after[@"trailing"] doubleValue] - [before[@"trailing"] doubleValue];
             CGFloat extraY = [after[@"top"] doubleValue] - [before[@"top"] doubleValue];
             NSSize minimum = native.minimum.sizeValue, maximum = native.maximum.sizeValue;
             minimum.width += extraX;
-            minimum.height += extraY;
-            // Preserve the previously requested common expanded-panel width.
-            // This floor applies to every intersecting provider, not named cases.
-            if (policy.extendsBelow) minimum.width = MAX(minimum.width, policy.notchWidth + 140);
+            minimum.height = MAX(minimum.height + extraY, shortHeight);
+            // Hosted system banners (volume, brightness, AirPods) size their
+            // own content below the cutout; their native width stays.
+            if (policy.extendsBelow && family == 0) {
+                // Element activities place content below the cutout through
+                // the top margin. Keep a modest floor so a narrow activity
+                // still clears the shoulders, and let providers that ask
+                // for more (music, ClockAngel) negotiate their own width.
+                CGFloat width = policy.notchWidth + 140;
+                CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
+                CGFloat growth = floor - minimum.width;
+                maximum.width += MIN(growth, MAX(0, policy.centeredDisplayWidth - maximum.width - extraX));
+                minimum.width = floor;
+            }
             maximum.width = MAX(maximum.width + extraX, minimum.width);
             maximum.height = MAX(maximum.height, minimum.height);
             minimumValue = layoutPayload([NSValue valueWithSize:minimum], native.minimum);
@@ -421,6 +461,15 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     for (NSUInteger family = 0; family < state.obstructions.count; family++) {
         MacIslandNativeObstruction *native = state.obstructions[family];
         NSRect rect = rects[family];
+        NSRect published = NSOffsetRect(rect, 0, -hostOffsets[family]);
+        NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
+        void (*setRect)(id, SEL, id) = family ? originalHostedObstruction : originalObstruction;
+        BOOL corrected = !NSEqualRects(published, original);
+        if (setRect && (corrected || native.obstructionApplied)) {
+            id value = corrected ? layoutPayload([NSValue valueWithRect:published], native.rect) : native.rect;
+            setRect(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), value);
+        }
+        native.obstructionApplied = corrected;
         void (*setter)(id, SEL, id) = family ? originalHostedCorners : originalCorners;
         NSSize extent = NSMakeSize(MAX(NSMaxX(rect), rect.size.width) + 1,
                                   MAX(NSMaxY(rect), rect.size.height) + 2);
@@ -504,15 +553,62 @@ static void setDisplayConfiguration(id settings, SEL selector, id value) {
     MacIslandSceneInsets *state = objc_getAssociatedObject(settings, &sceneInsetsKey);
     if (state) refreshSceneInsets(settings, state);
 }
+// The scene-extension accessors (margins, minimum size, obstruction…) do not
+// exist on FBSSceneSettings until FrontBoardServices registers the matching
+// settings extensions, which normally happens lazily on the first expanded or
+// hosted scene. Hooks are therefore (re)verified whenever an extension is
+// registered, and the known extensions are registered up front.
+static pthread_mutex_t contentInsetsHookLock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL contentInsetsHooksReported;
 static BOOL replaceObjectSetter(Class cls, NSString *name, IMP replacement, void (**original)(id, SEL, id)) {
-    if (*original) return YES;
     Method method = class_getInstanceMethod(cls, NSSelectorFromString(name));
     if (!method || strncmp(method_getTypeEncoding(method), "v24@0:8@", strlen("v24@0:8@"))) return NO;
-    *original = (void *)method_getImplementation(method);
+    IMP current = method_getImplementation(method);
+    if (current == replacement) return *original != NULL;
+    // Either first installation or the accessor was re-synthesized after an
+    // earlier hook; in both cases the current implementation is the original.
+    *original = (void *)current;
     method_setImplementation(method, replacement);
     return YES;
 }
+static BOOL installContentInsetsHooksLocked(void);
 static BOOL installContentInsetsHooks(void) {
+    pthread_mutex_lock(&contentInsetsHookLock);
+    BOOL ready = installContentInsetsHooksLocked();
+    pthread_mutex_unlock(&contentInsetsHookLock);
+    return ready;
+}
+static id (*originalSettingsExtensions)(id, SEL, id);
+static id settingsExtensionsForSceneExtension(id cls, SEL selector, id extension) {
+    id result = originalSettingsExtensions(cls, selector, extension);
+    installContentInsetsHooks();
+    return result;
+}
+static void observeSettingsExtensionRegistration(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = NSClassFromString(@"FBSSceneSettings");
+        Method method = cls ? class_getClassMethod(cls, NSSelectorFromString(@"_settingsExtensionsForSceneExtension:")) : NULL;
+        if (!method || strcmp(method_getTypeEncoding(method), "@24@0:8#16")) {
+            os_log(OS_LOG_DEFAULT, "MacIsland: settings-extension registration hook unavailable");
+            return;
+        }
+        originalSettingsExtensions = (void *)method_getImplementation(method);
+        method_setImplementation(method, (IMP)settingsExtensionsForSceneExtension);
+    });
+}
+static void registerKnownSettingsExtensions(void) {
+    Class cls = NSClassFromString(@"FBSSceneSettings");
+    SEL selector = NSSelectorFromString(@"_settingsExtensionsForSceneExtension:");
+    if (!cls || ![cls respondsToSelector:selector]) return;
+    for (NSString *name in @[@"ElementRegistryFoundation.ElementRegistrySceneExtension",
+                             @"MenuBarClient.HostedMetricsExtension",
+                             @"MenuBarClient.HostedIntegratedObstructionExtension"]) {
+        Class extension = NSClassFromString(name);
+        if (extension) ((id (*)(id, SEL, Class))objc_msgSend)(cls, selector, extension);
+    }
+}
+static BOOL installContentInsetsHooksLocked(void) {
     Class cls = NSClassFromString(@"FBSSceneSettings");
     if (!cls) return NO;
     BOOL ready = YES;
@@ -528,27 +624,171 @@ static BOOL installContentInsetsHooks(void) {
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRect:", (IMP)setHostedObstruction, &originalHostedObstruction);
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRectCoordinateSpace:", (IMP)setHostedSpace, &originalHostedSpace);
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionCornerRadii:", (IMP)setHostedCorners, &originalHostedCorners);
-    ready &= replaceObjectSetter(cls, @"setDisplayConfiguration:", (IMP)setDisplayConfiguration, &originalDisplayConfiguration);
-    if (!originalFrame) {
-        Method method = class_getInstanceMethod(cls, NSSelectorFromString(@"setFrame:"));
-        if (method && strstr(method_getTypeEncoding(method), "CGRect")) {
-            originalFrame = (void *)method_getImplementation(method);
-            method_setImplementation(method, (IMP)setFrame);
-        }
+    // Display configuration and frame are base FBSSceneSettings accessors:
+    // hook them when present, but they must not decide readiness.
+    replaceObjectSetter(cls, @"setDisplayConfiguration:", (IMP)setDisplayConfiguration, &originalDisplayConfiguration);
+    Method frameMethod = class_getInstanceMethod(cls, NSSelectorFromString(@"setFrame:"));
+    if (frameMethod && strstr(method_getTypeEncoding(frameMethod), "CGRect")
+        && method_getImplementation(frameMethod) != (IMP)setFrame) {
+        originalFrame = (void *)method_getImplementation(frameMethod);
+        method_setImplementation(frameMethod, (IMP)setFrame);
+    }
+    if (ready && !contentInsetsHooksReported) {
+        contentInsetsHooksReported = YES;
+        os_log(OS_LOG_DEFAULT, "MacIsland: scene-settings notch hooks installed");
     }
     return ready;
 }
 static void waitForSceneSettings(NSUInteger attempt) {
-    if (installContentInsetsHooks() || attempt >= 300) return;
-    int64_t delay = attempt < 20 ? 50 * NSEC_PER_MSEC : 500 * NSEC_PER_MSEC;
+    if (installContentInsetsHooks()) return;
+    // The registration hook normally finishes installation; polling is only
+    // a fallback, and keeps going slowly instead of giving up.
+    int64_t delay = attempt < 20 ? 50 * NSEC_PER_MSEC : attempt < 300 ? 500 * NSEC_PER_MSEC : 5 * NSEC_PER_SEC;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{ waitForSceneSettings(attempt + 1); });
 }
 __attribute__((constructor)) static void installNotchContentInsets(void) {
     if (strcmp(getprogname(), "MenuBarAgent") != 0) return;
-    dispatch_async(dispatch_get_main_queue(), ^{ waitForSceneSettings(0); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        observeSettingsExtensionRegistration();
+        registerKnownSettingsExtensions();
+        waitForSceneSettings(0);
+    });
+}
+MACISLAND_SAFEAREA_M
+
+  cat > "$SCRATCH/short-host.m" <<'MACISLAND_SHORT_HOST_M'
+#import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <string.h>
+
+// The tagged FBS obstruction is already expressed in the new, below-notch
+// content viewport. Move the AppKit event owner and its presentation together.
+static char shortHostFrameKey, shortTranslationKey;
+static void (*nativeHostSetFrame)(NSView *, SEL, NSRect);
+static void (*nativeHostLayout)(NSView *, SEL);
+static _Thread_local BOOL writingShortFrame;
+static atomic_bool shortHostAvailable;
+BOOL MacIslandShortHostAvailable(void) {
+    return atomic_load(&shortHostAvailable);
 }
 
-MACISLAND_SAFEAREA_M
+static id hostSetting(id object, NSString *name) {
+    SEL selector = NSSelectorFromString(name);
+    return [object respondsToSelector:selector] ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
+}
+static BOOL matchesShortViewport(id settings, CGFloat cutoutWidth, CGFloat cutoutHeight, NSSize nativeSize) {
+    for (NSString *prefix in @[@"", @"hosted"]) {
+        NSString *rectName = prefix.length ? @"hostedIntegratedObstructionRect" : @"integratedObstructionRect";
+        NSString *sizeName = prefix.length ? @"hostedMinimumSize" : @"elementViewMinimumSize";
+        id exclusion = hostSetting(settings, rectName);
+        id minimum = hostSetting(settings, sizeName);
+        if (![exclusion isKindOfClass:NSValue.class] || strcmp([exclusion objCType], @encode(NSRect)) ||
+            ![minimum isKindOfClass:NSValue.class] || strcmp([minimum objCType], @encode(NSSize))) continue;
+        NSRect rect = [exclusion rectValue];
+        NSSize size = [minimum sizeValue];
+        if (fabs(rect.origin.y + cutoutHeight) <= 3 &&
+            fabs(rect.size.height - cutoutHeight) <= 4 && fabs(rect.size.width - cutoutWidth) <= 4 &&
+            fabs(size.height - nativeSize.height) <= 1 && size.height > cutoutHeight &&
+            nativeSize.width >= cutoutWidth) return YES;
+    }
+    return NO;
+}
+static NSRect positionedHostFrame(NSView *host, NSRect nativeFrame) {
+    NSView *parent = host.superview;
+    NSWindow *window = host.window;
+    NSScreen *screen = window.screen;
+    CGFloat height = screen.safeAreaInsets.top;
+    if (height <= 0 || !parent.isFlipped || fabs(window.frame.size.height - screen.frame.size.height) > 1 ||
+        fabs(nativeFrame.size.height - parent.bounds.size.height) > 1 ||
+        fabs(nativeFrame.size.width - parent.bounds.size.width) > 1) return nativeFrame;
+    NSRect left = screen.auxiliaryTopLeftArea, right = screen.auxiliaryTopRightArea;
+    if (NSIsEmptyRect(left) || NSIsEmptyRect(right)) return nativeFrame;
+    CGFloat width = NSMinX(right) - NSMaxX(left);
+    if (nativeFrame.size.width <= width || nativeFrame.size.height <= height) return nativeFrame;
+    Class hostingClass = NSClassFromString(@"NSSceneHostingView");
+    for (NSView *child in host.subviews) {
+        if (![child isKindOfClass:hostingClass]) continue;
+        id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
+        if (!matchesShortViewport(settings, width, height, nativeFrame.size)) continue;
+        nativeFrame.origin.y += height;
+        nativeFrame.size.height -= height;
+        break;
+    }
+    return nativeFrame;
+}
+// MenuBarCore gates updates to the backing layer, even when AppKit has moved
+// its event owner. Translate the existing remote scene by the remaining delta.
+static void alignHostedPresentation(NSView *view) {
+    CALayer *layer = view.layer;
+    if (!layer || !layer.superlayer) return;
+    NSValue *nativeFrame = objc_getAssociatedObject(view, &shortHostFrameKey);
+    NSNumber *previous = objc_getAssociatedObject(layer, &shortTranslationKey);
+    if (!nativeFrame && !previous) return;
+    CATransform3D transform = layer.sublayerTransform;
+    CATransform3D prior = CATransform3DMakeTranslation(0, previous.doubleValue, 0);
+    if (!CATransform3DEqualToTransform(transform, prior)) {
+        // Another native owner replaced this transform. Leave it in control.
+        objc_setAssociatedObject(layer, &shortTranslationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    CGFloat delta = nativeFrame ? NSMinY(view.frame) - CGRectGetMinY(layer.frame) : 0;
+    if (fabs(delta - previous.doubleValue) < 0.001) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.sublayerTransform = CATransform3DMakeTranslation(0, delta, 0);
+    [CATransaction commit];
+    objc_setAssociatedObject(layer, &shortTranslationKey, delta ? @(delta) : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static void setHostFrame(NSView *view, SEL selector, NSRect requested) {
+    if (writingShortFrame) { nativeHostSetFrame(view, selector, requested); return; }
+    NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
+    if (saved && NSEqualRects(requested, view.frame)) requested = saved.rectValue;
+    NSRect frame = positionedHostFrame(view, requested);
+    BOOL adjusted = !NSEqualRects(frame, requested);
+    objc_setAssociatedObject(view, &shortHostFrameKey, adjusted ? [NSValue valueWithRect:requested] : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    writingShortFrame = YES;
+    nativeHostSetFrame(view, selector, frame);
+    writingShortFrame = NO;
+    alignHostedPresentation(view);
+}
+static void layoutHost(NSView *view, SEL selector) {
+    if (!writingShortFrame) {
+        NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
+        NSRect nativeFrame = saved ? saved.rectValue : view.frame;
+        if (!NSEqualRects(view.frame, positionedHostFrame(view, nativeFrame)))
+            setHostFrame(view, @selector(setFrame:), nativeFrame);
+    }
+    nativeHostLayout(view, selector);
+    alignHostedPresentation(view);
+}
+static void installShortHostLayout(unsigned attempt) {
+    Class cls = NSClassFromString(@"MenuBarCore.SceneHostDisplayItemContainerView");
+    if (!cls && attempt < 100) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            installShortHostLayout(attempt + 1);
+        });
+        return;
+    }
+    if (!cls || ![cls isSubclassOfClass:NSView.class] || nativeHostSetFrame) return;
+    Method frame = class_getInstanceMethod(cls, @selector(setFrame:));
+    Method layout = class_getInstanceMethod(cls, @selector(layout));
+    if (!frame || !layout) return;
+    nativeHostSetFrame = (void *)method_getImplementation(frame);
+    nativeHostLayout = (void *)method_getImplementation(layout);
+    class_replaceMethod(cls, @selector(setFrame:), (IMP)setHostFrame, method_getTypeEncoding(frame));
+    class_replaceMethod(cls, @selector(layout), (IMP)layoutHost, method_getTypeEncoding(layout));
+    atomic_store(&shortHostAvailable, true);
+}
+__attribute__((constructor)) static void installShortHost(void) {
+    if (!strcmp(getprogname(), "MenuBarAgent"))
+        dispatch_async(dispatch_get_main_queue(), ^{ installShortHostLayout(0); });
+}
+MACISLAND_SHORT_HOST_M
 
   cat > "$SCRATCH/mask.m" <<'MACISLAND_MASK_M'
 #import <AppKit/AppKit.h>
@@ -556,15 +796,18 @@ MACISLAND_SAFEAREA_M
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "notch-layout.h"
+#include <os/lock.h>
 #include <stdlib.h>
 #include <string.h>
 
-static char maskObserverKey, parentGeometryKey;
+static char mergeVisibilityKey;
+static void (*originalSetHidden)(id, SEL, BOOL);
+static char maskObserverKey, parentGeometryKey, sceneLayersKey, sceneOriginObserverKey;
 static void (*originalSetCornerRadius)(id, SEL, CGFloat);
 static void (*baseSetBounds)(id, SEL, CGRect);
 static void (*baseSetPosition)(id, SEL, CGPoint);
 
-static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top) {
+static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders) {
     CGFloat flare = MIN(MacIslandNotchFlare, MIN(size.width / 4, size.height / 3));
     CGFloat bottom = MIN(14, size.height / 2);
     CGFloat width = size.width;
@@ -572,10 +815,13 @@ static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top) {
     CGFloat k = 0.5522847498307936;
     CGMutablePathRef path = CGPathCreateMutable();
     top = MIN(MAX(top, 0), MAX(height - flare - bottom, 0));
-    CGPathMoveToPoint(path, NULL, 0, top);
-    CGPathAddLineToPoint(path, NULL, width, top);
-    CGPathAddCurveToPoint(path, NULL, width - k * flare, top,
-                         width - flare, top + flare - k * flare, width - flare, top + flare);
+    CGFloat shoulder = outwardShoulders ? flare : 0;
+    CGFloat left = flare - shoulder, right = width - left;
+    CGPathMoveToPoint(path, NULL, left, 0);
+    CGPathAddLineToPoint(path, NULL, right, 0);
+    CGPathAddLineToPoint(path, NULL, right, top);
+    CGPathAddCurveToPoint(path, NULL, right - k * shoulder, top,
+                         width - flare, top + (1 - k) * shoulder, width - flare, top + shoulder);
     CGPathAddLineToPoint(path, NULL, width - flare, height - bottom);
     CGPathAddCurveToPoint(path, NULL, width - flare, height - bottom + k * bottom,
                          width - flare - bottom + k * bottom, height,
@@ -583,8 +829,8 @@ static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top) {
     CGPathAddLineToPoint(path, NULL, flare + bottom, height);
     CGPathAddCurveToPoint(path, NULL, flare + bottom - k * bottom, height,
                          flare, height - bottom + k * bottom, flare, height - bottom);
-    CGPathAddLineToPoint(path, NULL, flare, top + flare);
-    CGPathAddCurveToPoint(path, NULL, flare, top + flare - k * flare, k * flare, top, 0, top);
+    CGPathAddLineToPoint(path, NULL, flare, top + shoulder);
+    CGPathAddCurveToPoint(path, NULL, flare, top + (1 - k) * shoulder, left + k * shoulder, top, left, top);
     CGPathCloseSubpath(path);
     return path;
 }
@@ -613,6 +859,30 @@ static BOOL isOpaqueBlack(CGColorRef color) {
     return geometry;
 }
 @end
+// Scaled display modes do not map points onto whole panel pixels. On a
+// 3024-pixel panel shown as 1800 points, the 38-point safe area covers 63.84
+// physical rows while the camera housing covers 64, leaving a faint partial
+// row under the island. Return the extra points needed to reach that row.
+static CGFloat panelBottomSnap(NSScreen *screen, CGFloat height) {
+    CGDirectDisplayID display = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+    CGFloat width = screen.frame.size.width;
+    if (!display || width <= 0 || height <= 0) return 0;
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)
+        @{(__bridge id)kCGDisplayShowDuplicateLowResolutionModes: @YES});
+    size_t native = 0, widest = 0;
+    for (CFIndex i = 0; modes && i < CFArrayGetCount(modes); i++) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        size_t pixels = CGDisplayModeGetPixelWidth(mode);
+        widest = MAX(widest, pixels);
+        if (CGDisplayModeGetIOFlags(mode) & 0x02000000) native = MAX(native, pixels);
+    }
+    if (modes) CFRelease(modes);
+    CGFloat scale = (CGFloat)(native ?: widest) / width;
+    if (!isfinite(scale) || scale <= 0) return 0;
+    CGFloat rows = height * scale;
+    CGFloat snap = ceil(rows - 0.01) / scale - height;
+    return snap > 0.001 && snap < 1 / scale ? snap : 0;
+}
 static void updateScreenGeometry(void) {
     NSMutableArray *layouts = [NSMutableArray array];
     for (NSScreen *screen in NSScreen.screens) {
@@ -623,12 +893,83 @@ static void updateScreenGeometry(void) {
                             @"height": @(screen.safeAreaInsets.top),
                             @"left": @(NSMaxX(left) - NSMinX(screen.frame)),
                             @"right": @(NSMinX(right) - NSMinX(screen.frame)),
-                            @"pixel": @(1 / MAX(screen.backingScaleFactor, 1))}];
+                            @"pixel": @(1 / MAX(screen.backingScaleFactor, 1)),
+                            @"bottomSnap": @(panelBottomSnap(screen, screen.safeAreaInsets.top))}];
     }
     [MacIslandScreenGeometry shared].layouts = layouts;
 }
+static NSDictionary *screenLayoutForLayer(CALayer *layer) {
+    CGSize parent = layer.superlayer.bounds.size;
+    for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
+        CGSize size = [layout[@"size"] sizeValue];
+        if (fabs(parent.width - size.width) <= 1 && fabs(parent.height - size.height) <= 1) return layout;
+    }
+    return nil;
+}
 
-static BOOL isNotchBackground(CALayer *layer) {
+@class MacIslandNativeMaskObserver;
+static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
+static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
+static id nativeModifierObject(id object, NSString *name);
+static BOOL nativeModifierEnabled(id modifier);
+
+@interface MacIslandNativeMaskObserver : NSObject
+@property(nonatomic, weak) CALayer *source;
+@property(nonatomic, weak) CALayer *observedParent;
+@property(nonatomic, weak) MacIslandNativeMaskObserver *mergeInput;
+@property(nonatomic, weak) MacIslandNativeMaskObserver *contourPeer;
+@property(nonatomic, weak) CALayer *heldUnion;
+@property(nonatomic, strong) id heldBlur;
+@property(nonatomic, weak) CALayer *mergeScene;
+@property(nonatomic, strong) CAShapeLayer *shapeMask;
+@property(nonatomic) CGFloat pixelInset;
+@property(nonatomic) CGFloat horizontalFlare;
+@property(nonatomic) CGFloat bottomExtension;
+@property(nonatomic) CGFloat topExtension;
+// Native layer updates can arrive on MenuBarAgent's animation thread as well
+// as main. These collections are replaced copy-on-write under this lock, which
+// is held only for the swap and never across a call into AppKit or Core Animation.
+@property(atomic, copy) NSArray *modifierBindings;
+@property(atomic, copy) NSArray *nativeMaskGroups;
+@property(nonatomic, strong) NSArray<NSString *> *keys;
+@property(nonatomic) CGFloat nativeRadius;
+@property(nonatomic) BOOL updating;
+@property(nonatomic) BOOL applied;
+@property(atomic) CGRect nativeBounds;
+@property(atomic) CGPoint nativePosition;
+@property(atomic, strong) id nativeMaskSize;
+- (instancetype)initWithLayer:(CALayer *)layer;
+- (void)refresh;
+- (void)refreshMask;
+- (void)endVisibilityHold:(BOOL)applyHide;
+- (void)updateVisibilityHold;
+@end
+
+static CGRect nativeBodyFrame(MacIslandNativeMaskObserver *observer) {
+    CALayer *layer = observer.source;
+    CGSize size = observer.nativeBounds.size;
+    CGRect box = CGRectMake(-layer.anchorPoint.x * size.width, -layer.anchorPoint.y * size.height,
+                            size.width, size.height);
+    CGRect frame = CGRectApplyAffineTransform(box, CATransform3DGetAffineTransform(layer.transform));
+    return CGRectOffset(frame, observer.nativePosition.x, observer.nativePosition.y);
+}
+
+static os_unfair_lock maskStateLock = OS_UNFAIR_LOCK_INIT;
+// Atomic check-and-set: a second thread must not run the same refresh at once.
+static BOOL beginObserverUpdate(MacIslandNativeMaskObserver *observer) {
+    os_unfair_lock_lock(&maskStateLock);
+    BOOL began = !observer.updating;
+    if (began) observer.updating = YES;
+    os_unfair_lock_unlock(&maskStateLock);
+    return began;
+}
+static void endObserverUpdate(MacIslandNativeMaskObserver *observer) {
+    os_unfair_lock_lock(&maskStateLock);
+    observer.updating = NO;
+    os_unfair_lock_unlock(&maskStateLock);
+}
+
+static BOOL isNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *observer) {
     // Include the native rim, shadow, and transparent clipping containers.
     // The latter clip the animated hover highlight: retaining their native
     // pill radius cuts a different outline into an otherwise notched island.
@@ -640,6 +981,9 @@ static BOOL isNotchBackground(CALayer *layer) {
     if (!fill && !material) return NO;
     CALayer *parent = layer.superlayer;
     CGRect frame = layer.frame;
+    // Eligibility follows Apple's original geometry, not the larger paint
+    // bounds used for shoulders and offscreen filter sampling.
+    if (observer) frame = nativeBodyFrame(observer);
     if (!parent || CGRectGetMinY(frame) > 2) return NO;
     for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
         CGFloat height = [layout[@"height"] doubleValue];
@@ -660,34 +1004,107 @@ static BOOL isNotchBackground(CALayer *layer) {
     return NO;
 }
 
-@class MacIslandNativeMaskObserver;
-static void synchronizeNativeCornerModifiers(MacIslandNativeMaskObserver *observer);
-static void restoreNativeCornerModifiers(MacIslandNativeMaskObserver *observer);
-static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
-static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
-static id nativeModifierObject(id object, NSString *name);
-static BOOL nativeModifierEnabled(id modifier);
+static CGFloat nativeSceneEdgeCompensation(CALayer *layer) {
+    for (CALayer *parent = layer.superlayer; parent; parent = parent.superlayer) {
+        id observer = objc_getAssociatedObject(parent, &sceneOriginObserverKey);
+        SEL pixel = NSSelectorFromString(@"pixel");
+        if ([observer respondsToSelector:pixel]) return MAX(0, ((CGFloat (*)(id, SEL))objc_msgSend)(observer, pixel));
+    }
+    return 0;
+}
+static BOOL hasMergeFilters(CALayer *layer) {
+    BOOL blur = NO, threshold = NO;
+    for (id filter in layer.filters) {
+        id type = nativeModifierObject(filter, @"type");
+        blur |= [type isEqual:@"gaussianBlur"];
+        threshold |= [type isEqual:@"alphaThreshold"];
+    }
+    return blur && threshold;
+}
 
-@interface MacIslandNativeMaskObserver : NSObject
-@property(nonatomic, weak) CALayer *source;
-@property(nonatomic, weak) CALayer *observedParent;
-@property(nonatomic, strong) CAShapeLayer *shapeMask;
-@property(nonatomic) CGFloat pixelInset;
-@property(nonatomic, strong) NSMutableArray *geometryModifiers;
-@property(nonatomic, strong) NSMutableArray *nativeMaskGroups;
-@property(nonatomic, strong) NSArray<NSString *> *keys;
-@property(nonatomic) CGFloat nativeRadius;
-@property(nonatomic) BOOL updating;
-@property(nonatomic) BOOL applied;
-@property(nonatomic) CGRect nativeBounds;
-@property(nonatomic) CGPoint nativePosition;
-@property(nonatomic) BOOL expandedFill;
-@property(nonatomic, strong) NSMutableArray *radiusModifiers;
-@property(nonatomic, strong) id nativeMaskSize;
-- (instancetype)initWithLayer:(CALayer *)layer;
-- (void)refresh;
-- (void)refreshMask;
-@end
+static BOOL isNativeUnionFill(CALayer *layer) {
+    return isOpaqueBlack(layer.backgroundColor) && hasMergeFilters(layer.superlayer);
+}
+
+// Only a secondary opaque input of the same native notch compositor joins
+// the primary's transaction. Its path, size, velocity and paint stay native.
+static BOOL isSecondaryMergeInput(CALayer *layer) {
+    return isOpaqueBlack(layer.backgroundColor) && hasMergeFilters(layer.superlayer.superlayer) &&
+           nativeSceneEdgeCompensation(layer) > 0;
+}
+
+// Only paint-only, childless black backgrounds qualify for delayed hiding.
+static id activeMergeBlur(CALayer *group) {
+    id blur = nil;
+    BOOL threshold = NO;
+    for (id filter in group.filters) {
+        if (!nativeModifierEnabled(filter)) continue;
+        id type = nativeModifierObject(filter, @"type");
+        if ([type isEqual:@"alphaThreshold"]) threshold = YES;
+        if ([type isEqual:@"gaussianBlur"] && [[filter valueForKey:@"inputRadius"] doubleValue] > 0)
+            blur = filter;
+    }
+    return threshold ? blur : nil;
+}
+
+// When the primary already has a matching opaque material, its native mask
+// owns the shoulder. Filtering that same shoulder a second time smears its
+// four-point curve over the Gaussian's larger kernel. The merge input still
+// supplies the full native body and the interaction with the separate circle.
+static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
+    CALayer *unionLayer = input.source.superlayer;
+    CALayer *scene = unionLayer.superlayer;
+    if (input.topExtension <= 0) scene = nil;
+    if (input.mergeScene != scene) {
+        [input.mergeScene removeObserver:input forKeyPath:@"sublayers" context:&sceneLayersKey];
+        input.mergeScene = scene;
+        [scene addObserver:input forKeyPath:@"sublayers" options:0 context:&sceneLayersKey];
+    }
+    MacIslandNativeMaskObserver *previous = input.contourPeer;
+    CALayer *heldMaterial = previous.source;
+    // The two model layers finish their bounds and position writes separately.
+    // Once Apple requests the hide, the identified material stays responsible
+    // until this same filter hands off. Revalidate ownership, not model endpoints.
+    if (scene && previous.heldBlur && previous.heldUnion == unionLayer && previous.applied &&
+        previous.mergeInput == input && heldMaterial.superlayer == scene &&
+        heldMaterial.mask == previous.shapeMask && !heldMaterial.hidden && heldMaterial.opacity >= 1 &&
+        !heldMaterial.contents && !heldMaterial.sublayers.count && isOpaqueBlack(heldMaterial.backgroundColor))
+        return YES;
+    MacIslandNativeMaskObserver *selected = nil;
+    CGRect body = [unionLayer convertRect:nativeBodyFrame(input) toLayer:scene];
+    for (CALayer *layer in scene.sublayers) {
+        if (layer.superlayer != scene || !isOpaqueBlack(layer.backgroundColor)) continue;
+        id association = objc_getAssociatedObject(layer, &maskObserverKey);
+        if (![association isKindOfClass:MacIslandNativeMaskObserver.class]) continue;
+        MacIslandNativeMaskObserver *peer = association;
+        if (!peer.applied || layer.mask != peer.shapeMask) continue;
+        CGRect r = nativeBodyFrame(peer);
+        // Native material and opaque merge input differ by a backing-pixel inset.
+        if (fabs(CGRectGetMinX(r) - CGRectGetMinX(body)) > 1 ||
+            fabs(CGRectGetMaxX(r) - CGRectGetMaxX(body)) > 1 ||
+            fabs(CGRectGetMinY(r) - CGRectGetMinY(body)) > 1 ||
+            fabs(CGRectGetMaxY(r) - CGRectGetMaxY(body)) > 1) continue;
+        peer.mergeInput = input;
+        if (!layer.hidden && layer.opacity >= 1) { selected = peer; break; }
+    }
+    input.contourPeer = selected;
+    if (previous != selected && previous.heldBlur) [previous endVisibilityHold:YES];
+    return selected != nil;
+}
+
+static CGSize paintSize(MacIslandNativeMaskObserver *observer, CGSize size) {
+    size.width += 2 * observer.horizontalFlare;
+    size.height += observer.topExtension + 2 * observer.pixelInset + observer.bottomExtension;
+    return size;
+}
+
+static CGPoint paintPosition(MacIslandNativeMaskObserver *observer, CGPoint point) {
+    CGPoint anchor = observer.source.anchorPoint;
+    point.x += (2 * anchor.x - 1) * observer.horizontalFlare;
+    point.y += (anchor.y - 1) * observer.topExtension + (2 * anchor.y - 1) * observer.pixelInset +
+               anchor.y * observer.bottomExtension;
+    return point;
+}
 
 static CAAnimation *animationWithoutPillCorners(CAAnimation *animation) {
     if ([animation isKindOfClass:CAAnimationGroup.class]) {
@@ -759,7 +1176,7 @@ static void observeNativeAnimations(CALayer *layer) {
         _shapeMask.edgeAntialiasingMask = 0;
         _shapeMask.actions = @{@"path": NSNull.null, @"bounds": NSNull.null, @"position": NSNull.null};
         _keys = @[@"bounds", @"position", @"anchorPoint", @"transform",
-                  @"superlayer", @"name", @"backgroundColor", @"shadowColor", @"shadowOpacity", @"masksToBounds", @"mask"];
+                  @"superlayer", @"name", @"hidden", @"opacity", @"backgroundColor", @"shadowColor", @"shadowOpacity", @"masksToBounds", @"mask"];
         for (NSString *key in _keys)
             [layer addObserver:self forKeyPath:key options:0 context:&maskObserverKey];
         observeNativeAnimations(layer);
@@ -769,8 +1186,7 @@ static void observeNativeAnimations(CALayer *layer) {
 }
 
 - (void)refresh {
-    if (self.updating) return;
-    self.updating = YES;
+    if (!beginObserverUpdate(self)) return;
     CALayer *source = self.source;
     // Native children may settle before their display parent gets its size.
     // Eligibility must follow that existing parent's layout too.
@@ -781,7 +1197,7 @@ static void observeNativeAnimations(CALayer *layer) {
         [parent addObserver:self forKeyPath:@"bounds" options:0 context:&parentGeometryKey];
     }
     BOOL ownsMask = source.mask == self.shapeMask;
-    BOOL eligible = source && (self.nativeRadius > 0 || self.applied) && isNotchBackground(source) &&
+    BOOL eligible = source && (self.nativeRadius > 0 || self.applied) && isNotchBackground(source, self) &&
                     (ownsMask || !source.mask);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -797,26 +1213,36 @@ static void observeNativeAnimations(CALayer *layer) {
                 if (fabs(source.superlayer.bounds.size.width - size.width) > 1 ||
                     fabs(source.superlayer.bounds.size.height - size.height) > 1) continue;
                 CGFloat pixel = [layout[@"pixel"] doubleValue];
-                if (nativeTop > 0 && fabs(nativeTop - pixel) < 0.05) inset = pixel;
+                if (isNativeUnionFill(source) || (nativeTop > 0 && fabs(nativeTop - pixel) < 0.05)) inset = pixel;
             }
         }
-        if (inset > 0 || self.expandedFill) {
-            CGRect bounds = self.nativeBounds;
-            CGPoint position = self.nativePosition;
-            bounds.size.height += 2 * inset;
-            position.y += (2 * source.anchorPoint.y - 1) * inset;
-            // MBGated_* ignores ordinary geometry writes outside its gate.
-            // Use CALayer's implementation, as for the corner-radius override.
-            baseSetBounds(source, @selector(setBounds:), bounds);
-            baseSetPosition(source, @selector(setPosition:), position);
-        }
-        self.expandedFill = inset > 0;
+        CGFloat flare = MacIslandNotchFlare;
+        // Reach the camera housing's last physical row in scaled modes.
+        CGFloat bottom = nativeSceneEdgeCompensation(source) + [screenLayoutForLayer(source)[@"bottomSnap"] doubleValue];
+        // Build 26C5035r uses a 6 2/3-point native merge blur. Its
+        // three-radius sampling support must continue above the bezel.
+        // Reserve it even while idle so native spring geometry never jumps
+        // when the filter switches on or off. This is outside the display.
+        CGFloat top = isNativeUnionFill(source) ? 20 : 0;
+        CGRect bounds = self.nativeBounds;
+        CGPoint position = self.nativePosition;
+        // The shoulder sits outside the native body, rather than consuming
+        // its absorption area. Offset the bounds origin so existing children
+        // keep their native coordinates when the paint surface grows.
+        bounds.origin.x -= flare;
+        bounds.origin.y -= top;
         self.pixelInset = inset;
+        self.horizontalFlare = flare;
+        self.bottomExtension = bottom;
+        self.topExtension = top;
+        bounds.size = paintSize(self, bounds.size);
+        position = paintPosition(self, position);
+        baseSetBounds(source, @selector(setBounds:), bounds);
+        baseSetPosition(source, @selector(setPosition:), position);
         originalSetCornerRadius(source, @selector(setCornerRadius:), 0);
         source.mask = self.shapeMask;
         BOOL newlyApplied = !self.applied;
         self.applied = YES;
-        synchronizeNativeCornerModifiers(self);
         if (newlyApplied) {
             for (NSString *key in source.animationKeys) {
                 CAAnimation *animation = [source animationForKey:key];
@@ -826,19 +1252,21 @@ static void observeNativeAnimations(CALayer *layer) {
         }
         [self refreshMask];
     } else if (self.applied) {
-        if (self.expandedFill) {
-            baseSetBounds(source, @selector(setBounds:), self.nativeBounds);
-            baseSetPosition(source, @selector(setPosition:), self.nativePosition);
-            self.expandedFill = NO;
-        }
+        [self.contourPeer endVisibilityHold:YES];
+        [self endVisibilityHold:YES];
+        self.contourPeer = nil;
+        baseSetBounds(source, @selector(setBounds:), self.nativeBounds);
+        baseSetPosition(source, @selector(setPosition:), self.nativePosition);
         if (ownsMask) source.mask = nil;
         originalSetCornerRadius(source, @selector(setCornerRadius:), self.nativeRadius);
         self.applied = NO;
-        restoreNativeCornerModifiers(self);
         removeNativeMaskGeometry(self);
     }
+    if (!self.applied) synchronizeNativeMaskGeometry(self);
+    // Re-evaluate immediately if the native material is hidden or removed.
+    [self.mergeInput refreshMask];
     [CATransaction commit];
-    self.updating = NO;
+    endObserverUpdate(self);
 }
 
 - (void)refreshMask {
@@ -865,19 +1293,57 @@ static void observeNativeAnimations(CALayer *layer) {
     self.shapeMask.bounds = (CGRect){CGPointZero, size};
     self.shapeMask.position = bounds.origin;
     self.shapeMask.contentsScale = MAX(source.contentsScale, 2);
-    CGPathRef path = notchMaskPathAtTop(size, top);
+    CGPathRef path = notchMaskPathAtTop(size, top, !hasOpaqueContourPeer(self));
     self.shapeMask.path = path;
     CGPathRelease(path);
 }
 
+// Apple hides its existing primary material partway through closing, before
+// the merge kernel is disabled. Preserve this previously-visible paint until
+// the native filter handoff; a new show request cancels the pending hide.
+- (void)endVisibilityHold:(BOOL)applyHide {
+    if (!self.heldBlur) return;
+    [self.heldBlur removeObserver:self forKeyPath:@"inputRadius" context:&mergeVisibilityKey];
+    [self.heldBlur removeObserver:self forKeyPath:@"enabled" context:&mergeVisibilityKey];
+    [self.heldUnion removeObserver:self forKeyPath:@"filters" context:&mergeVisibilityKey];
+    self.heldBlur = nil;
+    self.heldUnion = nil;
+    if (applyHide && self.source) originalSetHidden(self.source, @selector(setHidden:), YES);
+}
+
+- (void)updateVisibilityHold {
+    if (!self.heldBlur) return;
+    id blur = activeMergeBlur(self.heldUnion);
+    if (blur == self.heldBlur) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (blur) {
+        [self.heldBlur removeObserver:self forKeyPath:@"inputRadius" context:&mergeVisibilityKey];
+        [self.heldBlur removeObserver:self forKeyPath:@"enabled" context:&mergeVisibilityKey];
+        self.heldBlur = blur;
+        [blur addObserver:self forKeyPath:@"inputRadius" options:0 context:&mergeVisibilityKey];
+        [blur addObserver:self forKeyPath:@"enabled" options:0 context:&mergeVisibilityKey];
+    } else {
+        [self endVisibilityHold:YES];
+        [self.mergeInput refreshMask];
+    }
+    [CATransaction commit];
+}
+
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                        change:(NSDictionary *)change context:(void *)context {
+    if (context == &mergeVisibilityKey) { [self updateVisibilityHold]; return; }
+    if (context == &sceneLayersKey) { [self refreshMask]; return; }
     if (context == &parentGeometryKey) { [self refresh]; return; }
     if (context != &maskObserverKey) {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
         return;
     }
     if (self.updating) return;
+    if ([keyPath isEqualToString:@"hidden"] || [keyPath isEqualToString:@"opacity"]) {
+        [self.mergeInput refreshMask];
+        return;
+    }
     CALayer *source = self.source;
     CGRect bounds = source.bounds;
     CGPoint position = source.position;
@@ -887,14 +1353,16 @@ static void observeNativeAnimations(CALayer *layer) {
 }
 
 - (void)dealloc {
+    [_contourPeer endVisibilityHold:YES];
+    [self endVisibilityHold:YES];
+    [self.mergeScene removeObserver:self forKeyPath:@"sublayers" context:&sceneLayersKey];
     [self.observedParent removeObserver:self forKeyPath:@"bounds" context:&parentGeometryKey];
     removeNativeMaskGeometry(self);
-    restoreNativeCornerModifiers(self);
     CALayer *source = _source;
     for (NSString *key in _keys)
         [source removeObserver:self forKeyPath:key context:&maskObserverKey];
     if (source.mask == _shapeMask) {
-        if (_expandedFill) {
+        if (_applied) {
             baseSetBounds(source, @selector(setBounds:), _nativeBounds);
             baseSetPosition(source, @selector(setPosition:), _nativePosition);
         }
@@ -908,205 +1376,171 @@ static void observeNativeAnimations(CALayer *layer) {
 // CABasicAnimation or model setters. A live cornerRadius modifier can restore
 // pill clipping over the concave mask. Keep that existing modifier in its
 // original native group, but neutralize its rounding while the notch applies.
-@interface MacIslandRadiusModifierBinding : NSObject
+@interface MacIslandModifierBinding : NSObject
 @property(nonatomic, weak) MacIslandNativeMaskObserver *observer;
 @property(nonatomic, weak) id modifier;
-@property(atomic, strong) id nativeValue;
-@end
-@implementation MacIslandRadiusModifierBinding
-@end
-@interface MacIslandGeometryModifierBinding : MacIslandRadiusModifierBinding
 @property(nonatomic, copy) NSString *key;
+@property(atomic, strong) id nativeValue;
+@property(atomic, strong) id nativeVelocity;
 @end
-@implementation MacIslandGeometryModifierBinding
+@implementation MacIslandModifierBinding
 @end
-static char radiusModifierBindingKey, geometryModifierBindingKey, nativeMaskGroupObserversKey;
-static id adjustedNativeGeometry(MacIslandGeometryModifierBinding *binding, id value);
-static void restoreNativeGeometryModifiers(MacIslandNativeMaskObserver *observer);
-static void (*originalModifierValue)(id, SEL, id);
+
+static char modifierBindingKey, nativeMaskGroupObserversKey;
 static void (*originalModifierValueVelocity)(id, SEL, id, id);
 static void (*originalModifierEnabled)(id, SEL, BOOL);
 static void (*originalAddPresentationModifier)(id, SEL, id);
 static void (*originalSetPresentationModifiers)(id, SEL, id);
 static void (*originalRemovePresentationModifier)(id, SEL, id);
-static _Thread_local NSUInteger modifierWriteDepth;
-
 static id nativeModifierObject(id object, NSString *name) {
     SEL selector = NSSelectorFromString(name);
     return [object respondsToSelector:selector] ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
 }
-static BOOL modifierNeedsNotch(MacIslandRadiusModifierBinding *binding) {
-    MacIslandNativeMaskObserver *observer = binding.observer;
-    return observer.applied && isNotchBackground(observer.source);
+static id paintValue(MacIslandModifierBinding *binding, id value) {
+    if ([binding.key isEqual:@"cornerRadius"]) return @0;
+    if (![value isKindOfClass:NSValue.class]) return value;
+    if ([binding.key isEqual:@"bounds.size"] && !strcmp([value objCType], @encode(CGSize)))
+        return [NSValue valueWithSize:paintSize(binding.observer, [value sizeValue])];
+    if ([binding.key isEqual:@"position"] && !strcmp([value objCType], @encode(CGPoint)))
+        return [NSValue valueWithPoint:paintPosition(binding.observer, [value pointValue])];
+    return value;
 }
-static void setModifierValue(id modifier, SEL selector, id value) {
-    MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey) ?: objc_getAssociatedObject(modifier, &geometryModifierBindingKey);
-    if (modifierWriteDepth || !binding) { originalModifierValue(modifier, selector, value); return; }
-    binding.nativeValue = value;
-    modifierWriteDepth++;
-    originalModifierValue(modifier, selector, [binding isKindOfClass:MacIslandGeometryModifierBinding.class] ? adjustedNativeGeometry((id)binding, value) : (modifierNeedsNotch(binding) ? @0 : value));
-    modifierWriteDepth--;
-}
+
+// On this build setValue: forwards to setValue:velocity: with nil.
+// Intercept the terminal setter once, retaining Apple's derivative for motion.
 static void setModifierValueVelocity(id modifier, SEL selector, id value, id velocity) {
-    MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey) ?: objc_getAssociatedObject(modifier, &geometryModifierBindingKey);
-    if (modifierWriteDepth || !binding) { originalModifierValueVelocity(modifier, selector, value, velocity); return; }
-    binding.nativeValue = value;
-    BOOL notch = ![binding isKindOfClass:MacIslandGeometryModifierBinding.class] && modifierNeedsNotch(binding);
-    modifierWriteDepth++;
-    originalModifierValueVelocity(modifier, selector, [binding isKindOfClass:MacIslandGeometryModifierBinding.class] ? adjustedNativeGeometry((id)binding, value) : (notch ? @0 : value), notch ? @0 : velocity);
-    modifierWriteDepth--;
+    MacIslandModifierBinding *binding = objc_getAssociatedObject(modifier, &modifierBindingKey);
+    if (binding.observer.applied) {
+        binding.nativeValue = value;
+        binding.nativeVelocity = velocity;
+        value = paintValue(binding, value);
+        if (velocity && [binding.key isEqual:@"cornerRadius"]) velocity = @0;
+    }
+    originalModifierValueVelocity(modifier, selector, value, velocity);
 }
-// Native animations can stop by disabling a modifier before removing it.
-// Rebuild the vector contour at that exact handoff, using model geometry for
-// values that no longer participate in presentation.
 static void setModifierEnabled(id modifier, SEL selector, BOOL enabled) {
     originalModifierEnabled(modifier, selector, enabled);
-    if (modifierWriteDepth) return;
-    MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey) ?: objc_getAssociatedObject(modifier, &geometryModifierBindingKey);
+    MacIslandModifierBinding *binding = objc_getAssociatedObject(modifier, &modifierBindingKey);
     if (binding.observer.applied) [binding.observer refreshMask];
 }
-static void bindNativeCornerModifier(MacIslandNativeMaskObserver *observer, id modifier) {
-    if (!originalModifierValue || ![nativeModifierObject(modifier, @"keyPath") isEqual:@"cornerRadius"]) return;
-    MacIslandRadiusModifierBinding *binding = objc_getAssociatedObject(modifier, &radiusModifierBindingKey);
-    if (!binding) {
-        binding = [MacIslandRadiusModifierBinding new];
-        binding.modifier = modifier;
-        binding.nativeValue = nativeModifierObject(modifier, @"value");
-        objc_setAssociatedObject(modifier, &radiusModifierBindingKey, binding, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    if (binding.observer != observer) {
+static void bindNativeModifier(MacIslandNativeMaskObserver *observer, id modifier, NSString *key) {
+    if (!([key isEqual:@"cornerRadius"] || [key isEqual:@"bounds.size"] || [key isEqual:@"position"])) return;
+    if (((BOOL (*)(id, SEL))objc_msgSend)(modifier, NSSelectorFromString(@"additive"))) return;
+    MacIslandModifierBinding *binding = objc_getAssociatedObject(modifier, &modifierBindingKey);
+    if (binding && binding.observer != observer && binding.observer) return;
+    if (!binding || !binding.observer) {
+        binding = [MacIslandModifierBinding new];
         binding.observer = observer;
-        if (!observer.radiusModifiers) observer.radiusModifiers = [NSMutableArray array];
-        [observer.radiusModifiers addObject:binding];
+        binding.modifier = modifier;
+        binding.key = key;
+        binding.nativeValue = nativeModifierObject(modifier, @"value");
+        // A spring may already be moving when Apple attaches its modifier.
+        // This pinned build exposes the value getter but only an object ivar
+        // for its derivative. Read it once at attachment, never on each flush.
+        Ivar velocity = class_getInstanceVariable([modifier class], "_velocity");
+        if (velocity && ivar_getTypeEncoding(velocity)[0] == '@')
+            binding.nativeVelocity = object_getIvar(modifier, velocity);
+        objc_setAssociatedObject(modifier, &modifierBindingKey, binding, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        os_unfair_lock_lock(&maskStateLock);
+        observer.modifierBindings = [observer.modifierBindings ?: @[] arrayByAddingObject:binding];
+        os_unfair_lock_unlock(&maskStateLock);
     }
-    if (modifierNeedsNotch(binding)) {
-        modifierWriteDepth++;
-        originalModifierValue(modifier, NSSelectorFromString(@"setValue:"), @0);
-        modifierWriteDepth--;
+    id adjusted = paintValue(binding, binding.nativeValue);
+    if (adjusted && ![adjusted isEqual:nativeModifierObject(modifier, @"value")])
+        originalModifierValueVelocity(modifier, NSSelectorFromString(@"setValue:velocity:"), adjusted,
+                                      [key isEqual:@"cornerRadius"] && binding.nativeVelocity ? @0 : binding.nativeVelocity);
+}
+static void unbindModifier(MacIslandModifierBinding *binding) {
+    id modifier = binding.modifier;
+    if (modifier && objc_getAssociatedObject(modifier, &modifierBindingKey) == binding) {
+        objc_setAssociatedObject(modifier, &modifierBindingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        originalModifierValueVelocity(modifier, NSSelectorFromString(@"setValue:velocity:"), binding.nativeValue, binding.nativeVelocity);
     }
+    binding.observer = nil;
 }
 static MacIslandNativeMaskObserver *modelMaskObserver(CALayer *layer) {
     if (layer.modelLayer != layer) return nil;
     id value = objc_getAssociatedObject(layer, &maskObserverKey);
     return [value isKindOfClass:MacIslandNativeMaskObserver.class] ? value : nil;
 }
-static void addPresentationModifier(CALayer *layer, SEL selector, id modifier) {
+static void modifierListChanged(CALayer *layer) {
     MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
-    if (observer) bindNativeCornerModifier(observer, modifier);
-    originalAddPresentationModifier(layer, selector, modifier);
     if (observer.applied) [observer refreshMask];
+    else if (observer) synchronizeNativeMaskGeometry(observer);
+}
+static void addPresentationModifier(CALayer *layer, SEL selector, id modifier) {
+    originalAddPresentationModifier(layer, selector, modifier);
+    modifierListChanged(layer);
 }
 static void setPresentationModifiers(CALayer *layer, SEL selector, id modifiers) {
-    MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
-    if (observer && [modifiers isKindOfClass:NSArray.class])
-        for (id modifier in modifiers) bindNativeCornerModifier(observer, modifier);
     originalSetPresentationModifiers(layer, selector, modifiers);
-    if (observer.applied) [observer refreshMask];
+    modifierListChanged(layer);
 }
-static void synchronizeNativeCornerModifiers(MacIslandNativeMaskObserver *observer) {
-    id modifiers = nativeModifierObject(observer.source, @"presentationModifiers");
-    NSIndexSet *expired = [observer.radiusModifiers indexesOfObjectsPassingTest:^BOOL(MacIslandRadiusModifierBinding *binding, __unused NSUInteger index, __unused BOOL *stop) { return !binding.modifier; }];
-    if (expired.count) [observer.radiusModifiers removeObjectsAtIndexes:expired];
-    if ([modifiers isKindOfClass:NSArray.class])
-        for (id modifier in modifiers) bindNativeCornerModifier(observer, modifier);
-}
-static void restoreNativeCornerModifiers(MacIslandNativeMaskObserver *observer) {
-    if (!originalModifierValue) return;
-    for (MacIslandRadiusModifierBinding *binding in observer.radiusModifiers) {
-        id modifier = binding.modifier;
-        if (modifier && binding.observer == observer) {
-            modifierWriteDepth++;
-            originalModifierValue(modifier, NSSelectorFromString(@"setValue:"), binding.nativeValue);
-            modifierWriteDepth--;
-        }
-    }
-}
-// Keep vector geometry in the native modifier transaction. The existing
-// bounds modifier is shared with the mask; no extra modifier slots, spring,
-// raster stretching, or separate display timer are introduced.
 static BOOL nativeModifierEnabled(id modifier) {
     SEL selector = NSSelectorFromString(@"isEnabled");
     return [modifier respondsToSelector:selector] && ((BOOL (*)(id, SEL))objc_msgSend)(modifier, selector);
 }
-static id adjustedNativeGeometry(MacIslandGeometryModifierBinding *binding, id value) {
-    MacIslandNativeMaskObserver *observer = binding.observer;
-    if (!observer.applied || observer.pixelInset <= 0 || ![value isKindOfClass:NSValue.class]) return value;
-    if ([binding.key isEqual:@"bounds.size"] && !strcmp([value objCType], @encode(CGSize))) {
-        CGSize size = [value sizeValue];
-        size.height += 2 * observer.pixelInset;
-        return [NSValue valueWithSize:size];
-    }
-    if ([binding.key isEqual:@"position"] && !strcmp([value objCType], @encode(CGPoint))) {
-        CGPoint point = [value pointValue];
-        point.y += (2 * observer.source.anchorPoint.y - 1) * observer.pixelInset;
-        return [NSValue valueWithPoint:point];
-    }
-    return value;
-}
-static void bindNativeGeometryModifier(MacIslandNativeMaskObserver *observer, id modifier) {
-    NSString *key = nativeModifierObject(modifier, @"keyPath");
-    if (![key isEqual:@"bounds.size"] && ![key isEqual:@"position"]) return;
-    MacIslandGeometryModifierBinding *binding = objc_getAssociatedObject(modifier, &geometryModifierBindingKey);
-    if (binding.observer && binding.observer != observer) return;
-    if (!binding) {
-        binding = [MacIslandGeometryModifierBinding new];
-        binding.modifier = modifier;
-        binding.key = key;
-        binding.nativeValue = nativeModifierObject(modifier, @"value");
-        objc_setAssociatedObject(modifier, &geometryModifierBindingKey, binding, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    if (binding.observer != observer) {
-        binding.observer = observer;
-        if (!observer.geometryModifiers) observer.geometryModifiers = [NSMutableArray array];
-        [observer.geometryModifiers addObject:binding];
-    }
-    modifierWriteDepth++;
-    originalModifierValue(modifier, NSSelectorFromString(@"setValue:"), adjustedNativeGeometry(binding, binding.nativeValue));
-    modifierWriteDepth--;
-}
-static void restoreNativeGeometryModifiers(MacIslandNativeMaskObserver *observer) {
-    for (MacIslandGeometryModifierBinding *binding in observer.geometryModifiers) {
-        id modifier = binding.modifier;
-        if (!modifier || binding.observer != observer) continue;
-        modifierWriteDepth++;
-        originalModifierValue(modifier, NSSelectorFromString(@"setValue:"), binding.nativeValue);
-        modifierWriteDepth--;
-        binding.observer = nil;
-    }
-    [observer.geometryModifiers removeAllObjects];
-}
 static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
-    if (observer.nativeMaskSize && originalRemovePresentationModifier)
-        originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), observer.nativeMaskSize);
+    // Detach all state under the lock, then call out to Core Animation.
+    os_unfair_lock_lock(&maskStateLock);
+    id size = observer.nativeMaskSize;
+    NSArray *groups = observer.nativeMaskGroups;
+    NSArray *bindings = observer.modifierBindings;
     observer.nativeMaskSize = nil;
-    for (id group in observer.nativeMaskGroups) {
+    observer.nativeMaskGroups = nil;
+    observer.modifierBindings = nil;
+    os_unfair_lock_unlock(&maskStateLock);
+    if (size && originalRemovePresentationModifier)
+        originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), size);
+    for (id group in groups) {
         @synchronized(group) { [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) removeObject:observer]; }
     }
-    [observer.nativeMaskGroups removeAllObjects];
-    restoreNativeGeometryModifiers(observer);
+    for (MacIslandModifierBinding *binding in bindings) unbindModifier(binding);
 }
 static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
-    if (!observer.applied || !originalAddPresentationModifier) return;
+    if (!originalAddPresentationModifier) return;
+    BOOL member = observer.applied || isSecondaryMergeInput(observer.source);
+    NSArray *modifiers = member ? nativeModifierObject(observer.source, @"presentationModifiers") : nil;
+    NSMutableArray *stale = [NSMutableArray array];
+    for (MacIslandModifierBinding *binding in observer.modifierBindings) {
+        if (!observer.applied || !binding.modifier || ![modifiers containsObject:binding.modifier])
+            [stale addObject:binding];
+    }
+    if (stale.count) {
+        os_unfair_lock_lock(&maskStateLock);
+        NSMutableArray *kept = [observer.modifierBindings mutableCopy];
+        for (id binding in stale) [kept removeObjectIdenticalTo:binding];
+        observer.modifierBindings = kept;
+        os_unfair_lock_unlock(&maskStateLock);
+        for (MacIslandModifierBinding *binding in stale) unbindModifier(binding);
+    }
     id size = nil;
     NSMutableArray *groups = [NSMutableArray array];
-    for (id modifier in nativeModifierObject(observer.source, @"presentationModifiers")) {
-        // Retain the observer binding while disabled too, so re-enabling the
-        // same native modifier can refresh its mask before the next flush.
-        bindNativeGeometryModifier(observer, modifier);
-        if (!nativeModifierEnabled(modifier)) continue;
+    for (id modifier in modifiers) {
         NSString *key = nativeModifierObject(modifier, @"keyPath");
-        if ([key isEqual:@"bounds.size"]) size = modifier;
+        if (observer.applied) {
+            bindNativeModifier(observer, modifier, key);
+            if ([key isEqual:@"bounds.size"] && nativeModifierEnabled(modifier) &&
+                ((MacIslandModifierBinding *)objc_getAssociatedObject(modifier, &modifierBindingKey)).observer == observer)
+                size = modifier;
+        }
         id group = nativeModifierObject(modifier, @"group");
-        if (!group || !([key isEqual:@"bounds.size"] || [key isEqual:@"position"] || [key isEqual:@"anchorPoint"])) continue;
-        if (![groups containsObject:group]) [groups addObject:group];
+        if (group && ![groups containsObject:group]) [groups addObject:group];
     }
-    for (id group in observer.nativeMaskGroups) {
+    os_unfair_lock_lock(&maskStateLock);
+    NSArray *previousGroups = observer.nativeMaskGroups ?: @[];
+    observer.nativeMaskGroups = groups;
+    id previousSize = observer.nativeMaskSize;
+    BOOL sizeChanged = previousSize != size;
+    if (sizeChanged) observer.nativeMaskSize = size;
+    os_unfair_lock_unlock(&maskStateLock);
+    for (id group in previousGroups) {
         if (![groups containsObject:group]) {
             @synchronized(group) { [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) removeObject:observer]; }
         }
     }
     for (id group in groups) {
-        if (![observer.nativeMaskGroups containsObject:group]) {
+        if (![previousGroups containsObject:group]) {
             @synchronized(group) {
                 NSHashTable *observers = objc_getAssociatedObject(group, &nativeMaskGroupObserversKey);
                 if (!observers) {
@@ -1117,72 +1551,53 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
             }
         }
     }
-    observer.nativeMaskGroups = groups;
-    if (size == observer.nativeMaskSize) return;
-    if (observer.nativeMaskSize)
-        originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), observer.nativeMaskSize);
-    observer.nativeMaskSize = size;
+    if (!sizeChanged) return;
+    if (previousSize)
+        originalRemovePresentationModifier(observer.shapeMask, NSSelectorFromString(@"removePresentationModifier:"), previousSize);
     if (size) originalAddPresentationModifier(observer.shapeMask, NSSelectorFromString(@"addPresentationModifier:"), size);
 }
 static _Thread_local NSUInteger nativeGroupFlushDepth;
 static NSArray *nativeGroupMaskObservers(id group) {
-    @synchronized(group) { return [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) allObjects]; }
+    NSArray *snapshot;
+    @synchronized(group) { snapshot = [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) allObjects]; }
+    // Reparenting an entire secondary branch need not notify its leaf.
+    for (MacIslandNativeMaskObserver *observer in snapshot)
+        if (observer.applied || isSecondaryMergeInput(observer.source)) return snapshot;
+    return nil;
 }
 static void refreshNativeGroupMasks(NSArray *observers) {
     for (MacIslandNativeMaskObserver *observer in observers) [observer refreshMask];
 }
 static void installNativeGroupFlushHooks(void) {
     Class groupClass = NSClassFromString(@"CAPresentationModifierGroup");
-    SEL transactional = NSSelectorFromString(@"flushWithTransaction");
-    SEL transactionalTimed = NSSelectorFromString(@"flushWithTransactionAndTargetTime:");
-    Method transactionMethod = class_getInstanceMethod(groupClass, transactional);
-    Method transactionTimedMethod = class_getInstanceMethod(groupClass, transactionalTimed);
-    void (*transactionFlush)(id, SEL) = transactionMethod ? (void *)method_getImplementation(transactionMethod) : NULL;
-    void (*transactionTimedFlush)(id, SEL, double) = transactionTimedMethod ? (void *)method_getImplementation(transactionTimedMethod) : NULL;
-    // An ordinary native flush swaps shared-memory buffers immediately. The
-    // vector path is a transaction property: submit these together through
-    // Apple's transactional flush, retaining the original target time.
-    for (NSString *name in @[@"flush", @"flushLocally", @"flushWithTransaction"]) {
-        Method method = class_getInstanceMethod(groupClass, NSSelectorFromString(name));
-        if (!method) continue;
-        void (*previous)(id, SEL) = (void *)method_getImplementation(method);
-        SEL selector = NSSelectorFromString(name);
-        method_setImplementation(method, imp_implementationWithBlock(^(id group) {
-            if (nativeGroupFlushDepth) { previous(group, selector); return; }
-            NSArray *observers = nativeGroupMaskObservers(group);
-            if (!observers.count) { previous(group, selector); return; }
-            nativeGroupFlushDepth++;
-            [CATransaction begin]; [CATransaction setDisableActions:YES];
-            refreshNativeGroupMasks(observers);
-            if (selector == NSSelectorFromString(@"flush") && transactionFlush)
-                transactionFlush(group, transactional);
-            else previous(group, selector);
-            [CATransaction commit]; nativeGroupFlushDepth--;
-        }));
-    }
+    // All three untimed entry points forward to their timed counterparts.
+    // A local flush prepares the group's back buffer without publishing it.
+    SEL transaction = NSSelectorFromString(@"flushWithTransactionAndTargetTime:");
+    Method method = class_getInstanceMethod(groupClass, transaction);
+    if (!method) return;
+    void (*submit)(id, SEL, double) = (void *)method_getImplementation(method);
     for (NSString *name in @[@"flushWithTargetTime:", @"flushLocallyWithTargetTime:", @"flushWithTransactionAndTargetTime:"]) {
-        Method method = class_getInstanceMethod(groupClass, NSSelectorFromString(name));
-        if (!method) continue;
-        void (*previous)(id, SEL, double) = (void *)method_getImplementation(method);
         SEL selector = NSSelectorFromString(name);
-        method_setImplementation(method, imp_implementationWithBlock(^(id group, double time) {
-            if (nativeGroupFlushDepth) { previous(group, selector, time); return; }
-            NSArray *observers = nativeGroupMaskObservers(group);
+        Method entry = class_getInstanceMethod(groupClass, selector);
+        if (!entry) continue;
+        void (*previous)(id, SEL, double) = (void *)method_getImplementation(entry);
+        method_setImplementation(entry, imp_implementationWithBlock(^(id group, double time) {
+            NSArray *observers = nativeGroupFlushDepth ? nil : nativeGroupMaskObservers(group);
             if (!observers.count) { previous(group, selector, time); return; }
             nativeGroupFlushDepth++;
-            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
             refreshNativeGroupMasks(observers);
-            if (selector == NSSelectorFromString(@"flushWithTargetTime:") && transactionTimedFlush)
-                transactionTimedFlush(group, transactionalTimed, time);
+            if (selector == NSSelectorFromString(@"flushWithTargetTime:")) submit(group, transaction, time);
             else previous(group, selector, time);
-            [CATransaction commit]; nativeGroupFlushDepth--;
+            [CATransaction commit];
+            nativeGroupFlushDepth--;
         }));
     }
 }
 static void removePresentationModifier(CALayer *layer, SEL selector, id modifier) {
     originalRemovePresentationModifier(layer, selector, modifier);
-    MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
-    if (observer.applied) [observer refreshMask];
+    modifierListChanged(layer);
 }
 
 static void installNativeCornerModifierHooks(void) {
@@ -1193,20 +1608,45 @@ static void installNativeCornerModifierHooks(void) {
     Method add = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"addPresentationModifier:"));
     Method set = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"setPresentationModifiers:"));
     Method remove = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"removePresentationModifier:"));
-    if (!value || !velocity || !enabled || !add || !set || !remove || originalModifierValue) return;
-    originalModifierValue = (void *)method_getImplementation(value);
+    if (!value || !velocity || !enabled || !add || !set || !remove || originalModifierValueVelocity) return;
     originalModifierValueVelocity = (void *)method_getImplementation(velocity);
     originalModifierEnabled = (void *)method_getImplementation(enabled);
     originalAddPresentationModifier = (void *)method_getImplementation(add);
     originalSetPresentationModifiers = (void *)method_getImplementation(set);
     originalRemovePresentationModifier = (void *)method_getImplementation(remove);
-    method_setImplementation(value, (IMP)setModifierValue);
     method_setImplementation(velocity, (IMP)setModifierValueVelocity);
     method_setImplementation(enabled, (IMP)setModifierEnabled);
     method_setImplementation(add, (IMP)addPresentationModifier);
     method_setImplementation(set, (IMP)setPresentationModifiers);
     method_setImplementation(remove, (IMP)removePresentationModifier);
     installNativeGroupFlushHooks();
+}
+
+static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
+    id association = objc_getAssociatedObject(layer, &maskObserverKey);
+    if ([association isKindOfClass:MacIslandNativeMaskObserver.class]) {
+        MacIslandNativeMaskObserver *peer = association;
+        MacIslandNativeMaskObserver *input = peer.mergeInput;
+        if (!hidden) [peer endVisibilityHold:NO];
+        else if (input && input.contourPeer == peer && input.applied && peer.applied &&
+                 !layer.hidden && layer.opacity >= 1 && !layer.contents && layer.sublayers.count == 0 &&
+                 isOpaqueBlack(layer.backgroundColor) && layer.mask == peer.shapeMask &&
+                 layer.superlayer == input.source.superlayer.superlayer) {
+            CALayer *group = input.source.superlayer;
+            id blur = activeMergeBlur(group);
+            if (blur) {
+                if (!peer.heldBlur) {
+                    peer.heldUnion = group;
+                    peer.heldBlur = blur;
+                    [group addObserver:peer forKeyPath:@"filters" options:0 context:&mergeVisibilityKey];
+                    [blur addObserver:peer forKeyPath:@"inputRadius" options:0 context:&mergeVisibilityKey];
+                    [blur addObserver:peer forKeyPath:@"enabled" options:0 context:&mergeVisibilityKey];
+                }
+                return;
+            }
+        }
+    }
+    originalSetHidden(layer, selector, hidden);
 }
 
 static void setCornerRadius(CALayer *layer, SEL selector, CGFloat radius) {
@@ -1218,7 +1658,7 @@ static void setCornerRadius(CALayer *layer, SEL selector, CGFloat radius) {
     if (model != layer) {
         id modelAssociation = objc_getAssociatedObject(model, &maskObserverKey);
         MacIslandNativeMaskObserver *observer = [modelAssociation isKindOfClass:MacIslandNativeMaskObserver.class] ? modelAssociation : nil;
-        originalSetCornerRadius(layer, selector, observer.applied && isNotchBackground(model) ? 0 : radius);
+        originalSetCornerRadius(layer, selector, observer.applied && isNotchBackground(model, observer) ? 0 : radius);
         return;
     }
     id association = objc_getAssociatedObject(layer, &maskObserverKey);
@@ -1239,35 +1679,135 @@ static void setCornerRadius(CALayer *layer, SEL selector, CGFloat radius) {
     objc_setAssociatedObject(layer, &maskObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
+
+// Apply the half-backing-pixel sampling correction after the native scene has
+// drawn its masks and merge effects. Do not reshape individual islands.
+@interface MacIslandSceneOriginObserver : NSObject
+@property(nonatomic, weak) CALayer *source;
+@property(nonatomic) CATransform3D nativeTransform;
+@property(nonatomic) CGFloat pixel;
+@property(nonatomic) BOOL updating;
+- (instancetype)initWithLayer:(CALayer *)layer;
+- (void)refresh;
+@end
+@implementation MacIslandSceneOriginObserver
+- (instancetype)initWithLayer:(CALayer *)layer {
+    if ((self = [super init])) {
+        _source = layer;
+        _nativeTransform = layer.sublayerTransform;
+        [layer addObserver:self forKeyPath:@"sublayerTransform" options:0 context:&sceneOriginObserverKey];
+    }
+    return self;
+}
+- (void)refresh {
+    if (self.updating || !self.source) return;
+    self.updating = YES;
+    CATransform3D transform = self.nativeTransform;
+    transform.m42 -= self.pixel;
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    baseSetSublayerTransform(self.source, @selector(setSublayerTransform:), transform);
+    [CATransaction commit];
+    self.updating = NO;
+}
+- (void)observeValueForKeyPath:(NSString *)key ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (context != &sceneOriginObserverKey) {
+        [super observeValueForKeyPath:key ofObject:object change:change context:context];
+        return;
+    }
+    if (self.updating) return;
+    CATransform3D expected = self.nativeTransform;
+    expected.m42 -= self.pixel;
+    CATransform3D value = self.source.sublayerTransform;
+    if (CATransform3DEqualToTransform(value, expected)) return;
+    self.nativeTransform = value;
+    [self refresh];
+}
+- (void)dealloc {
+    CALayer *source = self.source;
+    [source removeObserver:self forKeyPath:@"sublayerTransform" context:&sceneOriginObserverKey];
+    if (source && self.pixel > 0) baseSetSublayerTransform(source, @selector(setSublayerTransform:), self.nativeTransform);
+}
+@end
+
+static void refreshNativeBackgroundCoverage(CALayer *layer) {
+    id observer = objc_getAssociatedObject(layer, &maskObserverKey);
+    if ([observer isKindOfClass:MacIslandNativeMaskObserver.class]) [observer refresh];
+    for (CALayer *child in layer.sublayers) refreshNativeBackgroundCoverage(child);
+}
+
+static void refreshNativeSceneOrigin(NSWindow *window) {
+    if (![window isKindOfClass:NSWindow.class]) return;
+    CALayer *root = window.contentView.layer;
+    if (!root) return;
+    MacIslandSceneOriginObserver *observer = objc_getAssociatedObject(root, &sceneOriginObserverKey);
+    NSScreen *screen = window.screen;
+    NSRect left = screen.auxiliaryTopLeftArea, right = screen.auxiliaryTopRightArea;
+    BOOL eligible = window.visible && screen.safeAreaInsets.top > 0 && !NSIsEmptyRect(left) && !NSIsEmptyRect(right) &&
+        [NSStringFromClass(root.class) hasPrefix:@"MBGated_"] &&
+        fabs(window.frame.size.width - screen.frame.size.width) < 1 &&
+        fabs(window.frame.size.height - screen.frame.size.height) < 1 &&
+        fabs(root.bounds.size.width - screen.frame.size.width) < 1 &&
+        fabs(root.bounds.size.height - screen.frame.size.height) < 1;
+    if (!eligible && !observer) return;
+    if (!observer) {
+        observer = [[MacIslandSceneOriginObserver alloc] initWithLayer:root];
+        objc_setAssociatedObject(root, &sceneOriginObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    CGFloat pixel = eligible ? 0.5 / MAX(screen.backingScaleFactor, 1) : 0;
+    if (observer.pixel != pixel) { observer.pixel = pixel; [observer refresh]; refreshNativeBackgroundCoverage(root); }
+}
+static void refreshAllNativeSceneOrigins(void) {
+    for (NSWindow *window in NSApp.windows) refreshNativeSceneOrigin(window);
+}
+
 __attribute__((constructor))
 static void installNativeNotchMask(void) {
     if (strcmp(getprogname(), "MenuBarAgent") != 0) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         updateScreenGeometry();
+        refreshAllNativeSceneOrigins();
+        for (NSNotificationName name in @[NSWindowDidUpdateNotification, NSWindowDidResizeNotification, NSWindowDidChangeScreenNotification])
+            [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *notification) { refreshNativeSceneOrigin(notification.object); }];
         [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification
                                                        object:nil queue:NSOperationQueue.mainQueue
-                                                   usingBlock:^(__unused NSNotification *notification) { updateScreenGeometry(); }];
+                                                   usingBlock:^(__unused NSNotification *notification) {
+            updateScreenGeometry();
+            refreshAllNativeSceneOrigins();
+            // A resolution change can keep the backing scale (so no pixel change
+            // above) while moving the notch in points. Re-evaluate every mask.
+            for (NSWindow *window in NSApp.windows) {
+                CALayer *root = window.contentView.layer;
+                if (root) refreshNativeBackgroundCoverage(root);
+            }
+        }];
     });
     Method method = class_getInstanceMethod(CALayer.class, @selector(setCornerRadius:));
     originalSetCornerRadius = (void *)method_getImplementation(method);
     baseSetBounds = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setBounds:)));
     baseSetPosition = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setPosition:)));
+    baseSetSublayerTransform = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setSublayerTransform:)));
+    Method visibility = class_getInstanceMethod(CALayer.class, @selector(setHidden:));
+    originalSetHidden = (void *)method_getImplementation(visibility);
+    method_setImplementation(visibility, (IMP)setNativeMaterialHidden);
     method_setImplementation(method, (IMP)setCornerRadius);
     installNativeCornerModifierHooks();
 }
-
 MACISLAND_MASK_M
 
   cat > "$SCRATCH/loader.py" <<'MACISLAND_LOADER_PY'
-"""Inject the Dynamic Island interposer into the next MenuBarAgent process."""
+"""Inject the Dynamic Island interposer into MenuBarAgent and keep it applied."""
 
 import argparse
 from contextlib import contextmanager
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -1276,6 +1816,75 @@ LAUNCHCTL = "/bin/launchctl"
 SERVICE = f"gui/{os.getuid()}/com.apple.MenuBarAgent"
 ENVIRONMENT_KEY = "DYLD_INSERT_LIBRARIES"
 LIBRARY = str(Path.home() / "Library/MacIsland/island.dylib")
+SUPPORTED_BUILD = "26C5035r"
+MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
+# Readiness is read through a fresh debugger attachment. Wait progressively,
+# rather than attaching repeatedly while the provider's main queue is busy.
+MUSIC_READY_DELAYS = (0.15, 0.35, 0.75, 1.5, 2.5)
+# Automatic reapplication budget per component. A patch that makes a service
+# crash repeatedly must not turn into an endless restart loop.
+REAPPLY_LIMIT = 3
+REAPPLY_WINDOW = 15 * 60
+
+
+def log(message, *, error=False):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", file=sys.stderr if error else sys.stdout, flush=True)
+
+
+def state_path():
+    return Path(LIBRARY).with_name("loader-state.json")
+
+
+def load_state():
+    try:
+        value = json.loads(state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_state(state):
+    path = state_path()
+    temporary = path.with_name(path.name + ".next")
+    temporary.write_text(json.dumps(state, sort_keys=True))
+    temporary.replace(path)
+
+
+def current_build():
+    return subprocess.check_output(["/usr/bin/sw_vers", "-buildVersion"], text=True).strip()
+
+
+def require_supported_build():
+    build = current_build()
+    if build != SUPPORTED_BUILD:
+        raise RuntimeError(
+            f"Unsupported OS build {build} (supported: {SUPPORTED_BUILD}); services left unchanged")
+    return build
+
+
+def find_lldb(*, required=True):
+    try:
+        return subprocess.check_output(["/usr/bin/xcrun", "--find", "lldb"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        if required:
+            raise RuntimeError("LLDB was not found in the selected developer tools")
+        return None
+
+
+def process_identity(pid):
+    """PID plus start time, so a reused PID is never mistaken for a patched one."""
+    if not pid:
+        return None
+    result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                            capture_output=True, text=True)
+    start = result.stdout.strip()
+    return f"{pid}@{start}" if result.returncode == 0 and start else None
+
+
+def is_traced(pid):
+    flags = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "flags="], text=True).strip()
+    return bool(int(flags, 16) & 0x800)  # Darwin P_TRACED
 
 
 def menu_bar_agent_pid():
@@ -1288,57 +1897,49 @@ def menu_bar_agent_pid():
     return int(match.group(1)) if match else None
 
 
-def legacy_main():
-    library_path = Path(LIBRARY)
-    if not library_path.is_file():
-        raise RuntimeError("Missing island.dylib; no launch environment changed")
+def legacy_main(library_path):
+    """Restart through the launch environment. The caller holds loader.lock."""
+    domain = subprocess.check_output(
+        [LAUNCHCTL, "print", f"gui/{os.getuid()}"], text=True
+    )
+    environment = re.search(
+        r"^\tenvironment = \{\n(.*?)^\t\}", domain, re.MULTILINE | re.DOTALL
+    )
+    if environment is None:
+        raise RuntimeError("Cannot establish prior launch environment")
 
-    # Prevent two login/reload events from racing while they temporarily change
-    # the per-user launch environment.
-    with (library_path.parent / "loader.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        domain = subprocess.check_output(
-            [LAUNCHCTL, "print", f"gui/{os.getuid()}"], text=True
+    prior = re.search(
+        rf"^\t\t{re.escape(ENVIRONMENT_KEY)} => (.*)$",
+        environment.group(1),
+        re.MULTILINE,
+    )
+    old_value = prior.group(1) if prior else None
+    previous_pid = menu_bar_agent_pid()
+    injected_value = library_path.as_posix()
+    if old_value:
+        injected_value = f"{old_value}:{injected_value}"
+
+    try:
+        subprocess.run(
+            [LAUNCHCTL, "setenv", ENVIRONMENT_KEY, injected_value], check=True
         )
-        environment = re.search(
-            r"^\tenvironment = \{\n(.*?)^\t\}", domain, re.MULTILINE | re.DOTALL
+        subprocess.run([LAUNCHCTL, "kickstart", "-k", SERVICE], check=True)
+
+        for _ in range(100):
+            current_pid = menu_bar_agent_pid()
+            if current_pid and current_pid != previous_pid:
+                print(f"MenuBarAgent started: {current_pid}", flush=True)
+                return current_pid
+            time.sleep(0.1)
+        raise RuntimeError("MenuBarAgent did not report a new PID")
+    finally:
+        restore = (
+            ["unsetenv", ENVIRONMENT_KEY]
+            if old_value is None
+            else ["setenv", ENVIRONMENT_KEY, old_value]
         )
-        if environment is None:
-            raise RuntimeError("Cannot establish prior launch environment")
-
-        prior = re.search(
-            rf"^\t\t{re.escape(ENVIRONMENT_KEY)} => (.*)$",
-            environment.group(1),
-            re.MULTILINE,
-        )
-        old_value = prior.group(1) if prior else None
-        previous_pid = menu_bar_agent_pid()
-        injected_value = library_path.as_posix()
-        if old_value:
-            injected_value = f"{old_value}:{injected_value}"
-
-        try:
-            subprocess.run(
-                [LAUNCHCTL, "setenv", ENVIRONMENT_KEY, injected_value], check=True
-            )
-            subprocess.run([LAUNCHCTL, "kickstart", "-k", SERVICE], check=True)
-
-            for _ in range(100):
-                current_pid = menu_bar_agent_pid()
-                if current_pid and current_pid != previous_pid:
-                    print(f"MenuBarAgent started: {current_pid}", flush=True)
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError("MenuBarAgent did not report a new PID")
-        finally:
-            restore = (
-                ["unsetenv", ENVIRONMENT_KEY]
-                if old_value is None
-                else ["setenv", ENVIRONMENT_KEY, old_value]
-            )
-            subprocess.run([LAUNCHCTL, *restore], check=True)
-            print("Prior launch environment restored", flush=True)
+        subprocess.run([LAUNCHCTL, *restore], check=True)
+        print("Prior launch environment restored", flush=True)
 
 
 def current_boot_arguments():
@@ -1346,6 +1947,14 @@ def current_boot_arguments():
     return subprocess.check_output(
         ["/usr/sbin/sysctl", "-n", "kern.bootargs"], text=True
     ).strip()
+
+
+def amfi_globally_disabled():
+    return any(
+        token.startswith("amfi_get_out_of_my_way=")
+        and token.split("=", 1)[1] in ("1", "0x1")
+        for token in current_boot_arguments().split()
+    )
 
 
 @contextmanager
@@ -1427,44 +2036,266 @@ def debugger_load(service, library_path, lldb, *, timeout=30):
         raise
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--debugger", action="store_true",
-                        help="Force the process-scoped debugger loader")
-    args = parser.parse_args()
-    boot_arguments = current_boot_arguments()
-    globally_disabled = any(
-        token.startswith("amfi_get_out_of_my_way=")
-        and token.split("=", 1)[1] in ("1", "0x1")
-        for token in boot_arguments.split()
+def music_pid():
+    result = subprocess.run(
+        ["/usr/bin/pgrep", "-u", str(os.getuid()), "-x", "MediaRemoteUIService"],
+        capture_output=True, text=True,
     )
-    lldb = subprocess.check_output(["/usr/bin/xcrun", "--find", "lldb"],
-                                   text=True).strip()
-    if args.status:
-        print(f"AMFI-disable boot flag active: {globally_disabled}")
-        print(f"Selected loader: {'legacy' if globally_disabled and not args.debugger else 'debugger'}")
-        print(f"Debugger: {lldb}")
+    if result.returncode == 1:
+        return None
+    result.check_returncode()
+    pid = result.stdout.strip()
+    if not pid.isdecimal() or subprocess.check_output(
+        ["/bin/ps", "-p", pid, "-o", "comm="], text=True,
+    ).strip() != MUSIC_EXE:
+        raise RuntimeError("Could not identify the current user's music UI provider")
+    return pid
+
+
+def available_music_pid(pid):
+    if music_pid() != pid:
+        raise RuntimeError("The music UI provider restarted")
+    flags = subprocess.check_output(["/bin/ps", "-p", pid, "-o", "flags="], text=True)
+    if int(flags.strip(), 16) & 0x800:
+        raise RuntimeError("The music UI provider is already being debugged")
+
+
+def stop_managed_music(library):
+    """Unmap our old provider code before replacing it or restoring a backup."""
+    pid = music_pid()
+    if pid is None:
         return
-    if globally_disabled and not args.debugger:
-        legacy_main()
+    mapped = subprocess.check_output(["/usr/bin/vmmap", "-w", pid], text=True, timeout=20)
+    if not any(line.rstrip().endswith(" " + str(library)) for line in mapped.splitlines()):
         return
+    available_music_pid(pid)
+    os.kill(int(pid), 15)
+    for _ in range(50):
+        if music_pid() != pid:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("The old music UI provider is still running")
+
+
+def prepare_music(library, lldb, *, launch=True):
+    """Install the expanded music layout. Returns the provider PID, or None if absent."""
+    if not library.is_file():
+        return None
+    require_supported_build()
+    pid = music_pid()
+    if pid is None and launch:
+        subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.MediaRemoteUIService"],
+                       check=True, timeout=15)
+        for _ in range(50):
+            pid = music_pid()
+            if pid:
+                break
+            time.sleep(0.1)
+        if pid is None:
+            raise RuntimeError("The native music UI provider did not start")
+    if pid is None:
+        return None
+    if not lldb:
+        raise RuntimeError("LLDB is required for the native music layout")
+
+    # Encode the filesystem bytes, including spaces and quotes, as a C literal.
+    path = '"' + ''.join(f'\\x{byte:02x}' for byte in os.fsencode(library)) + '"'
+    with tempfile.TemporaryDirectory(prefix="macisland-music-") as scratch:
+        def invoke(symbol, load):
+            available_music_pid(pid)
+            expr = f'void *h = dlopen({path}, RTLD_NOLOAD | RTLD_NOW); bool resident = h != 0; '
+            if load:
+                expr += f'if (!h) h = dlopen({path}, RTLD_NOW | RTLD_LOCAL); '
+            expr += (f'int (*fn)(void) = h ? (int(*)(void))dlsym(h, "{symbol}") : 0; '
+                     'int rc = fn ? fn() : -100; if (resident) dlclose(h); (int)rc')
+            result = subprocess.run(
+                [lldb, "--no-lldbinit", "--batch", "--attach-pid", pid,
+                 "-O", f"settings set symbols.clang-modules-cache-path {scratch}/modules",
+                 "-o", "expr -l objc++ -- @import Darwin",
+                 "-o", "expr -a true -t 3000000 -l objc++ -- " + expr,
+                 "-o", "process detach"], capture_output=True, text=True, timeout=40,
+            )
+            match = re.search(r"^\(int\) \$\d+ = (-?\d+)$", result.stdout, re.MULTILINE)
+            if result.returncode or not match:
+                raise RuntimeError(f"Could not verify {symbol} in the music UI provider: {result.stderr.strip()}")
+            return int(match.group(1))
+
+        if invoke("mi_music_enable", True) != 0:
+            raise RuntimeError("The music UI provider rejected the build or bundle")
+        # Installation runs on the target's main queue after LLDB detaches.
+        # At login that queue can be busy; 0 means it has not run yet.
+        state = 0
+        for delay in MUSIC_READY_DELAYS:
+            time.sleep(delay)
+            state = invoke("mi_music_status", False)
+            if state == 1:
+                print(f"Verified native music layout in PID {pid}", flush=True)
+                return pid
+            if state < 0:
+                break
+        raise RuntimeError(f"The music provider did not accept its native layout (state {state})")
+
+
+def prepare_music_safely(library, lldb, *, launch=True):
+    """The optional music layout must never prevent the island from loading."""
+    try:
+        return prepare_music(library, lldb, launch=launch)
+    except Exception as error:
+        log(f"Native music layout skipped: {error}", error=True)
+        return None
+
+
+def inject(state, *, force_debugger=False):
+    """Apply the music layout (optional) and the island (required).
+
+    The caller holds loader.lock. Records what was patched in ``state``.
+    """
+    require_supported_build()
     library_path = Path(LIBRARY)
     if not library_path.is_file():
         raise RuntimeError("Missing island.dylib; service unchanged")
-    sip = subprocess.check_output(["/usr/bin/csrutil", "status"], text=True)
-    if "status: disabled" not in sip:
-        raise RuntimeError("This loader requires existing disabled SIP")
-    with (library_path.parent / "loader.lock").open("w") as lock:
+    legacy = amfi_globally_disabled() and not force_debugger
+    lldb = find_lldb(required=not legacy)
+    if not legacy:
+        sip = subprocess.check_output(["/usr/bin/csrutil", "status"], text=True)
+        if "status: disabled" not in sip:
+            raise RuntimeError("This loader requires existing disabled SIP")
+    pid = menu_bar_agent_pid()
+    if pid and is_traced(pid):
+        raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
+    music = prepare_music_safely(library_path.with_name("notch-music.dylib"), lldb)
+    state["music"] = process_identity(music)
+    if legacy:
+        new_pid = legacy_main(library_path)
+    else:
+        new_pid = debugger_load(SERVICE, library_path.resolve(), lldb)
+    state["menubar"] = process_identity(new_pid)
+    return new_pid
+
+
+def take_attempt(state, name, now=None):
+    """Allow at most REAPPLY_LIMIT automatic attempts per REAPPLY_WINDOW."""
+    now = time.time() if now is None else now
+    key = f"{name}_attempts"
+    recent = [t for t in state.get(key, []) if isinstance(t, (int, float)) and 0 <= now - t < REAPPLY_WINDOW]
+    state[key] = recent
+    if len(recent) >= REAPPLY_LIMIT:
+        if not state.get(f"{name}_paused"):
+            log(f"{name}: {REAPPLY_LIMIT} automatic attempts within {REAPPLY_WINDOW // 60} minutes; "
+                "pausing to avoid a restart loop", error=True)
+            state[f"{name}_paused"] = True
+        return False
+    state.pop(f"{name}_paused", None)
+    recent.append(now)
+    return True
+
+
+def ensure():
+    """Periodic check: reapply only to service instances not yet patched."""
+    library_path = Path(LIBRARY)
+    if not library_path.is_file():
+        return
+    with (library_path.parent / "loader.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # An install, removal or another loader is running.
+        state = load_state()
+        before = json.dumps(state, sort_keys=True)
+        try:
+            ensure_locked(library_path, state)
+        finally:
+            if json.dumps(state, sort_keys=True) != before:
+                save_state(state)
+
+
+def ensure_locked(library_path, state):
+    build = current_build()
+    if build != SUPPORTED_BUILD:
+        if state.get("unsupported_build") != build:
+            log(f"Unsupported OS build {build}; automatic patching paused", error=True)
+            state["unsupported_build"] = build
+        return
+    state.pop("unsupported_build", None)
+    menubar = process_identity(menu_bar_agent_pid())
+    if menubar and menubar != state.get("menubar"):
+        if take_attempt(state, "menubar"):
+            log(f"MenuBarAgent {menubar} is not patched; applying")
+            try:
+                inject(state)
+            except Exception as error:
+                log(f"MenuBarAgent patch failed: {error}", error=True)
+        return
+    library = library_path.with_name("notch-music.dylib")
+    if not library.is_file():
+        return
+    try:
+        music = process_identity(music_pid())
+    except Exception:
+        return
+    # Do not launch the provider here; it starts on demand and is patched then.
+    if music and music != state.get("music") and take_attempt(state, "music"):
+        log(f"Music UI provider {music} is not patched; applying")
+        pid = prepare_music_safely(library, find_lldb(required=False), launch=False)
+        state["music"] = process_identity(pid)
+
+
+def print_status(force_debugger):
+    state = load_state()
+    build = current_build()
+    globally_disabled = amfi_globally_disabled()
+    print(f"OS build: {build} ({'supported' if build == SUPPORTED_BUILD else 'unsupported'})")
+    print(f"AMFI-disable boot flag active: {globally_disabled}")
+    print(f"Selected loader: {'legacy' if globally_disabled and not force_debugger else 'debugger'}")
+    print(f"Debugger: {find_lldb(required=False) or 'not found'}")
+    menubar = process_identity(menu_bar_agent_pid())
+    print(f"MenuBarAgent: {menubar or 'not running'}; patched: {bool(menubar) and menubar == state.get('menubar')}")
+    try:
+        music = process_identity(music_pid())
+    except Exception:
+        music = None
+    print(f"Music UI provider: {music or 'not running'}; patched: {bool(music) and music == state.get('music')}")
+    for name in ("menubar", "music"):
+        if state.get(f"{name}_paused"):
+            print(f"Automatic {name} reapplication paused after repeated attempts")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--status", action="store_true")
+    group.add_argument("--ensure", action="store_true",
+                       help="Reapply only if MenuBarAgent or the music provider restarted unpatched")
+    group.add_argument("--music-only", action="store_true",
+                       help="Reapply the native music layout without restarting MenuBarAgent")
+    group.add_argument("--stop-music", action="store_true", help="Detach the installed native music layout")
+    parser.add_argument("--debugger", action="store_true",
+                        help="Force the process-scoped debugger loader")
+    args = parser.parse_args()
+    if args.status:
+        print_status(args.debugger)
+        return
+    if args.ensure:
+        ensure()
+        return
+    library_path = Path(LIBRARY)
+    with (library_path.parent / "loader.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        pid = menu_bar_agent_pid()
-        if pid:
-            flags = subprocess.check_output(
-                ["/bin/ps", "-p", str(pid), "-o", "flags="], text=True
-            ).strip()
-            if int(flags, 16) & 0x800:  # Darwin P_TRACED
-                raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
-        debugger_load(SERVICE, library_path.resolve(), lldb)
+        state = load_state()
+        try:
+            if args.stop_music:
+                stop_managed_music(library_path.with_name("notch-music.dylib"))
+                state.pop("music", None)
+            elif args.music_only:
+                pid = prepare_music(library_path.with_name("notch-music.dylib"), find_lldb())
+                state["music"] = process_identity(pid)
+            else:
+                inject(state, force_debugger=args.debugger)
+                for name in ("menubar", "music"):
+                    state.pop(f"{name}_attempts", None)
+                    state.pop(f"{name}_paused", None)
+        finally:
+            save_state(state)
 
 
 if __name__ == "__main__":
@@ -1478,14 +2309,504 @@ path = Path(sys.argv[1])
 compile(path.read_text(), str(path), 'exec')
 MACISLAND_LOADER_CHECK
 
+  cat > "$SCRATCH/music.swift" <<'MACISLAND_MUSIC_SWIFT'
+import AppKit
+import Darwin
+import SwiftUI
+import os
+
+private let sessionMangle = "12NowPlayingUI0aB19ActivitySessionViewV"
+private func child(_ value: Any, _ name: String) -> Any? {
+  Mirror(reflecting: value).children.first(where: { $0.label == name })?.value
+}
+private func valueName(_ value: Any) -> String { String(reflecting: type(of: value)) }
+private func view(_ value: Any) -> AnyView? {
+  guard let v = value as? any View else { return nil }
+  return AnyView(v)
+}
+private func stackChildren(_ value: Any) -> [Any]? {
+  guard let tree = child(value, "_tree"), let tupleView = child(tree, "content"),
+    let tuple = child(tupleView, "content")
+  else { return nil }
+  let fields = Mirror(reflecting: tuple)
+  guard fields.displayStyle == .tuple else { return nil }
+  return fields.children.map(\.value)
+}
+// Apple's artwork carries its own fixed frame. The surface width is chosen
+// before the session lays out, so remember the last native artwork width.
+private let artworkWidth = OSAllocatedUnfairLock<CGFloat?>(initialState: nil)
+private func fixedWidth(_ value: Any) -> CGFloat? {
+  var current = value
+  while valueName(current).hasPrefix("SwiftUI.ModifiedContent<") {
+    if let modifier = child(current, "modifier"), valueName(modifier) == "SwiftUI._FrameLayout",
+      let field = child(modifier, "width") as? CGFloat?, let width = field, width.isFinite, width > 0
+    {
+      return width
+    }
+    guard let next = child(current, "content") else { return nil }
+    current = next
+  }
+  return nil
+}
+// Space between the artwork (or waveform) and the camera housing.
+private let notchClearance: CGFloat = 12
+private struct HeaderParts {
+  let children: [AnyView]
+  let modifiers: [any ViewModifier]
+  init?(_ header: Any) {
+    var stack = header
+    var mods: [any ViewModifier] = []
+    while valueName(stack).hasPrefix("SwiftUI.ModifiedContent<") {
+      guard let next = child(stack, "content"),
+        let mod = child(stack, "modifier") as? any ViewModifier
+      else { return nil }
+      mods.append(mod)
+      stack = next
+    }
+    guard valueName(stack).hasPrefix("SwiftUI.HStack<"), let parts = stackChildren(stack),
+      parts.count == 4,
+      valueName(parts[0]).contains("NowPlayingUI.FlippingArtworkView"),
+      valueName(parts[1]).contains("NowPlayingUI.MetadataView"),
+      valueName(parts[2]) == "SwiftUI.Spacer",
+      valueName(parts[3]).contains("NowPlayingUI.Waveform")
+    else { return nil }
+    // Keep the active native accessory and its playback modifiers.
+    guard let storage = child(parts[3], "storage"),
+      let selected = Mirror(reflecting: storage).children.first?.value,
+      let accessory = view(selected)
+    else { return nil }
+    let vs = parts.prefix(3).compactMap(view) + [accessory]
+    guard vs.count == 4 else { return nil }
+    children = vs
+    modifiers = mods.reversed()
+    if let width = fixedWidth(parts[0]) { artworkWidth.withLock { $0 = width } }
+  }
+  @MainActor func build(size: CGSize) -> AnyView {
+    let layout = NotchMusicHeader(cutoutWidth: size.width, cutoutHeight: size.height)
+    var row = AnyView(
+      layout {
+        children[0]
+        children[1]
+        children[2]
+        HStack(spacing: 0) { children[3].fixedSize() }
+      })
+    func apply<M: ViewModifier>(_ modifier: M, _ value: AnyView) -> AnyView {
+      AnyView(value.modifier(modifier))
+    }
+    for modifier in modifiers { row = apply(modifier, row) }
+    return row
+  }
+}
+// The loader reads readiness after it detaches, on a separate debugger thread.
+private let readiness = OSAllocatedUnfairLock<Int32>(initialState: 0)
+
+private func cutoutScreen(_ size: CGSize) -> NSScreen? {
+  NSScreen.screens.first { screen in
+    guard let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea,
+      screen.safeAreaInsets.top > 0
+    else { return false }
+    return abs(right.minX - left.maxX - size.width) <= 4
+      && abs(screen.safeAreaInsets.top - size.height) <= 4
+  }
+}
+
+// The full music session receives compact mode before the host finishes
+// dismissing it. Its artwork and transport still belong to the outgoing panel.
+// Apple's separate leading/trailing compact scenes use their own view types.
+private func panelCutout(_ context: Any) -> (size: CGSize, screen: NSScreen)? {
+  guard let mode = child(context, "layoutMode"),
+    ["expanded", "compact"].contains(String(describing: mode)),
+    let metrics = child(context, "obstructionMetrics"),
+    let size = child(metrics, "size") as? CGSize, let screen = cutoutScreen(size)
+  else { return nil }
+  return (size, screen)
+}
+
+private struct SessionLayout<Native: View>: View {
+  let native: Native
+  var body: AnyView {
+    let stock = native.body
+    let fallback = AnyView(stock)
+    guard let context = child(native, "context"), let cutout = panelCutout(context) else {
+      return fallback
+    }
+    guard let rows = stackChildren(stock), rows.count == 3, let lead = view(rows[0]),
+      let parts = HeaderParts(rows[1]), let tail = view(rows[2]),
+      valueName(rows[2]).contains("NowPlayingUI.TimelineControl"),
+      valueName(rows[2]).contains("NowPlayingUI.TransportControls")
+    else { return fallback }
+    let gap =
+      child(stock, "_tree").flatMap { child($0, "root") }.flatMap { child($0, "spacing") }
+      as? CGFloat
+
+    return AnyView(
+      VStack(spacing: gap) {
+        lead
+        parts.build(size: cutout.size)
+        tail
+      })
+  }
+}
+extension View {
+  fileprivate nonisolated var miProjectedSession: SessionLayout<Self> {
+    SessionLayout(native: self)
+  }
+}
+// SwiftUI invokes these signed witness entries with the native graph. Project
+// the typed graph through a key path so its state and observation stay attached.
+private struct Relay: View {
+  nonisolated(unsafe) static var make: ((_GraphValue<Relay>, _ViewInputs) -> _ViewOutputs)!
+  nonisolated(unsafe) static var list: ((_GraphValue<Relay>, _ViewListInputs) -> _ViewListOutputs)!
+  var body: Never { fatalError("uninstantiated graph relay") }
+  nonisolated static func _makeView(view: _GraphValue<Relay>, inputs: _ViewInputs) -> _ViewOutputs {
+    return make(view, inputs)
+  }
+  nonisolated static func _makeViewList(view: _GraphValue<Relay>, inputs: _ViewListInputs)
+    -> _ViewListOutputs
+  { return list(view, inputs) }
+}
+@_silgen_name("move_signed") private func signedEntry(
+  _ source: UnsafeMutablePointer<UInt>, _ destination: UnsafeMutablePointer<UInt>,
+  _ discriminator: UInt32
+) -> UInt
+private func table(_ t: any View.Type) -> UnsafeMutablePointer<UInt> {
+  var t = t
+  return withUnsafeBytes(of: &t) {
+    $0.load(
+      fromByteOffset: MemoryLayout<UnsafeRawPointer>.size, as: UnsafeMutablePointer<UInt>.self)
+  }
+}
+private nonisolated(unsafe) var installed: (UnsafeMutablePointer<UInt>, UInt, UInt, UInt, UInt)?
+private func writable(_ p: UnsafeMutablePointer<UInt>) -> Bool {
+  var a = mach_vm_address_t(UInt(bitPattern: p))
+  var size: mach_vm_size_t = 0
+  var info = vm_region_basic_info_data_64_t()
+  let start = a
+  var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: info) / 4)
+  var obj = mach_port_t()
+  let result = withUnsafeMutablePointer(to: &info) { q in
+    q.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+      mach_vm_region(mach_task_self_, &a, &size, VM_REGION_BASIC_INFO_64, $0, &count, &obj)
+    }
+  }
+  if obj != 0 { mach_port_deallocate(mach_task_self_, obj) }
+  return result == KERN_SUCCESS && info.protection & VM_PROT_WRITE != 0 && a <= start
+    && start + 40 <= a + size
+}
+private func install<T: View>(_ type: T.Type) -> Int {
+  guard installed == nil else { return 1 }
+  let name = String(reflecting: T.Body.self)
+  guard name.hasPrefix("SwiftUI.VStack<SwiftUI.TupleContent<"),
+    ["FlippingArtworkView", "MetadataView", "Waveform", "TimelineControl", "TransportControls"]
+      .allSatisfy(name.contains)
+  else { return -3 }
+  let dest = table(type)
+  let source = table(Relay.self)
+  guard writable(dest) else { return -4 }
+  let requirements = [
+    "$s7SwiftUI4ViewP05_makeC04view6inputsAA01_C7OutputsVAA11_GraphValueVyxG_AA01_C6InputsVtFZTq",
+    "$s7SwiftUI4ViewP05_makeC4List4view6inputsAA01_cE7OutputsVAA11_GraphValueVyxG_AA01_cE6InputsVtFZTq",
+  ]
+  let disc = requirements.compactMap {
+    dlsym(UnsafeMutableRawPointer(bitPattern: -2), $0)?.load(as: UInt32.self)
+  }.map { $0 >> 16 }
+  guard disc == [0xaeaf, 0x6ddd] else { return -5 }
+  Relay.make = { graph, inputs in
+    let typed = unsafeBitCast(graph, to: _GraphValue<T>.self)
+    return SessionLayout<T>._makeView(view: typed[\.miProjectedSession], inputs: inputs)
+  }
+  Relay.list = { graph, inputs in
+    let typed = unsafeBitCast(graph, to: _GraphValue<T>.self)
+    return SessionLayout<T>._makeViewList(view: typed[\.miProjectedSession], inputs: inputs)
+  }
+  let make = signedEntry(source + 3, dest + 3, disc[0])
+  let list = signedEntry(source + 4, dest + 4, disc[1])
+  installed = (dest, dest[3], dest[4], make, list)
+  dest[3] = make
+  dest[4] = list
+  return 1
+}
+private func rightBuild() -> Bool {
+  var value = [CChar](repeating: 0, count: 64)
+  var size = value.count
+  return sysctlbyname("kern.osversion", &value, &size, nil, 0) == 0
+    && String(cString: value) == "26C5035r"
+}
+@_cdecl("mi_music_enable") public func enable() -> Int32 {
+  guard rightBuild(), Bundle.main.bundleIdentifier == "com.apple.MediaRemoteUIService" else {
+    return -1
+  }
+  DispatchQueue.main.async {
+    guard let target = _typeByName(sessionMangle) as? any View.Type else {
+      readiness.withLock { $0 = -2 }
+      return
+    }
+    if installed != nil { return }
+    guard let surface = _typeByName("12NowPlayingUI0aB15ActivitySurfaceV") as? any View.Type,
+      installSurface(surface)
+    else {
+      readiness.withLock { $0 = -6 }
+      return
+    }
+    let result = install(target)
+    if result < 0, let (slot, old, ours) = surfaceSlot, slot.pointee == ours {
+      slot.pointee = old
+      surfaceSlot = nil
+    }
+    readiness.withLock { $0 = Int32(result) }
+  }
+  return 0
+}
+@_cdecl("mi_music_disable") public func disable() -> Int32 {
+  DispatchQueue.main.async {
+    if let (p, make, list, ours, oursList) = installed {
+      if p[3] == ours { p[3] = make }
+      if p[4] == oursList { p[4] = list }
+      installed = nil
+    }
+    if let (slot, old, ours) = surfaceSlot, slot.pointee == ours {
+      slot.pointee = old
+      surfaceSlot = nil
+    }
+    readiness.withLock { $0 = 0 }
+  }
+  return 0
+}
+@_cdecl("mi_music_status") public func musicStatus() -> Int32 { readiness.withLock { $0 } }
+
+@_silgen_name("swift_reflectionMirror_recursiveCount") private func fieldCount(_ type: Any.Type)
+  -> Int
+@_silgen_name("swift_reflectionMirror_recursiveChildMetadata") private func fieldType(
+  _ t: Any.Type, _ i: Int, _ d: UnsafeMutableRawPointer
+) -> Any.Type
+@_silgen_name("swift_reflectionMirror_recursiveChildOffset") private func fieldOffset(
+  _ t: Any.Type, _ i: Int
+) -> Int
+// _FieldReflectionMetadata from the Swift runtime's ReflectionMirror interface.
+private struct ReflectionFieldMetadata {
+  var name: UnsafePointer<CChar>? = nil
+  var freeName: (@convention(c) (UnsafePointer<CChar>?) -> Void)? = nil
+  var isStrong: Bool = false
+  var isVar: Bool = false
+}
+private func fieldInfo(_ type: Any.Type, _ name: String) -> (Int, Any.Type)? {
+  var metadata = ReflectionFieldMetadata()
+  for index in 0..<fieldCount(type) {
+    metadata = ReflectionFieldMetadata()
+    let field = withUnsafeMutablePointer(to: &metadata) { fieldType(type, index, $0) }
+    let matches = metadata.name.map { String(cString: $0) == name } ?? false
+    if let free = metadata.freeName { free(metadata.name) }
+    if matches { return (fieldOffset(type, index), field) }
+  }
+  return nil
+}
+// Look up the two native layout fields by reflection on this exact OS build.
+// The assembly shim calls Apple's body getter first, retaining its stored state.
+private func originalModifiers(_ type: Any.Type) -> (Int, Int)? {
+  var current = type
+  var base = 0
+  var width: Int?
+  var insets: Int?
+  while String(reflecting: current).hasPrefix("SwiftUI.ModifiedContent<") {
+    guard let c = fieldInfo(current, "content"), let m = fieldInfo(current, "modifier") else {
+      return nil
+    }
+    if String(reflecting: m.1) == "SwiftUI._FrameLayout", let w = fieldInfo(m.1, "width"),
+      w.1 == CGFloat?.self
+    {
+      width = base + m.0 + w.0
+    }
+    if String(reflecting: m.1) == "SwiftUI._PaddingLayout", let i = fieldInfo(m.1, "insets"),
+      i.1 == EdgeInsets?.self
+    {
+      insets = base + m.0 + i.0
+    }
+    base += c.0
+    current = c.1
+  }
+  guard let w = width, let i = insets else { return nil }
+  return (w, i)
+}
+@_silgen_name("sign_surface") private func signSurface(
+  _ slot: UnsafeMutablePointer<UInt>, _ disc: UInt32
+) -> UInt
+private nonisolated(unsafe) var surfaceResult:
+  ((UnsafeRawPointer, UnsafeMutableRawPointer) -> Void)?
+private nonisolated(unsafe) var surfaceSlot: (UnsafeMutablePointer<UInt>, UInt, UInt)?
+private func installSurface<T: View>(_ t: T.Type) -> Bool {
+  guard let (w, i) = originalModifiers(T.Body.self), w >= 0, i >= 0,
+    w % MemoryLayout<CGFloat?>.alignment == 0, i % MemoryLayout<EdgeInsets?>.alignment == 0,
+    w + MemoryLayout<CGFloat?>.size <= MemoryLayout<T.Body>.size,
+    i + MemoryLayout<EdgeInsets?>.size <= MemoryLayout<T.Body>.size,
+    let req = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$s7SwiftUI4ViewP4body4BodyQzvgTq")
+  else { return false }
+  let slot = table(t) + 6
+  guard writable(slot) else { return false }
+  surfaceResult = { native, out in
+    let surface = native.assumingMemoryBound(to: T.self).pointee
+    guard let context = child(surface, "context"), let cutout = panelCutout(context) else { return }
+    let size = cutout.size
+    let width = out.advanced(by: w).assumingMemoryBound(to: CGFloat?.self)
+    let margins = out.advanced(by: i).assumingMemoryBound(to: EdgeInsets?.self)
+    guard let nativeWidth = width.pointee, nativeWidth >= size.width,
+      var pad = margins.pointee, pad.top >= size.height
+    else { return }
+    // Preserve the native root and its DynamicProperty storage. Give the
+    // expanded session its actual scene proposal; it lays out its own safe
+    // header, so top padding does not have to clear the notch a second time.
+    // Advertising an unbounded frame makes this provider lay out against its
+    // maximum offer, even while the host displays its smaller preferred size.
+    // Like the iPhone layout, the artwork shares the timeline's leading edge:
+    // each wing holds the content inset, the artwork and the notch clearance.
+    let art = artworkWidth.withLock { $0 } ?? cutout.screen.safeAreaInsets.top + notchClearance
+    let wing = art + notchClearance + max(pad.leading, pad.trailing)
+    width.pointee = max(nativeWidth, size.width + 2 * wing)
+    pad.top = min(pad.leading, 4)
+    margins.pointee = pad
+  }
+  let discriminator = req.load(as: UInt32.self) >> 16
+  let ours = signSurface(slot, discriminator)
+  surfaceSlot = (slot, slot.pointee, ours)
+  slot.pointee = ours
+  return true
+}
+@_cdecl("mi_music_surface_result") public func adjust(
+  _ native: UnsafeRawPointer, _ out: UnsafeMutableRawPointer
+) { surfaceResult?(native, out) }
+MACISLAND_MUSIC_SWIFT
+
+  cat > "$SCRATCH/music-layout.swift" <<'MACISLAND_MUSIC_LAYOUT_SWIFT'
+import SwiftUI
+
+/// Apple supplies artwork, metadata, a spacer and a trailing accessory in this order.
+/// The enclosing view owns the native header tap target, timeline and transport row.
+struct NotchMusicHeader: Layout {
+  let cutoutWidth: CGFloat
+  let cutoutHeight: CGFloat
+
+  private struct Positions {
+    let size: CGSize
+    let art: CGRect
+    let metadata: CGRect
+    let accessory: CGRect
+  }
+
+  private func positions(width: CGFloat?, subviews: Subviews) -> Positions {
+    let art = subviews[0].sizeThatFits(.unspecified)
+    let accessory = subviews[3].sizeThatFits(.unspecified)
+    let idealMetadata = subviews[1].sizeThatFits(.unspecified)
+    let idealWidth = max(idealMetadata.width, cutoutWidth + 2 * max(art.width, accessory.width))
+    let width = width.flatMap { $0.isFinite ? max($0, 0) : nil } ?? idealWidth
+    let textWidth = min(width, cutoutWidth)
+    let text = subviews[1].sizeThatFits(ProposedViewSize(width: textWidth, height: nil))
+    let wing = max(0, (width - cutoutWidth) / 2)
+    let gap = subviews[0].spacing.distance(to: subviews[1].spacing, along: .vertical)
+    // Contents with large Dynamic Type or a narrow proposal flow under the camera.
+    let fits = max(art.width, accessory.width) <= wing
+    let top = fits ? 0 : cutoutHeight
+    let rowHeight = max(art.height, accessory.height, fits ? cutoutHeight : 0)
+    let artX: CGFloat = 0
+    let accessoryX = max(0, width - accessory.width)
+    let stacksAccessory = !fits && art.width + accessory.width > width
+    let textY =
+      fits
+      ? cutoutHeight + gap
+      : top + (stacksAccessory ? art.height + accessory.height : rowHeight) + gap
+    let artY = fits ? max(0, textY + text.height - art.height) : top + (rowHeight - art.height) / 2
+    let artFrame = CGRect(origin: CGPoint(x: artX, y: artY), size: art)
+    let accessoryY = stacksAccessory ? artFrame.maxY : artFrame.midY - accessory.height / 2
+    let accessoryFrame = CGRect(
+      origin: CGPoint(x: accessoryX, y: max(fits ? 0 : top, accessoryY)), size: accessory)
+    let titleWidth = min(text.width, textWidth)
+    let titleX = fits ? wing : 0
+    return Positions(
+      size: CGSize(
+        width: width, height: max(artFrame.maxY, accessoryFrame.maxY, textY + text.height)),
+      art: artFrame, metadata: CGRect(x: titleX, y: textY, width: titleWidth, height: text.height),
+      accessory: accessoryFrame)
+  }
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    positions(width: proposal.width, subviews: subviews).size
+  }
+
+  func placeSubviews(
+    in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+  ) {
+    let result = positions(width: bounds.width, subviews: subviews)
+    for (index, rect) in [(0, result.art), (1, result.metadata), (3, result.accessory)] {
+      subviews[index].place(
+        at: CGPoint(x: bounds.minX + rect.minX, y: bounds.minY + rect.minY),
+        anchor: .topLeading, proposal: ProposedViewSize(rect.size))
+    }
+    subviews[2].place(at: bounds.origin, anchor: .topLeading, proposal: .zero)
+  }
+}
+MACISLAND_MUSIC_LAYOUT_SWIFT
+
+  cat > "$SCRATCH/music-abi.c" <<'MACISLAND_MUSIC_ABI_C'
+#include <ptrauth.h>
+#include <stddef.h>
+#include <stdint.h>
+uintptr_t move_signed(uintptr_t *from, uintptr_t *to, unsigned disc) {
+#if __has_feature(ptrauth_calls)
+  void *before = (void *)*from;
+  void *after = ptrauth_auth_and_resign(
+      before, ptrauth_key_asia, ptrauth_blend_discriminator(from, disc),
+      ptrauth_key_asia, ptrauth_blend_discriminator(to, disc));
+  return (uintptr_t)after;
+#else
+  return *from;
+#endif
+}
+extern void mi_surface_body(void);
+uintptr_t sign_surface(uintptr_t *slot, unsigned discriminator) {
+#if __has_feature(ptrauth_calls)
+  return (uintptr_t)ptrauth_auth_and_resign(
+      &mi_surface_body, ptrauth_key_function_pointer, 0, ptrauth_key_asia,
+      ptrauth_blend_discriminator(slot, discriminator));
+#else
+  return (uintptr_t)mi_surface_body;
+#endif
+}
+MACISLAND_MUSIC_ABI_C
+
+  cat > "$SCRATCH/music-body.S" <<'MACISLAND_MUSIC_BODY_S'
+.text
+.p2align 2
+.globl _mi_surface_body
+_mi_surface_body:
+ pacibsp
+ stp x20, x19, [sp, #-32]!
+ stp x29, x30, [sp, #16]
+ add x29, sp, #16
+ mov x19, x8
+ bl _$s12NowPlayingUI0aB15ActivitySurfaceV4bodyQrvg
+ mov x0, x20
+ mov x1, x19
+ bl _mi_music_surface_result
+ ldp x29, x30, [sp, #16]
+ ldp x20, x19, [sp], #32
+ retab
+MACISLAND_MUSIC_BODY_S
+
   echo "Building native notch patch from embedded source..."
   /usr/bin/xcrun clang -arch arm64e -dynamiclib -fobjc-arc -Wall -Wextra -Werror \
     -o "$SCRATCH/island.dylib" "$SCRATCH/island.c" "$SCRATCH/notch.m" \
-    "$SCRATCH/safearea.m" "$SCRATCH/mask.m" \
+    "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" "$SCRATCH/mask.m" \
     -framework AppKit -framework QuartzCore -F/System/Library/PrivateFrameworks \
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/island.dylib"
+  /usr/bin/xcrun clang -arch arm64e -c "$SCRATCH/music-abi.c" -o "$SCRATCH/music-abi.o"
+  /usr/bin/xcrun clang -arch arm64e -c "$SCRATCH/music-body.S" -o "$SCRATCH/music-body.o"
+  /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \
+    -module-cache-path "$SCRATCH/swift-modules" -O -emit-library \
+    "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" "$SCRATCH/music-abi.o" "$SCRATCH/music-body.o" \
+    -Xlinker -undefined -Xlinker dynamic_lookup -Xlinker -install_name -Xlinker @rpath/notch-music.dylib \
+    -o "$SCRATCH/notch-music.dylib"
+  /usr/bin/codesign -f -s - "$SCRATCH/notch-music.dylib"
+  /usr/bin/codesign --verify --strict "$SCRATCH/notch-music.dylib"
   if [[ "$MODE" == --check ]]; then
     echo "Loader syntax, native build, and signature checks passed. No installation or preference changes."
     exit 0
@@ -1497,6 +2818,7 @@ import fcntl
 import os
 from pathlib import Path
 import plistlib
+import xml.etree.ElementTree as ET
 import shutil
 import subprocess
 import sys
@@ -1514,7 +2836,12 @@ PREFERENCES = [
     ('com.apple.campo', 'SupportsIslandMitosis', True),
 ]
 FILES = {'island.dylib': ROOT / 'island.dylib', 'loader.py': ROOT / 'loader.py', 'agent.plist': AGENT}
-AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error.log')]
+MUSIC = ROOT / 'notch-music.dylib'
+FILES[MUSIC.name] = MUSIC
+AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error.log',
+                                      'loader-state.json', 'loader-state.json.next')]
+# Login and periodic check: patch only service instances that are not yet patched.
+CHECK_INTERVAL = 30
 
 
 def run(*args, required=True):
@@ -1525,10 +2852,20 @@ def preference(domain, key):
     result = run('/usr/bin/defaults', 'export', domain, '-', required=False)
     if result.returncode and b'does not exist' not in result.stderr:
         raise RuntimeError(f'Cannot read preferences: {domain}; no settings changed')
-    values = plistlib.loads(result.stdout) if result.returncode == 0 else {}
-    if key not in values:
+    if result.returncode:
         return {'present': False}
-    value = values[key]
+    # Only deserialize the key we own. Other menu-bar settings can contain
+    # CF dates outside Python's datetime range.
+    root = ET.fromstring(result.stdout).find('dict')
+    if root is None:
+        raise RuntimeError(f'Invalid preferences dictionary: {domain}')
+    items = iter(root)
+    for name, element in zip(items, items):
+        if name.tag == 'key' and name.text == key:
+            value = plistlib.loads(b'<plist version="1.0">' + ET.tostring(element) + b'</plist>')
+            break
+    else:
+        return {'present': False}
     if type(value) not in (bool, int, str):
         raise RuntimeError(f'Unsupported existing preference type: {key}; no settings changed')
     return {'present': True, 'value': value}
@@ -1557,7 +2894,18 @@ def replace_file(source, destination, mode):
 
 def save_original():
     if STATE.is_file():
-        return plistlib.loads(STATE.read_bytes())
+        state = plistlib.loads(STATE.read_bytes())
+        if MUSIC.name not in state['files']:
+            if MUSIC.exists():
+                raise RuntimeError(f'Unmanaged music library exists: {MUSIC}')
+            state['files'][MUSIC.name] = {'existed': False, 'mode': 0o755}
+            temporary = BACKUP / 'state.next'
+            temporary.write_bytes(plistlib.dumps(state))
+            temporary.chmod(0o600)
+            temporary.replace(STATE)
+        return state
+    if MUSIC.exists():
+        raise RuntimeError(f'Unmanaged music library exists: {MUSIC}')
     if BACKUP.exists():
         raise RuntimeError(f'Incomplete backup exists: {BACKUP}; refusing to overwrite it')
     state = {'version': 1, 'files': {}, 'preferences': [],
@@ -1585,13 +2933,20 @@ def save_original():
     return state
 
 
+def stop_installed_music(state):
+    if MUSIC.name in state['files'] and MUSIC.is_file():
+        run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music')
+
+
 def restore_original(state):
     for name, details in state['files'].items():
         if details['existed'] and not (BACKUP / name).is_file():
             raise RuntimeError(f'Missing backup: {BACKUP / name}; restoration stopped')
+    # Stop the periodic check first, so it cannot reapply what is being removed.
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    for name, path in FILES.items():
-        details = state['files'][name]
+    stop_installed_music(state)
+    for name, details in state['files'].items():
+        path = FILES[name]
         if details['existed']:
             replace_file(BACKUP / name, path, details['mode'])
         else:
@@ -1607,39 +2962,84 @@ def restore_original(state):
     STATE.unlink()
     BACKUP.rmdir()
     for path in AUXILIARY:
-        if not state['auxiliary_existed'][path.name]:
+        # States written by earlier versions do not list newer auxiliary files.
+        if not state['auxiliary_existed'].get(path.name, False):
             path.unlink(missing_ok=True)
 
 
+def snapshot_current():
+    """Copy the currently installed files, so a failed upgrade can return to them."""
+    folder = SOURCE / 'previous'
+    folder.mkdir()
+    snapshot = {}
+    for name, path in FILES.items():
+        exists = path.is_file()
+        snapshot[name] = {'existed': exists, 'mode': path.stat().st_mode & 0o777 if exists else 0o644}
+        if exists:
+            shutil.copy2(path, folder / name)
+    return snapshot
+
+
+def restore_previous(snapshot):
+    """Return to the installation that was working before this upgrade."""
+    folder = SOURCE / 'previous'
+    run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
+    if MUSIC.is_file():
+        run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music', required=False)
+    for name, details in snapshot.items():
+        path = FILES[name]
+        if details['existed']:
+            replace_file(folder / name, path, details['mode'])
+        else:
+            path.unlink(missing_ok=True)
+    if snapshot['agent.plist']['existed']:
+        # Its RunAtLoad loader reapplies the previous patch.
+        run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT), required=False)
+    else:
+        run('/bin/launchctl', 'kickstart', '-k', MENU_SERVICE, required=False)
+
+
+def agent_definition():
+    return {
+        'Label': 'com.macisland.loader',
+        'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure'],
+        'RunAtLoad': True,
+        'StartInterval': CHECK_INTERVAL,
+        'ProcessType': 'Background',
+        'StandardOutPath': str(ROOT / 'loader.log'),
+        'StandardErrorPath': str(ROOT / 'loader-error.log'),
+    }
+
+
 def install():
+    upgrading = STATE.is_file()
     state = save_original()
+    previous = snapshot_current() if upgrading else None
     try:
+        # Stop the previous periodic check before replacing what it loads.
+        run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
+        stop_installed_music(state)
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
-        agent = {
-            'Label': 'com.macisland.loader',
-            'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py')],
-            'RunAtLoad': False,
-            'StandardOutPath': str(ROOT / 'loader.log'),
-            'StandardErrorPath': str(ROOT / 'loader-error.log'),
-        }
+        replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)
         for domain, key, value in PREFERENCES:
             write_preference(domain, key, {'present': True, 'value': value})
-        run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-        # Bootstrap without RunAtLoad so injection can be checked synchronously.
-        (SOURCE / 'agent.plist').write_bytes(plistlib.dumps(agent))
-        replace_file(SOURCE / 'agent.plist', AGENT, 0o644)
-        run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
-        agent['RunAtLoad'] = True
-        (SOURCE / 'agent.plist').write_bytes(plistlib.dumps(agent))
-        replace_file(SOURCE / 'agent.plist', AGENT, 0o644)
-        # Loaded job has no KeepAlive or events; the plist on disk enables login.
+        # Apply synchronously first; the island must load. The music layout
+        # is optional and only reported if it cannot be applied.
         subprocess.run(['/usr/bin/python3', str(ROOT / 'loader.py')], check=True)
+        (SOURCE / 'agent.plist').write_bytes(plistlib.dumps(agent_definition()))
+        replace_file(SOURCE / 'agent.plist', AGENT, 0o644)
+        # Its first run finds the instances just patched and leaves them alone.
+        run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
     except BaseException:
-        print('Installation failed; restoring the saved pre-install state.', file=sys.stderr)
-        restore_original(state)
+        if previous is not None:
+            print('Upgrade failed; restoring the previously installed version.', file=sys.stderr)
+            restore_previous(previous)
+        else:
+            print('Installation failed; restoring the saved pre-install state.', file=sys.stderr)
+            restore_original(state)
         raise
-    print('Installed MacIsland Notch. Login injection is enabled.')
+    print('Installed MacIsland Notch. Login injection and automatic reapplication are enabled.')
     print(f'Original files and preferences: {BACKUP}')
 
 
