@@ -32,9 +32,13 @@ class PreferenceTests(unittest.TestCase):
         # or open their real app group or campo preferences during these tests.
         source = SOURCE.replace("$.NSHomeDirectory()", f"$({json.dumps(str(home))})")
         source = source.replace(
-            "$.NSUserDefaults.alloc.initWithSuiteName(domain)",
-            "$.NSUserDefaults.alloc._initWithSuiteNameContainer(domain, "
-            f"$.NSURL.fileURLWithPathIsDirectory($({json.dumps(str(self.campo))}), true))",
+            "$(" + json.dumps(str(home)) + ").stringByAppendingPathComponent('Library/Preferences/com.apple.campo.plist')",
+            f"$({json.dumps(str(self.campo / 'Library/Preferences/com.apple.campo.plist'))})",
+        )
+        source = source.replace(
+            "defaults = $.NSUserDefaults.alloc.initWithSuiteName(domain);",
+            "defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer(domain, "
+            f"$.NSURL.fileURLWithPathIsDirectory($({json.dumps(str(self.campo))}), true));",
         )
         self.helper = root / "preferences.js"
         self.helper.write_text(source)
@@ -89,6 +93,30 @@ class PreferenceTests(unittest.TestCase):
         self.invoke("com.apple.campo", "UnrelatedValue", required=False)
         self.invoke("unrelated.domain", "EmulateCenterHUD", required=False)
         self.assertEqual(plistlib.loads(self.plist.read_bytes()), {"UnrelatedValue": "preserve me"})
+
+    def test_missing_and_unreadable_group_plists_are_distinct(self):
+        key = "EmulateCenterHUD"
+        self.plist.unlink()
+        self.assertEqual(self.invoke(self.domain, key), {"present": False})
+        self.plist.write_text("invalid plist")
+        self.invoke(self.domain, key, required=False)
+
+    def test_registered_fallback_is_not_backed_up_or_restored(self):
+        source = self.helper.read_text()
+        self.helper.write_text(source.replace(
+            "    if (args.length === 3) {",
+            """    var fallback = $.NSMutableDictionary.dictionary;
+    fallback.setObjectForKey($("registered"), key);
+    defaults.registerDefaults(fallback);
+    if (args.length === 3) {""",
+        ))
+        key = "EmulateCenterHUD"
+        missing = {"present": False}
+        stored = {"present": True, "value": True}
+        self.assertEqual(self.invoke(self.domain, key), missing)
+        self.assertEqual(self.invoke(self.domain, key, stored), stored)
+        self.assertEqual(self.invoke(self.domain, key, missing), missing)
+        self.assertEqual(self.invoke(self.domain, key), missing)
 
     def test_invalid_saved_values_do_not_overwrite_the_existing_value(self):
         key = "ShowSoftwareNotch"

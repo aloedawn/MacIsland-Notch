@@ -299,6 +299,13 @@ class ManagerTests(unittest.TestCase):
             exec(compile(MANAGER, "embedded_manager.py", "exec"), self.manager.__dict__)
         self.calls = []
         self.manager.run = lambda *args, required=True: self.calls.append(args)
+        self.saved_preferences = {
+            (domain, key): {"present": False} for domain, key, _ in self.manager.PREFERENCES
+        }
+        self.manager.preference = lambda domain, key: self.saved_preferences[domain, key]
+        def write_preference(domain, key, saved):
+            self.saved_preferences[domain, key] = saved
+        self.manager.write_preference = write_preference
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -317,6 +324,7 @@ class ManagerTests(unittest.TestCase):
     def test_failed_upgrade_returns_to_the_working_version(self):
         self.existing_install()
         m = self.manager
+        original_preferences = dict(self.saved_preferences)
         failure = subprocess.CalledProcessError(1, ["loader"])
         with patch.object(m.subprocess, "run", side_effect=failure), \
              patch("sys.stderr", new=io.StringIO()), \
@@ -324,6 +332,7 @@ class ManagerTests(unittest.TestCase):
             m.install()
         self.assertEqual((m.ROOT / "island.dylib").read_text(), "old")
         self.assertEqual(m.AGENT.read_text(), "old")
+        self.assertEqual(self.saved_preferences, original_preferences)
         self.assertTrue(m.STATE.is_file(), "the original backup must survive a failed upgrade")
         self.assertIn(("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)), self.calls)
 

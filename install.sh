@@ -27,15 +27,35 @@ function run(args) {
     var domain = args[0], key = args[1];
     var container = $.NSURL.fileURLWithPathIsDirectory($.NSHomeDirectory().stringByAppendingPathComponent('Library/Group Containers/com.apple.MenuBar'), true);
     var menuBarDomain = ObjC.unwrap(container.path.stringByAppendingPathComponent('Library/Preferences/com.apple.MenuBar'));
-    var defaults;
+    var defaults, storedFile;
     if (domain === menuBarDomain && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
+        storedFile = $(menuBarDomain + '.plist');
         defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer('com.apple.MenuBar', container);
     } else if (domain === 'com.apple.campo' && key === 'SupportsIslandMitosis') {
+        storedFile = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Preferences/com.apple.campo.plist');
         defaults = $.NSUserDefaults.alloc.initWithSuiteName(domain);
     } else {
         throw Error('Unsupported preference');
     }
     if (ObjC.unwrap(defaults) === undefined) throw Error('Preference store unavailable');
+    // Inspect this persisted domain only. NSUserDefaults.objectForKey also
+    // searches global and registered defaults, which have no value to restore.
+    function storedValue() {
+        // Read the exact preference plist through Foundation. A missing
+        // file is normal, but permission or parse errors must stop the backup.
+        var files = $.NSFileManager.defaultManager;
+        if (!files.isReadableFileAtPath(storedFile.stringByDeletingLastPathComponent)) {
+            throw Error('Cannot access the preference directory');
+        }
+        if (!files.fileExistsAtPath(storedFile)) return undefined;
+        var data = $.NSData.dataWithContentsOfFile(storedFile);
+        if (ObjC.unwrap(data) === undefined) throw Error('Cannot read persisted preferences');
+        var values = $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null);
+        if (ObjC.unwrap(values) === undefined || !values.isKindOfClass($.NSDictionary)) {
+            throw Error('Invalid persisted preferences dictionary');
+        }
+        return values.objectForKey(key);
+    }
     if (args.length === 3) {
         var saved = $.NSJSONSerialization.JSONObjectWithDataOptionsError($(args[2]).dataUsingEncoding($.NSUTF8StringEncoding), 0, null);
         var present = ObjC.unwrap(saved.objectForKey('present'));
@@ -43,7 +63,7 @@ function run(args) {
         var target = saved.objectForKey('value');
         if (present) {
             if (!target.isKindOfClass($.NSNumber) && !target.isKindOfClass($.NSString)) throw Error('Unsupported preference type');
-            var previous = defaults.objectForKey(key);
+            var previous = storedValue();
             // CFPreferences may retain false when assigned an equal integer 0.
             if (ObjC.unwrap(previous) !== undefined && previous.isEqual(target) &&
                 $.CFGetTypeID(previous) !== $.CFGetTypeID(target)) {
@@ -55,14 +75,14 @@ function run(args) {
             defaults.removeObjectForKey(key);
         }
         if (!defaults.synchronize) throw Error('Preference synchronization failed');
-        var actual = defaults.objectForKey(key);
+        var actual = storedValue();
         var matches = present
             ? ObjC.unwrap(actual) !== undefined && actual.isEqual(target) &&
               $.CFGetTypeID(actual) === $.CFGetTypeID(target)
             : ObjC.unwrap(actual) === undefined;
         if (!matches) throw Error('Preference verification failed');
     }
-    var value = defaults.objectForKey(key);
+    var value = storedValue();
     var result = ObjC.unwrap(value) === undefined ? $({present:false}) : $({present:true, value:value});
     var json = $.NSJSONSerialization.dataWithJSONObjectOptionsError(result, 0, null);
     return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(json, $.NSUTF8StringEncoding));
@@ -3012,11 +3032,15 @@ def snapshot_current():
         snapshot[name] = {'existed': exists, 'mode': path.stat().st_mode & 0o777 if exists else 0o644}
         if exists:
             shutil.copy2(path, folder / name)
-    return snapshot
+    preferences = [
+        (domain, key, preference(domain, key)) for domain, key, _ in PREFERENCES
+    ]
+    return snapshot, preferences
 
 
-def restore_previous(snapshot):
+def restore_previous(previous):
     """Return to the installation that was working before this upgrade."""
+    snapshot, preferences = previous
     folder = SOURCE / 'previous'
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
     if MUSIC.is_file():
@@ -3027,6 +3051,8 @@ def restore_previous(snapshot):
             replace_file(folder / name, path, details['mode'])
         else:
             path.unlink(missing_ok=True)
+    for domain, key, saved in preferences:
+        write_preference(domain, key, saved)
     if snapshot['agent.plist']['existed']:
         # Its RunAtLoad loader reapplies the previous patch.
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT), required=False)
