@@ -2708,12 +2708,16 @@ struct NotchMusicHeader: Layout {
     let artX: CGFloat = 0
     let accessoryX = max(0, width - accessory.width)
     let stacksAccessory = !fits && art.width + accessory.width > width
+    let metadataTop = cutoutHeight + gap
+    let artY =
+      fits
+      ? max(0, metadataTop + (text.height - art.height) / 2)
+      : top + (rowHeight - art.height) / 2
+    let artFrame = CGRect(origin: CGPoint(x: artX, y: artY), size: art)
     let textY =
       fits
-      ? cutoutHeight + gap
+      ? max(metadataTop, artFrame.midY - text.height / 2)
       : top + (stacksAccessory ? art.height + accessory.height : rowHeight) + gap
-    let artY = fits ? max(0, textY + text.height - art.height) : top + (rowHeight - art.height) / 2
-    let artFrame = CGRect(origin: CGPoint(x: artX, y: artY), size: art)
     let accessoryY = stacksAccessory ? artFrame.maxY : artFrame.midY - accessory.height / 2
     let accessoryFrame = CGRect(
       origin: CGPoint(x: accessoryX, y: max(fits ? 0 : top, accessoryY)), size: accessory)
