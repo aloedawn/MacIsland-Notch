@@ -152,8 +152,12 @@ MACISLAND_ISLAND_C
 
 __attribute__((visibility("hidden"))) bool MacIslandIsMenuBarAgent(void);
 
-// A shallow shoulder preserves the native content area's horizontal room.
-static const CGFloat MacIslandNotchFlare = 4;
+// The upper shoulder joins the bezel outside the native content area.
+static const CGFloat MacIslandNotchFlare = 6;
+// Room for the full-height digits drawn above the short activity's controls.
+static const CGFloat MacIslandShortContentClearance = 14;
+// Keep room for native controls even before the Clock UI provider is patched.
+static const CGFloat MacIslandShortPanelClearance = 6;
 
 MACISLAND_NOTCH_LAYOUT_H
 
@@ -513,9 +517,11 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
             CGFloat top = [before[@"top"] doubleValue], bottom = [before[@"bottom"] doubleValue];
             CGFloat oldFloor = native.minimum.sizeValue.height + MAX(0, policy.top - top);
             CGFloat proposed = policy.notchHeight + MAX(native.minimum.sizeValue.height, policy.notchHeight + top + bottom);
-            if (fabs(layoutViewport.height - oldFloor) <= 1 || fabs(layoutViewport.height - proposed) <= 1) {
-                shortHeight = proposed;
-                hostOffsets[obstructionFamily] = policy.notchHeight;
+            if (fabs(layoutViewport.height - oldFloor) <= 1 || fabs(layoutViewport.height - proposed) <= 1 ||
+                fabs(layoutViewport.height - proposed - MacIslandShortContentClearance) <= 1 ||
+                fabs(layoutViewport.height - proposed - MacIslandShortPanelClearance) <= 1) {
+                shortHeight = proposed + MacIslandShortPanelClearance;
+                hostOffsets[obstructionFamily] = policy.notchHeight + MacIslandShortContentClearance;
                 policy.top = 0;
             }
         }
@@ -537,7 +543,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
                 // the top margin. Keep a modest floor so a narrow activity
                 // still clears the shoulders, and let providers that ask
                 // for more (music, ClockAngel) negotiate their own width.
-                CGFloat width = policy.notchWidth + 140;
+                CGFloat width = policy.notchWidth + (shortHeight > 0 ? 92 : 140);
                 CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
                 CGFloat growth = floor - minimum.width;
                 maximum.width += MIN(growth, MAX(0, policy.centeredDisplayWidth - maximum.width - extraX));
@@ -555,7 +561,13 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     for (NSUInteger family = 0; family < state.obstructions.count; family++) {
         MacIslandNativeObstruction *native = state.obstructions[family];
         NSRect rect = rects[family];
-        NSRect published = NSOffsetRect(rect, 0, -hostOffsets[family]);
+        NSRect published = rect;
+        if (hostOffsets[family] > 0) {
+            // The short host is already moved below the camera. Some
+            // providers reserve horizontal space from the obstruction's
+            // width even when it is above their viewport.
+            published = NSMakeRect(NSMidX(rect) - 0.5, -hostOffsets[family] - 1, 1, 1);
+        }
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
         void (*setRect)(id, SEL, id) = family ? originalHostedObstruction : originalObstruction;
         BOOL corrected = !NSEqualRects(published, original);
@@ -762,7 +774,7 @@ MACISLAND_SAFEAREA_M
 
 // The tagged FBS obstruction is already expressed in the new, below-notch
 // content viewport. Move the AppKit event owner and its presentation together.
-static char shortHostFrameKey, shortTranslationKey;
+static char shortHostFrameKey, shortTranslationKey, shortClipKey;
 static void (*nativeHostSetFrame)(NSView *, SEL, NSRect);
 static void (*nativeHostLayout)(NSView *, SEL);
 static _Thread_local BOOL writingShortFrame;
@@ -785,9 +797,9 @@ static BOOL matchesShortViewport(id settings, CGFloat cutoutWidth, CGFloat cutou
             ![minimum isKindOfClass:NSValue.class] || strcmp([minimum objCType], @encode(NSSize))) continue;
         NSRect rect = [exclusion rectValue];
         NSSize size = [minimum sizeValue];
-        if (fabs(rect.origin.y + cutoutHeight) <= 3 &&
-            fabs(rect.size.height - cutoutHeight) <= 4 && fabs(rect.size.width - cutoutWidth) <= 4 &&
-            fabs(size.height - nativeSize.height) <= 1 && size.height > cutoutHeight &&
+        CGFloat inset = cutoutHeight + MacIslandShortContentClearance;
+        if (NSEqualSizes(rect.size, NSMakeSize(1, 1)) && fabs(NSMaxY(rect) + inset) <= 0.01 &&
+            fabs(size.height - nativeSize.height) <= 1 && size.height > inset &&
             nativeSize.width >= cutoutWidth) return YES;
     }
     return NO;
@@ -809,20 +821,47 @@ static NSRect positionedHostFrame(NSView *host, NSRect nativeFrame) {
         if (![child isKindOfClass:hostingClass]) continue;
         id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
         if (!matchesShortViewport(settings, width, height, nativeFrame.size)) continue;
-        nativeFrame.origin.y += height;
-        nativeFrame.size.height -= height;
+        CGFloat inset = height + MacIslandShortContentClearance;
+        nativeFrame.origin.y += inset;
+        nativeFrame.size.height -= inset;
         break;
     }
     return nativeFrame;
 }
 // MenuBarCore gates updates to the backing layer, even when AppKit has moved
 // its event owner. Translate the existing remote scene by the remaining delta.
+static void allowShortHostOverdraw(CALayer *layer, NSHashTable<CALayer *> *unclipped, NSUInteger depth) {
+    if ([NSStringFromClass(layer.class) isEqualToString:@"SceneHosting._SceneLayerHost"]) {
+        if (layer.masksToBounds) {
+            [unclipped addObject:layer];
+            layer.masksToBounds = NO;
+        }
+    } else if (depth) {
+        for (CALayer *child in layer.sublayers) allowShortHostOverdraw(child, unclipped, depth - 1);
+    }
+}
 static void alignHostedPresentation(NSView *view) {
     CALayer *layer = view.layer;
     if (!layer || !layer.superlayer) return;
     NSValue *nativeFrame = objc_getAssociatedObject(view, &shortHostFrameKey);
     NSNumber *previous = objc_getAssociatedObject(layer, &shortTranslationKey);
-    if (!nativeFrame && !previous) return;
+    NSHashTable<CALayer *> *unclipped = objc_getAssociatedObject(view, &shortClipKey);
+    if (!nativeFrame && !previous && !unclipped) return;
+    // The native baseline layout can draw the top of its digits above the
+    // remote surface. The moved short host reserves room for that overdraw.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (nativeFrame) {
+        if (!unclipped) {
+            unclipped = [NSHashTable weakObjectsHashTable];
+            objc_setAssociatedObject(view, &shortClipKey, unclipped, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        allowShortHostOverdraw(layer, unclipped, 3);
+    } else {
+        for (CALayer *child in unclipped.allObjects) child.masksToBounds = YES;
+        objc_setAssociatedObject(view, &shortClipKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [CATransaction commit];
     CATransform3D transform = layer.sublayerTransform;
     CATransform3D prior = CATransform3DMakeTranslation(0, previous.doubleValue, 0);
     if (!CATransform3DEqualToTransform(transform, prior)) {
@@ -902,21 +941,22 @@ static void (*originalSetCornerRadius)(id, SEL, CGFloat);
 static void (*baseSetBounds)(id, SEL, CGRect);
 static void (*baseSetPosition)(id, SEL, CGPoint);
 
-static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders) {
+static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY) {
     CGFloat flare = MIN(MacIslandNotchFlare, MIN(size.width / 4, size.height / 3));
     CGFloat bottom = MIN(14, size.height / 2);
     CGFloat width = size.width;
     CGFloat height = size.height;
     CGFloat k = 0.5522847498307936;
     CGMutablePathRef path = CGPathCreateMutable();
-    top = MIN(MAX(top, 0), MAX(height - flare - bottom, 0));
     CGFloat shoulder = outwardShoulders ? flare : 0;
+    CGFloat shoulderY = MIN(shoulder / MAX(scaleY, 0.001), height / 3);
+    top = MIN(MAX(top, 0), MAX(height - shoulderY - bottom, 0));
     CGFloat left = flare - shoulder, right = width - left;
     CGPathMoveToPoint(path, NULL, left, 0);
     CGPathAddLineToPoint(path, NULL, right, 0);
     CGPathAddLineToPoint(path, NULL, right, top);
     CGPathAddCurveToPoint(path, NULL, right - k * shoulder, top,
-                         width - flare, top + (1 - k) * shoulder, width - flare, top + shoulder);
+                         width - flare, top + (1 - k) * shoulderY, width - flare, top + shoulderY);
     CGPathAddLineToPoint(path, NULL, width - flare, height - bottom);
     CGPathAddCurveToPoint(path, NULL, width - flare, height - bottom + k * bottom,
                          width - flare - bottom + k * bottom, height,
@@ -924,8 +964,8 @@ static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShould
     CGPathAddLineToPoint(path, NULL, flare + bottom, height);
     CGPathAddCurveToPoint(path, NULL, flare + bottom - k * bottom, height,
                          flare, height - bottom + k * bottom, flare, height - bottom);
-    CGPathAddLineToPoint(path, NULL, flare, top + shoulder);
-    CGPathAddCurveToPoint(path, NULL, flare, top + (1 - k) * shoulder, left + k * shoulder, top, left, top);
+    CGPathAddLineToPoint(path, NULL, flare, top + shoulderY);
+    CGPathAddCurveToPoint(path, NULL, flare, top + (1 - k) * shoulderY, left + k * shoulder, top, left, top);
     CGPathCloseSubpath(path);
     return path;
 }
@@ -1016,6 +1056,7 @@ static BOOL nativeModifierEnabled(id modifier);
 @property(nonatomic, weak) CALayer *heldUnion;
 @property(nonatomic, strong) id heldBlur;
 @property(nonatomic, weak) CALayer *observedUnion;
+@property(nonatomic, weak) MacIslandNativeMaskObserver *detachedPaint;
 @property(nonatomic, strong) id observedBlur;
 @property(nonatomic, strong) NSMapTable<CALayer *, NSNumber *> *suppressedPaint;
 @property(nonatomic, weak) CALayer *mergeScene;
@@ -1041,8 +1082,10 @@ static BOOL nativeModifierEnabled(id modifier);
 - (void)refreshMask;
 - (void)endVisibilityHold:(BOOL)applyHide;
 - (void)updateVisibilityHold;
+- (void)holdVisibilityInUnion:(CALayer *)group blur:(id)blur;
 - (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
-                    fallback:(CALayer *)fallback;
+                       paints:(NSArray<CALayer *> *)paints;
+- (void)useDetachedPaint:(MacIslandNativeMaskObserver *)peer inUnion:(CALayer *)group blur:(id)blur;
 @end
 
 static CGRect nativeBodyFrame(MacIslandNativeMaskObserver *observer) {
@@ -1186,15 +1229,22 @@ static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize
     *transformOut = transform;
 }
 
-static CGRect presentationLayerFrameInAncestor(CALayer *layer, CALayer *ancestor) {
+static CGRect layerFrameInAncestor(CALayer *layer, CALayer *ancestor, BOOL presentation) {
     CGPoint origin, position, anchor;
     CGSize size;
     CATransform3D transform;
-    presentationLayerGeometry(layer, &origin, &size, &position, &anchor, &transform);
-    CGRect rect = (CGRect){origin, size};
+    CGRect rect = CGRectZero;
     for (CALayer *cur = layer; cur && cur != ancestor; cur = cur.superlayer) {
-        if (cur != layer)
+        if (presentation) {
             presentationLayerGeometry(cur, &origin, &size, &position, &anchor, &transform);
+        } else {
+            origin = cur.bounds.origin;
+            size = cur.bounds.size;
+            position = cur.position;
+            anchor = cur.anchorPoint;
+            transform = cur.transform;
+        }
+        if (cur == layer) rect = (CGRect){origin, size};
         CGRect centered = CGRectOffset(rect, -origin.x - anchor.x * size.width, -origin.y - anchor.y * size.height);
         CGRect transformed = CGRectApplyAffineTransform(centered, CATransform3DGetAffineTransform(transform));
         rect = CGRectOffset(transformed, position.x, position.y);
@@ -1202,10 +1252,21 @@ static CGRect presentationLayerFrameInAncestor(CALayer *layer, CALayer *ancestor
     return rect;
 }
 
+static CGRect presentationLayerFrameInAncestor(CALayer *layer, CALayer *ancestor) {
+    return layerFrameInAncestor(layer, ancestor, YES);
+}
+
 // Apple supplies two black fills for the circle: the filtered input and a
 // matching opaque fallback outside the group. Match the fallback by its
 // presentation bounds in the same scene, including the native pixel inset.
-static CALayer *secondaryFallback(CALayer *leaf, CALayer *group) {
+static BOOL sameCircleFrame(CGRect a, CGRect b) {
+    return fabs(CGRectGetMinX(a) - CGRectGetMinX(b)) <= 1.5 &&
+           fabs(CGRectGetMaxX(a) - CGRectGetMaxX(b)) <= 1.5 &&
+           fabs(CGRectGetMinY(a) - CGRectGetMinY(b)) <= 1.5 &&
+           fabs(CGRectGetMaxY(a) - CGRectGetMaxY(b)) <= 1.5;
+}
+
+static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
     CALayer *scene = group.superlayer;
     CGRect circle = presentationLayerFrameInAncestor(leaf, scene);
     CALayer *match = nil;
@@ -1216,15 +1277,38 @@ static CALayer *secondaryFallback(CALayer *leaf, CALayer *group) {
                 !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || candidate.sublayers.count)
                 continue;
             CGRect rect = presentationLayerFrameInAncestor(candidate, scene);
-            if (fabs(CGRectGetMinX(circle) - CGRectGetMinX(rect)) > 1.5 ||
-                fabs(CGRectGetMaxX(circle) - CGRectGetMaxX(rect)) > 1.5 ||
-                fabs(CGRectGetMinY(circle) - CGRectGetMinY(rect)) > 1.5 ||
-                fabs(CGRectGetMaxY(circle) - CGRectGetMaxY(rect)) > 1.5) continue;
-            if (match) return nil;
+            if (!sameCircleFrame(circle, rect)) continue;
+            if (match) return @[leaf];
             match = candidate;
         }
     }
-    return match;
+    if (!match) return @[leaf];
+
+    // The circular backdrops and gain map still draw after the two black
+    // fills are suppressed. The transition backdrop has a two-point bleed
+    // on the same native spring frame.
+    CGRect fallback = presentationLayerFrameInAncestor(match, scene);
+    NSMutableArray<CALayer *> *paints = [NSMutableArray arrayWithArray:@[leaf, match]];
+    for (CALayer *branch in scene.sublayers) {
+        if (branch == group || branch.contents) continue;
+        for (CALayer *candidate in branch.sublayers) {
+            if (candidate.contents || candidate.sublayers.count) continue;
+            CGRect expected = fallback;
+            if ([candidate.name hasPrefix:@"BackdropViewDisplayItem-"]) {
+                NSArray *types = [candidate.filters valueForKey:@"type"];
+                if (types.count) {
+                    if (types.count != 2 || ![types containsObject:@"colorMatrix"] ||
+                        ![types containsObject:@"colorInvertDisplayAware"]) continue;
+                    expected = CGRectInset(fallback, -2, -2);
+                }
+            } else if (branch != match.superlayer || ![candidate.name hasPrefix:@"GainMapViewDisplayItem-"]) {
+                continue;
+            }
+            if (sameCircleFrame(expected, presentationLayerFrameInAncestor(candidate, scene)))
+                [paints addObject:candidate];
+        }
+    }
+    return paints;
 }
 static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRect primaryBody) {
     CALayer *unionLayer = input.source.superlayer;
@@ -1238,13 +1322,31 @@ static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRe
         if (!isSecondaryMergeInput(leaf) || leaf.contents || leaf.sublayers.count) continue;
         MacIslandNativeMaskObserver *secondaryObserver = modelMaskObserver(leaf);
         CGRect circle = presentationLayerFrameInAncestor(leaf, unionLayer);
-        CGFloat gap = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody)
-            ? CGRectGetMinX(circle) - CGRectGetMaxX(primaryBody)
-            : CGRectGetMinX(primaryBody) - CGRectGetMaxX(circle);
+        BOOL trailing = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody);
+        CGFloat gap = trailing ? CGRectGetMinX(circle) - CGRectGetMaxX(primaryBody)
+                               : CGRectGetMinX(primaryBody) - CGRectGetMaxX(circle);
         CGFloat radius = [[blur valueForKey:@"inputRadius"] doubleValue];
-        BOOL suppress = blur && gap <= radius;
+        // Both contours spread into the gap before the threshold joins them.
+        // Start retiring the paint when the circle's spring targets the
+        // inside of the primary, even before its diameter starts shrinking.
+        // A full-size circle at its detached endpoint stays visible.
+        NSDictionary *screen = screenLayoutForLayer(input.source);
+        CGFloat compactHeight = [screen[@"height"] doubleValue];
+        CGFloat pixel = [screen[@"pixel"] doubleValue];
+        CGRect target = layerFrameInAncestor(leaf, unionLayer, NO);
+        CGFloat targetGap = trailing ? CGRectGetMinX(target) - CGRectGetMaxX(primaryBody)
+                                     : CGRectGetMinX(primaryBody) - CGRectGetMaxX(target);
+        BOOL entering = compactHeight > 0 && targetGap < -pixel &&
+                        target.size.height < compactHeight - 3 * pixel;
+        BOOL moving = !sameCircleFrame(circle, target);
+        BOOL absorbing = moving && (gap < radius || (entering && gap <= 2 * radius));
+        NSArray<CALayer *> *paints = blur && gap <= 2 * radius ? secondaryPaints(leaf, unionLayer) : nil;
+        MacIslandNativeMaskObserver *detached = !absorbing && paints.count > 1
+            ? modelMaskObserver(paints[1]) : nil;
+        BOOL suppress = paints.count && (absorbing || detached);
         [secondaryObserver setMergeSuppression:suppress unionLayer:unionLayer blur:blur
-                                      fallback:suppress ? secondaryFallback(leaf, unionLayer) : nil];
+                                         paints:absorbing ? paints : (detached ? @[leaf] : nil)];
+        [secondaryObserver useDetachedPaint:detached inUnion:unionLayer blur:blur];
     }
 }
 
@@ -1256,10 +1358,8 @@ static void notifyUnionPrimaryObserver(CALayer *secondary) {
     }
 }
 
-// When the primary already has a matching opaque material, its native mask
-// owns the shoulder. Filtering that same shoulder a second time smears its
-// four-point curve over the Gaussian's larger kernel. The merge input still
-// supplies the full native body and the interaction with the separate circle.
+// An opaque material can draw the shoulder without smoothing it a second
+// time through the native merge filter.
 static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
     CALayer *unionLayer = input.source.superlayer;
     CALayer *scene = unionLayer.superlayer;
@@ -1271,6 +1371,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
     }
     MacIslandNativeMaskObserver *previous = input.contourPeer;
     CALayer *heldMaterial = previous.source;
+    id blur = activeMergeBlur(unionLayer);
     // The two model layers finish their bounds and position writes separately.
     // Once Apple requests the hide, the identified material stays responsible
     // until this same filter hands off. Revalidate ownership, not model endpoints.
@@ -1294,10 +1395,21 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
             fabs(CGRectGetMinY(r) - CGRectGetMinY(body)) > 1 ||
             fabs(CGRectGetMaxY(r) - CGRectGetMaxY(body)) > 1) continue;
         peer.mergeInput = input;
-        if (!layer.hidden && layer.opacity >= 1) { selected = peer; break; }
+        if (layer.opacity >= 1 && !layer.contents && !layer.sublayers.count &&
+            (!layer.hidden || (blur && !input.source.hidden && input.source.opacity >= 1 &&
+                                !unionLayer.hidden && unionLayer.opacity >= 1))) {
+            selected = peer;
+            break;
+        }
     }
     input.contourPeer = selected;
     if (previous != selected && previous.heldBlur) [previous endVisibilityHold:YES];
+    // Sharing can hide the material before the merge starts. Reuse the
+    // matched native paint until the same blur releases it.
+    if (selected.source.hidden) {
+        [selected holdVisibilityInUnion:unionLayer blur:blur];
+        originalSetHidden(selected.source, @selector(setHidden:), NO);
+    }
     return selected != nil;
 }
 
@@ -1474,7 +1586,7 @@ static void observeNativeAnimations(CALayer *layer) {
     if (!self.applied) {
         if (self.observedUnion &&
             (source.superlayer.superlayer != self.observedUnion || !isSecondaryMergeInput(source)))
-            [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
+            [self setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
         synchronizeNativeMaskGeometry(self);
         if (isSecondaryMergeInput(source)) notifyUnionPrimaryObserver(source);
     }
@@ -1499,6 +1611,7 @@ static void observeNativeAnimations(CALayer *layer) {
     CGSize size = bounds.size;
     CGPoint position = source.position;
     CGPoint anchor = source.anchorPoint;
+    CATransform3D transform = source.transform;
     for (id modifier in nativeModifierObject(source, @"presentationModifiers")) {
         if (!nativeModifierEnabled(modifier)) continue;
         NSString *key = nativeModifierObject(modifier, @"keyPath");
@@ -1508,14 +1621,16 @@ static void observeNativeAnimations(CALayer *layer) {
         if ([key isEqual:@"bounds.size"] && !strcmp(type, @encode(CGSize))) size = [value sizeValue];
         if ([key isEqual:@"position"] && !strcmp(type, @encode(CGPoint))) position = [value pointValue];
         if ([key isEqual:@"anchorPoint"] && !strcmp(type, @encode(CGPoint))) anchor = [value pointValue];
+        if ([key isEqual:@"transform"] && !strcmp(type, @encode(CATransform3D))) transform = [value CATransform3DValue];
     }
     if (!isfinite(size.width) || !isfinite(size.height) || size.width <= 0 || size.height <= 0) return;
-    CGFloat scaleY = hypot(source.transform.m21, source.transform.m22);
+    CGFloat scaleY = hypot(transform.m21, transform.m22);
     CGFloat top = MAX(0, -(position.y - anchor.y * size.height)) / MAX(scaleY, 0.001);
     self.shapeMask.bounds = (CGRect){CGPointZero, size};
     self.shapeMask.position = bounds.origin;
     self.shapeMask.contentsScale = MAX(source.contentsScale, 2);
-    CGPathRef path = notchMaskPathAtTop(size, top, !hasOpaqueContourPeer(self));
+    BOOL peerOwnsShoulder = hasOpaqueContourPeer(self) && activeMergeBlur(source.superlayer);
+    CGPathRef path = notchMaskPathAtTop(size, top, !peerOwnsShoulder, scaleY);
     self.shapeMask.path = path;
     CGPathRelease(path);
     if (isNativeUnionFill(source)) {
@@ -1540,6 +1655,15 @@ static void observeNativeAnimations(CALayer *layer) {
     if (applyHide && self.source) originalSetHidden(self.source, @selector(setHidden:), YES);
 }
 
+- (void)holdVisibilityInUnion:(CALayer *)group blur:(id)blur {
+    if (self.heldBlur || !blur) return;
+    self.heldUnion = group;
+    self.heldBlur = blur;
+    [group addObserver:self forKeyPath:@"filters" options:0 context:&mergeVisibilityKey];
+    [blur addObserver:self forKeyPath:@"inputRadius" options:0 context:&mergeVisibilityKey];
+    [blur addObserver:self forKeyPath:@"enabled" options:0 context:&mergeVisibilityKey];
+}
+
 - (void)updateVisibilityHold {
     if (!self.heldBlur) return;
     id blur = activeMergeBlur(self.heldUnion);
@@ -1559,8 +1683,22 @@ static void observeNativeAnimations(CALayer *layer) {
     [CATransaction commit];
 }
 
+- (void)useDetachedPaint:(MacIslandNativeMaskObserver *)peer inUnion:(CALayer *)group blur:(id)blur {
+    if (self.detachedPaint != peer) {
+        [self.detachedPaint endVisibilityHold:YES];
+        self.detachedPaint = peer;
+    }
+    // The stock fallback is painted at the same spring frame, outside the
+    // union. It keeps the two contours separate while the filter is active.
+    if (peer.source.hidden) {
+        [peer holdVisibilityInUnion:group blur:blur];
+        originalSetHidden(peer.source, @selector(setHidden:), NO);
+    }
+}
+
 - (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
-                    fallback:(CALayer *)fallback {
+                       paints:(NSArray<CALayer *> *)paints {
+    if (!suppress) [self useDetachedPaint:nil inUnion:nil blur:nil];
     id nextBlur = suppress ? blur : nil;
     CALayer *nextUnion = nextBlur ? unionLayer : nil;
     if (self.observedBlur != nextBlur || self.observedUnion != nextUnion) {
@@ -1573,16 +1711,15 @@ static void observeNativeAnimations(CALayer *layer) {
         [nextBlur addObserver:self forKeyPath:@"inputRadius" options:0 context:&secondaryMergeKey];
         [nextBlur addObserver:self forKeyPath:@"enabled" options:0 context:&secondaryMergeKey];
     }
-    CALayer *input = suppress ? self.source : nil;
-    NSArray<CALayer *> *targets = input ? (fallback ? @[input, fallback] : @[input]) : @[];
+    NSArray<CALayer *> *targets = suppress ? paints : @[];
     NSMutableArray<NSNumber *> *opacities = [NSMutableArray arrayWithCapacity:targets.count];
     for (CALayer *paint in targets) [opacities addObject:@(paint.opacity)];
     NSMutableArray<CALayer *> *restored = [NSMutableArray array];
     NSMutableArray<NSNumber *> *original = [NSMutableArray array];
     os_unfair_lock_lock(&maskStateLock);
-    if (input && !self.suppressedPaint) self.suppressedPaint = [NSMapTable weakToStrongObjectsMapTable];
+    if (targets.count && !self.suppressedPaint) self.suppressedPaint = [NSMapTable weakToStrongObjectsMapTable];
     for (CALayer *paint in self.suppressedPaint.keyEnumerator.allObjects) {
-        if (paint == input || paint == fallback) continue;
+        if ([targets containsObject:paint]) continue;
         NSNumber *opacity = [self.suppressedPaint objectForKey:paint];
         [self.suppressedPaint removeObjectForKey:paint];
         if (opacity) {
@@ -1610,11 +1747,10 @@ static void observeNativeAnimations(CALayer *layer) {
         if (!blur || !isSecondaryMergeInput(self.source)) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
+            [self setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
             [CATransaction commit];
-        } else if (blur != self.observedBlur) {
-            [self setMergeSuppression:YES unionLayer:self.observedUnion blur:blur
-                              fallback:secondaryFallback(self.source, self.observedUnion)];
+        } else {
+            notifyUnionPrimaryObserver(self.source);
         }
         return;
     }
@@ -1646,7 +1782,7 @@ static void observeNativeAnimations(CALayer *layer) {
     CALayer *source = _source;
     for (NSString *key in _keys)
         [source removeObserver:self forKeyPath:key context:&maskObserverKey];
-    [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
+    [self setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
     if (source.mask == _shapeMask) {
         if (_applied) {
             baseSetBounds(source, @selector(setBounds:), _nativeBounds);
@@ -1926,6 +2062,7 @@ static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
         MacIslandNativeMaskObserver *peer = association;
         MacIslandNativeMaskObserver *input = peer.mergeInput;
         if (!hidden) [peer endVisibilityHold:NO];
+        else if (peer.heldBlur && !peer.applied) return;
         else if (input && input.contourPeer == peer && input.applied && peer.applied &&
                  !layer.hidden && layer.opacity >= 1 && !layer.contents && layer.sublayers.count == 0 &&
                  isOpaqueBlack(layer.backgroundColor) && layer.mask == peer.shapeMask &&
@@ -1933,13 +2070,7 @@ static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
             CALayer *group = input.source.superlayer;
             id blur = activeMergeBlur(group);
             if (blur) {
-                if (!peer.heldBlur) {
-                    peer.heldUnion = group;
-                    peer.heldBlur = blur;
-                    [group addObserver:peer forKeyPath:@"filters" options:0 context:&mergeVisibilityKey];
-                    [blur addObserver:peer forKeyPath:@"inputRadius" options:0 context:&mergeVisibilityKey];
-                    [blur addObserver:peer forKeyPath:@"enabled" options:0 context:&mergeVisibilityKey];
-                }
+                [peer holdVisibilityInUnion:group blur:blur];
                 return;
             }
         }
@@ -2117,6 +2248,7 @@ ENVIRONMENT_KEY = "DYLD_INSERT_LIBRARIES"
 LIBRARY = str(Path.home() / "Library/MacIsland/island.dylib")
 SUPPORTED_BUILD = "26C5035r"
 MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
+CLOCK_EXE = "/System/Library/CoreServices/ClockAngel.app/Contents/MacOS/ClockAngel"
 # Readiness is read through a fresh debugger attachment. Wait progressively,
 # rather than attaching repeatedly while the provider's main queue is busy.
 MUSIC_READY_DELAYS = (0.15, 0.35, 0.75, 1.5, 2.5)
@@ -2345,9 +2477,9 @@ def debugger_load(service, library_path, lldb, *, timeout=30):
         raise
 
 
-def music_pid():
+def provider_pid(executable):
     result = subprocess.run(
-        ["/usr/bin/pgrep", "-u", str(os.getuid()), "-x", "MediaRemoteUIService"],
+        ["/usr/bin/pgrep", "-u", str(os.getuid()), "-x", Path(executable).name],
         capture_output=True, text=True,
     )
     if result.returncode == 1:
@@ -2356,63 +2488,79 @@ def music_pid():
     pid = result.stdout.strip()
     if not pid.isdecimal() or subprocess.check_output(
         ["/bin/ps", "-p", pid, "-o", "comm="], text=True,
-    ).strip() != MUSIC_EXE:
-        raise RuntimeError("Could not identify the current user's music UI provider")
+    ).strip() != executable:
+        raise RuntimeError(f"Could not identify the current user's {Path(executable).name} provider")
     return pid
 
 
-def available_music_pid(pid):
-    if music_pid() != pid:
-        raise RuntimeError("The music UI provider restarted")
+def music_pid():
+    return provider_pid(MUSIC_EXE)
+
+
+def clock_pid():
+    return provider_pid(CLOCK_EXE)
+
+
+def available_provider_pid(pid, get_pid):
+    if get_pid() != pid:
+        raise RuntimeError("The UI provider restarted")
     flags = subprocess.check_output(["/bin/ps", "-p", pid, "-o", "flags="], text=True)
     if int(flags.strip(), 16) & 0x800:
-        raise RuntimeError("The music UI provider is already being debugged")
+        raise RuntimeError("The UI provider is already being debugged")
+
+
+def available_music_pid(pid):
+    available_provider_pid(pid, music_pid)
+
+
+def stop_managed_provider(library, get_pid):
+    """Unmap our old provider code before replacing it or restoring a backup."""
+    pid = get_pid()
+    if pid is None:
+        return False
+    mapped = subprocess.check_output(["/usr/bin/vmmap", "-w", pid], text=True, timeout=20)
+    if not any(line.rstrip().endswith(" " + str(library)) for line in mapped.splitlines()):
+        return False
+    available_provider_pid(pid, get_pid)
+    os.kill(int(pid), 15)
+    for _ in range(50):
+        if get_pid() != pid:
+            return True
+        time.sleep(0.1)
+    raise RuntimeError("The old UI provider is still running")
 
 
 def stop_managed_music(library):
-    """Unmap our old provider code before replacing it or restoring a backup."""
-    pid = music_pid()
-    if pid is None:
-        return
-    mapped = subprocess.check_output(["/usr/bin/vmmap", "-w", pid], text=True, timeout=20)
-    if not any(line.rstrip().endswith(" " + str(library)) for line in mapped.splitlines()):
-        return
-    available_music_pid(pid)
-    os.kill(int(pid), 15)
-    for _ in range(50):
-        if music_pid() != pid:
-            return
-        time.sleep(0.1)
-    raise RuntimeError("The old music UI provider is still running")
+    stop_managed_provider(library, music_pid)
 
 
-def prepare_music(library, lldb, *, launch=True):
-    """Install the expanded music layout. Returns the provider PID, or None if absent."""
+def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch):
+    """Install an optional native layout and verify its witness hook."""
     if not library.is_file():
         return None
     require_supported_build()
     require_trusted_library(library)
-    pid = music_pid()
+    pid = get_pid()
     if pid is None and launch:
-        subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.MediaRemoteUIService"],
+        subprocess.run(["/usr/bin/open", "-gj", "-b", bundle],
                        check=True, timeout=15)
         for _ in range(50):
-            pid = music_pid()
+            pid = get_pid()
             if pid:
                 break
             time.sleep(0.1)
         if pid is None:
-            raise RuntimeError("The native music UI provider did not start")
+            raise RuntimeError(f"The native {name} UI provider did not start")
     if pid is None:
         return None
     if not lldb:
-        raise RuntimeError("LLDB is required for the native music layout")
+        raise RuntimeError(f"LLDB is required for the native {name} layout")
 
     # Encode the filesystem bytes, including spaces and quotes, as a C literal.
     path = '"' + ''.join(f'\\x{byte:02x}' for byte in os.fsencode(library)) + '"'
-    with tempfile.TemporaryDirectory(prefix="macisland-music-") as scratch:
+    with tempfile.TemporaryDirectory(prefix=f"macisland-{name}-") as scratch:
         def invoke(symbol, load):
-            available_music_pid(pid)
+            check_pid(pid)
             expr = f'void *h = dlopen({path}, RTLD_NOLOAD | RTLD_NOW); bool resident = h != 0; '
             if load:
                 expr += f'if (!h) h = dlopen({path}, RTLD_NOW | RTLD_LOCAL); '
@@ -2427,23 +2575,38 @@ def prepare_music(library, lldb, *, launch=True):
             )
             match = re.search(r"^\(int\) \$\d+ = (-?\d+)$", result.stdout, re.MULTILINE)
             if result.returncode or not match:
-                raise RuntimeError(f"Could not verify {symbol} in the music UI provider: {result.stderr.strip()}")
+                raise RuntimeError(f"Could not verify {symbol} in the {name} UI provider: {result.stderr.strip()}")
             return int(match.group(1))
 
-        if invoke("mi_music_enable", True) != 0:
-            raise RuntimeError("The music UI provider rejected the build or bundle")
+        if invoke(f"mi_{name}_enable", True) != 0:
+            raise RuntimeError(f"The {name} UI provider rejected the build or bundle")
         # Installation runs on the target's main queue after LLDB detaches.
         # At login that queue can be busy; 0 means it has not run yet.
         state = 0
         for delay in MUSIC_READY_DELAYS:
             time.sleep(delay)
-            state = invoke("mi_music_status", False)
+            state = invoke(f"mi_{name}_status", False)
             if state == 1:
-                print(f"Verified native music layout in PID {pid}", flush=True)
+                print(f"Verified native {name} layout in PID {pid}", flush=True)
                 return pid
             if state < 0:
                 break
-        raise RuntimeError(f"The music provider did not accept its native layout (state {state})")
+        raise RuntimeError(f"The {name} provider did not accept its native layout (state {state})")
+
+
+def prepare_music(library, lldb, *, launch=True):
+    return prepare_provider(library, lldb, music_pid, available_music_pid,
+                            "com.apple.MediaRemoteUIService", "music", launch=launch)
+
+
+def prepare_clock_safely(library, lldb):
+    try:
+        return prepare_provider(library, lldb, clock_pid,
+                                lambda pid: available_provider_pid(pid, clock_pid),
+                                "com.apple.ClockAngel", "clock", launch=False)
+    except Exception as error:
+        log(f"Native clock layout skipped: {error}", error=True)
+        return None
 
 
 def prepare_music_safely(library, lldb, *, launch=True):
@@ -2476,6 +2639,8 @@ def inject(state, *, force_debugger=False):
         raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
     music = prepare_music_safely(library_path.with_name("notch-music.dylib"), lldb)
     state["music"] = process_identity(music)
+    clock = prepare_clock_safely(library_path.with_name("notch-music.dylib"), lldb)
+    state["clock"] = process_identity(clock)
     if legacy:
         new_pid = legacy_main(library_path)
     else:
@@ -2540,15 +2705,19 @@ def ensure_locked(library_path, state):
     library = library_path.with_name("notch-music.dylib")
     if not library.is_file():
         return
-    try:
-        music = process_identity(music_pid())
-    except Exception:
-        return
-    # Do not launch the provider here; it starts on demand and is patched then.
-    if music and music != state.get("music") and take_attempt(state, "music"):
-        log(f"Music UI provider {music} is not patched; applying")
-        pid = prepare_music_safely(library, find_lldb(required=False), launch=False)
-        state["music"] = process_identity(pid)
+    for name, get_pid in (("music", music_pid), ("clock", clock_pid)):
+        try:
+            identity = process_identity(get_pid())
+        except Exception:
+            continue
+        # Optional providers start on demand; do not launch them here.
+        if not identity or identity == state.get(name) or not take_attempt(state, name):
+            continue
+        log(f"{name.capitalize()} UI provider {identity} is not patched; applying")
+        lldb = find_lldb(required=False)
+        pid = (prepare_music_safely(library, lldb, launch=False) if name == "music"
+               else prepare_clock_safely(library, lldb))
+        state[name] = process_identity(pid)
 
 
 def print_status(force_debugger):
@@ -2562,13 +2731,14 @@ def print_status(force_debugger):
     menubar = process_identity(menu_bar_agent_pid())
     print(f"MenuBarAgent: {menubar or 'not running'}; matches last recorded instance: "
           f"{bool(menubar) and menubar == state.get('menubar')}")
-    try:
-        music = process_identity(music_pid())
-    except Exception:
-        music = None
-    print(f"Music UI provider: {music or 'not running'}; matches last recorded instance: "
-          f"{bool(music) and music == state.get('music')}")
-    for name in ("menubar", "music"):
+    for name, get_pid in (("music", music_pid), ("clock", clock_pid)):
+        try:
+            identity = process_identity(get_pid())
+        except Exception:
+            identity = None
+        print(f"{name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
+              f"{bool(identity) and identity == state.get(name)}")
+    for name in ("menubar", "music", "clock"):
         if state.get(f"{name}_paused"):
             print(f"Automatic {name} reapplication paused after repeated attempts")
 
@@ -2578,10 +2748,10 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--status", action="store_true")
     group.add_argument("--ensure", action="store_true",
-                       help="Reapply only if MenuBarAgent or the music provider restarted unpatched")
+                       help="Reapply only when MenuBarAgent or a patched UI provider has restarted")
     group.add_argument("--music-only", action="store_true",
                        help="Reapply the native music layout without restarting MenuBarAgent")
-    group.add_argument("--stop-music", action="store_true", help="Detach the installed native music layout")
+    group.add_argument("--stop-music", action="store_true", help="Detach the installed native provider layouts")
     parser.add_argument("--debugger", action="store_true",
                         help="Force the process-scoped debugger loader")
     args = parser.parse_args()
@@ -2597,14 +2767,19 @@ def main():
         state = load_state()
         try:
             if args.stop_music:
-                stop_managed_music(library_path.with_name("notch-music.dylib"))
+                library = library_path.with_name("notch-music.dylib")
+                stop_managed_music(library)
+                if stop_managed_provider(library, clock_pid):
+                    subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.ClockAngel"],
+                                   check=True, timeout=15)
                 state.pop("music", None)
+                state.pop("clock", None)
             elif args.music_only:
                 pid = prepare_music(library_path.with_name("notch-music.dylib"), find_lldb())
                 state["music"] = process_identity(pid)
             else:
                 inject(state, force_debugger=args.debugger)
-                for name in ("menubar", "music"):
+                for name in ("menubar", "music", "clock"):
                     state.pop(f"{name}_attempts", None)
                     state.pop(f"{name}_paused", None)
         finally:
@@ -2986,6 +3161,84 @@ private func installSurface<T: View>(_ t: T.Type) -> Bool {
 @_cdecl("mi_music_surface_result") public func adjust(
   _ native: UnsafeRawPointer, _ out: UnsafeMutableRawPointer
 ) { surfaceResult?(native, out) }
+
+// ClockAngel's stock horizontal stack paints the countdown above its own
+// layout baseline. Align the original button row to that visible baseline.
+private enum RaisedTimerControls: AlignmentID {
+  static func defaultValue(in dimensions: ViewDimensions) -> CGFloat {
+    // Two native 38-point buttons with an eight-point gap.
+    let isControls = abs(dimensions.width - 84) < 1 && abs(dimensions.height - 38) < 1
+    return dimensions[VerticalAlignment.center] + (isControls ? 26 : 0)
+  }
+}
+private func clockField<Root, Value>(
+  _ root: Root.Type, _ names: [String], _ expected: Value.Type
+) -> Int? {
+  var type: Any.Type = root
+  var offset = 0
+  for name in names {
+    guard let (fieldOffset, fieldType) = fieldInfo(type, name) else { return nil }
+    offset += fieldOffset
+    type = fieldType
+  }
+  guard type == expected, offset >= 0, offset % MemoryLayout<Value>.alignment == 0,
+    offset + MemoryLayout<Value>.size <= MemoryLayout<Root>.size
+  else { return nil }
+  return offset
+}
+private func isShortNotchViewport(_ rect: CGRect) -> Bool {
+  guard rect.size == CGSize(width: 1, height: 1) else { return false }
+  return NSScreen.screens.contains {
+    let height = $0.safeAreaInsets.top
+    return height > 0 && abs(rect.maxY + height + 14) < 0.01
+  }
+}
+@_silgen_name("prepare_clock_body") private func prepareClockBody(
+  _ slot: UnsafeMutablePointer<UInt>, _ discriminator: UInt32
+) -> UInt
+private let clockReadiness = OSAllocatedUnfairLock<Int32>(initialState: 0)
+private nonisolated(unsafe) var clockResult: ((UnsafeRawPointer, UnsafeMutableRawPointer) -> Void)?
+private nonisolated(unsafe) var clockSlot: (UnsafeMutablePointer<UInt>, UInt, UInt)?
+private func installClock<T: View>(_ nativeType: T.Type) -> Int32 {
+  guard clockSlot == nil else { return 1 }
+  let bodyName = String(reflecting: T.Body.self)
+  guard bodyName.contains("ClockAngel.TimerControlsView"), bodyName.contains("ClockAngel.BaselineRow"),
+    let obstruction = clockField(nativeType, ["_obstructionRect"], Environment<CGRect?>.self),
+    let alignment = clockField(
+      T.Body.self, ["content", "content", "_tree", "root", "alignment"], VerticalAlignment.self),
+    let req = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$s7SwiftUI4ViewP4body4BodyQzvgTq")
+  else { return -3 }
+  let slot = table(nativeType) + 6
+  guard writable(slot) else { return -4 }
+  clockResult = { native, out in
+    let environment = native.advanced(by: obstruction).assumingMemoryBound(to: Environment<CGRect?>.self)
+    guard let rect = environment.pointee.wrappedValue, isShortNotchViewport(rect) else { return }
+    let value = out.advanced(by: alignment).assumingMemoryBound(to: VerticalAlignment.self)
+    if value.pointee == .center { value.pointee = VerticalAlignment(RaisedTimerControls.self) }
+  }
+  let replacement = prepareClockBody(slot, req.load(as: UInt32.self) >> 16)
+  clockSlot = (slot, slot.pointee, replacement)
+  slot.pointee = replacement
+  return 1
+}
+@_cdecl("mi_clock_enable") public func enableClock() -> Int32 {
+  guard rightBuild(), Bundle.main.bundleIdentifier == "com.apple.ClockAngel" else { return -1 }
+  DispatchQueue.main.async {
+    guard let target = _typeByName("10ClockAngel17TimerExpandedViewV") as? any View.Type else {
+      clockReadiness.withLock { $0 = -2 }
+      return
+    }
+    let result = installClock(target)
+    clockReadiness.withLock { $0 = result }
+  }
+  return 0
+}
+@_cdecl("mi_clock_status") public func clockStatus() -> Int32 {
+  clockReadiness.withLock { $0 }
+}
+@_cdecl("mi_clock_layout_result") public func adjustClock(
+  _ native: UnsafeRawPointer, _ out: UnsafeMutableRawPointer
+) { clockResult?(native, out) }
 MACISLAND_MUSIC_SWIFT
 
   cat > "$SCRATCH/music-layout.swift" <<'MACISLAND_MUSIC_LAYOUT_SWIFT'
@@ -3077,14 +3330,27 @@ uintptr_t move_signed(uintptr_t *from, uintptr_t *to, unsigned disc) {
 #endif
 }
 extern void mi_surface_body(void);
+__attribute__((visibility("hidden"))) uintptr_t music_saved_body;
 uintptr_t sign_surface(uintptr_t *slot, unsigned discriminator) {
 #if __has_feature(ptrauth_calls)
+  uintptr_t context = ptrauth_blend_discriminator(slot, discriminator);
+  music_saved_body = (uintptr_t)ptrauth_auth_and_resign(
+      (void *)*slot, ptrauth_key_asia, context, ptrauth_key_function_pointer, 0);
   return (uintptr_t)ptrauth_auth_and_resign(
-      &mi_surface_body, ptrauth_key_function_pointer, 0, ptrauth_key_asia,
-      ptrauth_blend_discriminator(slot, discriminator));
+      &mi_surface_body, ptrauth_key_function_pointer, 0, ptrauth_key_asia, context);
 #else
+  music_saved_body = *slot;
   return (uintptr_t)mi_surface_body;
 #endif
+}
+extern void mi_clock_body(void);
+__attribute__((visibility("hidden"))) uintptr_t clock_saved_body;
+uintptr_t prepare_clock_body(uintptr_t *slot, uint32_t discriminator) {
+  uintptr_t context = ptrauth_blend_discriminator(slot, discriminator);
+  clock_saved_body = (uintptr_t)ptrauth_auth_and_resign(
+      (void *)*slot, ptrauth_key_asia, context, ptrauth_key_function_pointer, 0);
+  return (uintptr_t)ptrauth_auth_and_resign(
+      &mi_clock_body, ptrauth_key_function_pointer, 0, ptrauth_key_asia, context);
 }
 MACISLAND_MUSIC_ABI_C
 
@@ -3098,10 +3364,30 @@ _mi_surface_body:
  stp x29, x30, [sp, #16]
  add x29, sp, #16
  mov x19, x8
- bl _$s12NowPlayingUI0aB15ActivitySurfaceV4bodyQrvg
+ adrp x16, _music_saved_body@PAGE
+ ldr x16, [x16, _music_saved_body@PAGEOFF]
+ blraaz x16
  mov x0, x20
  mov x1, x19
  bl _mi_music_surface_result
+ ldp x29, x30, [sp, #16]
+ ldp x20, x19, [sp], #32
+ retab
+
+.p2align 2
+.globl _mi_clock_body
+_mi_clock_body:
+ pacibsp
+ stp x20, x19, [sp, #-32]!
+ stp x29, x30, [sp, #16]
+ add x29, sp, #16
+ mov x19, x8
+ adrp x16, _clock_saved_body@PAGE
+ ldr x16, [x16, _clock_saved_body@PAGEOFF]
+ blraaz x16
+ mov x0, x20
+ mov x1, x19
+ bl _mi_clock_layout_result
  ldp x29, x30, [sp, #16]
  ldp x20, x19, [sp], #32
  retab
