@@ -149,6 +149,18 @@ class MusicProviderTests(unittest.TestCase):
                  self.assertRaisesRegex(RuntimeError, "Unsupported OS build"):
                 loader.prepare_music(library, "/test/lldb")
 
+    def test_redirected_music_library_is_rejected_before_contacting_the_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "other.dylib"
+            target.touch()
+            library = Path(tmp) / "notch-music.dylib"
+            library.symlink_to(target)
+            with patch.object(loader, "require_supported_build"), \
+                 patch.object(loader, "music_pid") as provider, \
+                 self.assertRaisesRegex(RuntimeError, "symbolic link"):
+                loader.prepare_music(library, "/test/lldb")
+            provider.assert_not_called()
+
 
 class StrategyTests(unittest.TestCase):
     def test_no_amfi_flag_uses_debugger_strategy(self):
@@ -168,6 +180,25 @@ class StrategyTests(unittest.TestCase):
 
     def test_music_only_does_not_restart_menu_bar_agent(self):
         self.check_strategy("", traced=False, expected="music", argv=["--music-only"])
+
+    def test_shared_writable_install_is_rejected_before_loading_either_patch(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            library = directory / "island.dylib"
+            library.touch()
+            for writable in (directory, library):
+                with self.subTest(writable=writable):
+                    mode = writable.stat().st_mode & 0o777
+                    writable.chmod(mode | 0o020)
+                    try:
+                        with patch.object(loader, "LIBRARY", str(library)), \
+                             patch.object(loader, "require_supported_build"), \
+                             patch.object(loader, "amfi_globally_disabled") as boot_args, \
+                             self.assertRaisesRegex(RuntimeError, "group- or world-writable"):
+                            loader.inject({})
+                        boot_args.assert_not_called()
+                    finally:
+                        writable.chmod(mode)
 
     def check_strategy(self, boot_arguments, *, traced, expected, build=None,
                        music_error=False, argv=()):

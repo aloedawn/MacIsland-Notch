@@ -116,13 +116,27 @@ if [[ "$MODE" != --uninstall ]]; then
   fi
 
   cat > "$SCRATCH/island.c" <<'MACISLAND_ISLAND_C'
-#include <dlfcn.h>
+#include <libproc.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <string.h>
-#include <stdlib.h>
+#include <unistd.h>
 extern int IsAppleInternalBuild(void);
+
+static pthread_once_t identityOnce = PTHREAD_ONCE_INIT;
+static bool isMenuBarAgent;
+static void checkExecutable(void) {
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    isMenuBarAgent = proc_pidpath(getpid(), path, sizeof(path)) > 0 &&
+        strcmp(path, "/System/Library/CoreServices/MenuBarAgent.app/Contents/MacOS/MenuBarAgent") == 0;
+}
+__attribute__((visibility("hidden"))) bool MacIslandIsMenuBarAgent(void) {
+    pthread_once(&identityOnce, checkExecutable);
+    return isMenuBarAgent;
+}
+
 static int fake_IsAppleInternalBuild(void) {
-    const char *n = getprogname();
-    if (n && strcmp(n, "MenuBarAgent") == 0) return 1;
+    if (MacIslandIsMenuBarAgent()) return 1;
     return IsAppleInternalBuild();
 }
 __attribute__((used)) static struct { const void *r; const void *o; } interposers[]
@@ -134,6 +148,9 @@ MACISLAND_ISLAND_C
 
   cat > "$SCRATCH/notch-layout.h" <<'MACISLAND_NOTCH_LAYOUT_H'
 #import <CoreGraphics/CoreGraphics.h>
+#include <stdbool.h>
+
+__attribute__((visibility("hidden"))) bool MacIslandIsMenuBarAgent(void);
 
 // A shallow shoulder preserves the native content area's horizontal room.
 static const CGFloat MacIslandNotchFlare = 4;
@@ -143,6 +160,7 @@ MACISLAND_NOTCH_LAYOUT_H
   cat > "$SCRATCH/notch.m" <<'MACISLAND_NOTCH_M'
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
+#import "notch-layout.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -179,15 +197,18 @@ static NSRect minimalFrame(id screen, SEL selector) {
 
 __attribute__((constructor))
 static void installNotchGeometry(void) {
-    const char *name = getprogname();
-    if (!name || strcmp(name, "MenuBarAgent") != 0) return;
+    if (!MacIslandIsMenuBarAgent()) return;
     Class screen = NSScreen.class;
     Method defaultMethod = class_getInstanceMethod(screen, NSSelectorFromString(@"_centerHUDDefaultFrame"));
     Method hardwareMethod = class_getInstanceMethod(screen, NSSelectorFromString(@"_centerHUDHardwareFrame"));
     Method minimalMethod = class_getInstanceMethod(screen, NSSelectorFromString(@"_centerHUDMinimalObstructionFrame"));
-    if (!defaultMethod || !hardwareMethod || !minimalMethod) return;
-    if (strcmp(method_getTypeEncoding(defaultMethod), method_getTypeEncoding(hardwareMethod)) != 0 ||
-        strcmp(method_getTypeEncoding(defaultMethod), method_getTypeEncoding(minimalMethod)) != 0) return;
+    // Comparing the private methods to one another would miss a shared ABI change.
+    Method frameMethod = class_getInstanceMethod(screen, @selector(frame));
+    if (!frameMethod || !defaultMethod || !hardwareMethod || !minimalMethod) return;
+    const char *expected = method_getTypeEncoding(frameMethod);
+    if (strcmp(expected, method_getTypeEncoding(defaultMethod)) != 0 ||
+        strcmp(expected, method_getTypeEncoding(hardwareMethod)) != 0 ||
+        strcmp(expected, method_getTypeEncoding(minimalMethod)) != 0) return;
     originalDefaultFrame = (FrameGetter)method_getImplementation(defaultMethod);
     originalHardwareFrame = (FrameGetter)method_getImplementation(hardwareMethod);
     originalMinimalFrame = (FrameGetter)method_getImplementation(minimalMethod);
@@ -720,7 +741,7 @@ static void waitForSceneSettings(NSUInteger attempt) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{ waitForSceneSettings(attempt + 1); });
 }
 __attribute__((constructor)) static void installNotchContentInsets(void) {
-    if (strcmp(getprogname(), "MenuBarAgent") != 0) return;
+    if (!MacIslandIsMenuBarAgent()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         observeSettingsExtensionRegistration();
         registerKnownSettingsExtensions();
@@ -734,6 +755,7 @@ MACISLAND_SAFEAREA_M
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "notch-layout.h"
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -858,7 +880,7 @@ static void installShortHostLayout(unsigned attempt) {
     atomic_store(&shortHostAvailable, true);
 }
 __attribute__((constructor)) static void installShortHost(void) {
-    if (!strcmp(getprogname(), "MenuBarAgent"))
+    if (MacIslandIsMenuBarAgent())
         dispatch_async(dispatch_get_main_queue(), ^{ installShortHostLayout(0); });
 }
 MACISLAND_SHORT_HOST_M
@@ -873,7 +895,7 @@ MACISLAND_SHORT_HOST_M
 #include <stdlib.h>
 #include <string.h>
 
-static char mergeVisibilityKey;
+static char mergeVisibilityKey, secondaryMergeKey;
 static void (*originalSetHidden)(id, SEL, BOOL);
 static char maskObserverKey, parentGeometryKey, sceneLayersKey, sceneOriginObserverKey;
 static void (*originalSetCornerRadius)(id, SEL, CGFloat);
@@ -993,6 +1015,9 @@ static BOOL nativeModifierEnabled(id modifier);
 @property(nonatomic, weak) MacIslandNativeMaskObserver *contourPeer;
 @property(nonatomic, weak) CALayer *heldUnion;
 @property(nonatomic, strong) id heldBlur;
+@property(nonatomic, weak) CALayer *observedUnion;
+@property(nonatomic, strong) id observedBlur;
+@property(nonatomic, strong) NSMapTable<CALayer *, NSNumber *> *suppressedPaint;
 @property(nonatomic, weak) CALayer *mergeScene;
 @property(nonatomic, strong) CAShapeLayer *shapeMask;
 @property(nonatomic) CGFloat pixelInset;
@@ -1016,6 +1041,8 @@ static BOOL nativeModifierEnabled(id modifier);
 - (void)refreshMask;
 - (void)endVisibilityHold:(BOOL)applyHide;
 - (void)updateVisibilityHold;
+- (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
+                    fallback:(CALayer *)fallback;
 @end
 
 static CGRect nativeBodyFrame(MacIslandNativeMaskObserver *observer) {
@@ -1118,6 +1145,115 @@ static id activeMergeBlur(CALayer *group) {
             blur = filter;
     }
     return threshold ? blur : nil;
+}
+
+static MacIslandNativeMaskObserver *modelMaskObserver(CALayer *layer);
+
+static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize *sizeOut,
+                                      CGPoint *positionOut, CGPoint *anchorOut, CATransform3D *transformOut) {
+    CGRect bounds = layer.bounds;
+    CGPoint origin = bounds.origin;
+    CGSize size = bounds.size;
+    CGPoint position = layer.position;
+    CGPoint anchor = layer.anchorPoint;
+    CATransform3D transform = layer.transform;
+    for (id modifier in nativeModifierObject(layer, @"presentationModifiers")) {
+        if (!nativeModifierEnabled(modifier)) continue;
+        NSString *key = nativeModifierObject(modifier, @"keyPath");
+        id value = nativeModifierObject(modifier, @"value");
+        if (![value isKindOfClass:NSValue.class]) continue;
+        const char *type = [value objCType];
+        if ([key isEqual:@"bounds"] && !strcmp(type, @encode(CGRect))) {
+            CGRect r = [value rectValue];
+            origin = r.origin;
+            size = r.size;
+        } else if ([key isEqual:@"bounds.origin"] && !strcmp(type, @encode(CGPoint))) {
+            origin = [value pointValue];
+        } else if ([key isEqual:@"bounds.size"] && !strcmp(type, @encode(CGSize))) {
+            size = [value sizeValue];
+        } else if ([key isEqual:@"position"] && !strcmp(type, @encode(CGPoint))) {
+            position = [value pointValue];
+        } else if ([key isEqual:@"anchorPoint"] && !strcmp(type, @encode(CGPoint))) {
+            anchor = [value pointValue];
+        } else if ([key isEqual:@"transform"] && !strcmp(type, @encode(CATransform3D))) {
+            transform = [value CATransform3DValue];
+        }
+    }
+    *originOut = origin;
+    *sizeOut = size;
+    *positionOut = position;
+    *anchorOut = anchor;
+    *transformOut = transform;
+}
+
+static CGRect presentationLayerFrameInAncestor(CALayer *layer, CALayer *ancestor) {
+    CGPoint origin, position, anchor;
+    CGSize size;
+    CATransform3D transform;
+    presentationLayerGeometry(layer, &origin, &size, &position, &anchor, &transform);
+    CGRect rect = (CGRect){origin, size};
+    for (CALayer *cur = layer; cur && cur != ancestor; cur = cur.superlayer) {
+        if (cur != layer)
+            presentationLayerGeometry(cur, &origin, &size, &position, &anchor, &transform);
+        CGRect centered = CGRectOffset(rect, -origin.x - anchor.x * size.width, -origin.y - anchor.y * size.height);
+        CGRect transformed = CGRectApplyAffineTransform(centered, CATransform3DGetAffineTransform(transform));
+        rect = CGRectOffset(transformed, position.x, position.y);
+    }
+    return rect;
+}
+
+// Apple supplies two black fills for the circle: the filtered input and a
+// matching opaque fallback outside the group. Match the fallback by its
+// presentation bounds in the same scene, including the native pixel inset.
+static CALayer *secondaryFallback(CALayer *leaf, CALayer *group) {
+    CALayer *scene = group.superlayer;
+    CGRect circle = presentationLayerFrameInAncestor(leaf, scene);
+    CALayer *match = nil;
+    for (CALayer *branch in scene.sublayers) {
+        if (branch == group || branch.contents) continue;
+        for (CALayer *candidate in branch.sublayers) {
+            if (![candidate.name hasPrefix:@"SimpleViewDisplayItem-"] ||
+                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || candidate.sublayers.count)
+                continue;
+            CGRect rect = presentationLayerFrameInAncestor(candidate, scene);
+            if (fabs(CGRectGetMinX(circle) - CGRectGetMinX(rect)) > 1.5 ||
+                fabs(CGRectGetMaxX(circle) - CGRectGetMaxX(rect)) > 1.5 ||
+                fabs(CGRectGetMinY(circle) - CGRectGetMinY(rect)) > 1.5 ||
+                fabs(CGRectGetMaxY(circle) - CGRectGetMaxY(rect)) > 1.5) continue;
+            if (match) return nil;
+            match = candidate;
+        }
+    }
+    return match;
+}
+static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRect primaryBody) {
+    CALayer *unionLayer = input.source.superlayer;
+    if (!unionLayer) return;
+    id blur = activeMergeBlur(unionLayer);
+    for (CALayer *branch in unionLayer.sublayers) {
+        if (branch == input.source || branch.contents || branch.sublayers.count != 1 ||
+            (branch.backgroundColor && CGColorGetAlpha(branch.backgroundColor) > 0))
+            continue;
+        CALayer *leaf = branch.sublayers.firstObject;
+        if (!isSecondaryMergeInput(leaf) || leaf.contents || leaf.sublayers.count) continue;
+        MacIslandNativeMaskObserver *secondaryObserver = modelMaskObserver(leaf);
+        CGRect circle = presentationLayerFrameInAncestor(leaf, unionLayer);
+        CGFloat gap = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody)
+            ? CGRectGetMinX(circle) - CGRectGetMaxX(primaryBody)
+            : CGRectGetMinX(primaryBody) - CGRectGetMaxX(circle);
+        CGFloat radius = [[blur valueForKey:@"inputRadius"] doubleValue];
+        BOOL suppress = blur && gap <= radius;
+        [secondaryObserver setMergeSuppression:suppress unionLayer:unionLayer blur:blur
+                                      fallback:suppress ? secondaryFallback(leaf, unionLayer) : nil];
+    }
+}
+
+static void notifyUnionPrimaryObserver(CALayer *secondary) {
+    for (CALayer *sibling in secondary.superlayer.superlayer.sublayers) {
+        if (!isNativeUnionFill(sibling)) continue;
+        MacIslandNativeMaskObserver *primary = modelMaskObserver(sibling);
+        if (primary.applied) [primary refreshMask];
+    }
 }
 
 // When the primary already has a matching opaque material, its native mask
@@ -1335,7 +1471,13 @@ static void observeNativeAnimations(CALayer *layer) {
         self.applied = NO;
         removeNativeMaskGeometry(self);
     }
-    if (!self.applied) synchronizeNativeMaskGeometry(self);
+    if (!self.applied) {
+        if (self.observedUnion &&
+            (source.superlayer.superlayer != self.observedUnion || !isSecondaryMergeInput(source)))
+            [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
+        synchronizeNativeMaskGeometry(self);
+        if (isSecondaryMergeInput(source)) notifyUnionPrimaryObserver(source);
+    }
     // Re-evaluate immediately if the native material is hidden or removed.
     [self.mergeInput refreshMask];
     [CATransaction commit];
@@ -1344,7 +1486,14 @@ static void observeNativeAnimations(CALayer *layer) {
 
 - (void)refreshMask {
     CALayer *source = self.source;
-    if (!self.applied || !source || source.mask != self.shapeMask) return;
+    if (!self.applied) {
+        if (isSecondaryMergeInput(source)) {
+            synchronizeNativeMaskGeometry(self);
+            notifyUnionPrimaryObserver(source);
+        }
+        return;
+    }
+    if (!source || source.mask != self.shapeMask) return;
     synchronizeNativeMaskGeometry(self);
     CGRect bounds = source.bounds;
     CGSize size = bounds.size;
@@ -1369,6 +1518,13 @@ static void observeNativeAnimations(CALayer *layer) {
     CGPathRef path = notchMaskPathAtTop(size, top, !hasOpaqueContourPeer(self));
     self.shapeMask.path = path;
     CGPathRelease(path);
+    if (isNativeUnionFill(source)) {
+        CGRect primaryBody = CGRectMake((position.x - anchor.x * size.width) + self.horizontalFlare,
+                                        (position.y - anchor.y * size.height) + self.topExtension,
+                                        MAX(0, size.width - 2 * self.horizontalFlare),
+                                        MAX(0, size.height - self.topExtension));
+        refreshSecondaryMergeInputs(self, primaryBody);
+    }
 }
 
 // Apple hides its existing primary material partway through closing, before
@@ -1403,9 +1559,65 @@ static void observeNativeAnimations(CALayer *layer) {
     [CATransaction commit];
 }
 
+- (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
+                    fallback:(CALayer *)fallback {
+    id nextBlur = suppress ? blur : nil;
+    CALayer *nextUnion = nextBlur ? unionLayer : nil;
+    if (self.observedBlur != nextBlur || self.observedUnion != nextUnion) {
+        [self.observedBlur removeObserver:self forKeyPath:@"inputRadius" context:&secondaryMergeKey];
+        [self.observedBlur removeObserver:self forKeyPath:@"enabled" context:&secondaryMergeKey];
+        [self.observedUnion removeObserver:self forKeyPath:@"filters" context:&secondaryMergeKey];
+        self.observedBlur = nextBlur;
+        self.observedUnion = nextUnion;
+        [nextUnion addObserver:self forKeyPath:@"filters" options:0 context:&secondaryMergeKey];
+        [nextBlur addObserver:self forKeyPath:@"inputRadius" options:0 context:&secondaryMergeKey];
+        [nextBlur addObserver:self forKeyPath:@"enabled" options:0 context:&secondaryMergeKey];
+    }
+    CALayer *input = suppress ? self.source : nil;
+    NSArray<CALayer *> *targets = input ? (fallback ? @[input, fallback] : @[input]) : @[];
+    NSMutableArray<NSNumber *> *opacities = [NSMutableArray arrayWithCapacity:targets.count];
+    for (CALayer *paint in targets) [opacities addObject:@(paint.opacity)];
+    NSMutableArray<CALayer *> *restored = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *original = [NSMutableArray array];
+    os_unfair_lock_lock(&maskStateLock);
+    if (input && !self.suppressedPaint) self.suppressedPaint = [NSMapTable weakToStrongObjectsMapTable];
+    for (CALayer *paint in self.suppressedPaint.keyEnumerator.allObjects) {
+        if (paint == input || paint == fallback) continue;
+        NSNumber *opacity = [self.suppressedPaint objectForKey:paint];
+        [self.suppressedPaint removeObjectForKey:paint];
+        if (opacity) {
+            [restored addObject:paint];
+            [original addObject:opacity];
+        }
+    }
+    for (NSUInteger i = 0; i < targets.count; i++) {
+        if (opacities[i].floatValue > 0.0f || ![self.suppressedPaint objectForKey:targets[i]])
+            [self.suppressedPaint setObject:opacities[i] forKey:targets[i]];
+    }
+    os_unfair_lock_unlock(&maskStateLock);
+    // Core Animation can invoke observers synchronously; leave the lock first.
+    for (NSUInteger i = 0; i < restored.count; i++)
+        if (restored[i].opacity == 0.0f) restored[i].opacity = original[i].floatValue;
+    for (CALayer *paint in targets)
+        if (paint.opacity > 0.0f) paint.opacity = 0.0f;
+}
+
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                        change:(NSDictionary *)change context:(void *)context {
     if (context == &mergeVisibilityKey) { [self updateVisibilityHold]; return; }
+    if (context == &secondaryMergeKey) {
+        id blur = activeMergeBlur(self.observedUnion);
+        if (!blur || !isSecondaryMergeInput(self.source)) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
+            [CATransaction commit];
+        } else if (blur != self.observedBlur) {
+            [self setMergeSuppression:YES unionLayer:self.observedUnion blur:blur
+                              fallback:secondaryFallback(self.source, self.observedUnion)];
+        }
+        return;
+    }
     if (context == &sceneLayersKey) { [self refreshMask]; return; }
     if (context == &parentGeometryKey) { [self refresh]; return; }
     if (context != &maskObserverKey) {
@@ -1434,6 +1646,7 @@ static void observeNativeAnimations(CALayer *layer) {
     CALayer *source = _source;
     for (NSString *key in _keys)
         [source removeObserver:self forKeyPath:key context:&maskObserverKey];
+    [self setMergeSuppression:NO unionLayer:nil blur:nil fallback:nil];
     if (source.mask == _shapeMask) {
         if (_applied) {
             baseSetBounds(source, @selector(setBounds:), _nativeBounds);
@@ -1540,6 +1753,12 @@ static void modifierListChanged(CALayer *layer) {
     MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
     if (observer.applied) [observer refreshMask];
     else if (observer) synchronizeNativeMaskGeometry(observer);
+    else if (hasMergeFilters(layer.superlayer)) {
+        for (CALayer *child in layer.sublayers) {
+            MacIslandNativeMaskObserver *childObserver = modelMaskObserver(child);
+            if (childObserver) synchronizeNativeMaskGeometry(childObserver);
+        }
+    }
 }
 static void addPresentationModifier(CALayer *layer, SEL selector, id modifier) {
     originalAddPresentationModifier(layer, selector, modifier);
@@ -1599,6 +1818,12 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         }
         id group = nativeModifierObject(modifier, @"group");
         if (group && ![groups containsObject:group]) [groups addObject:group];
+    }
+    if (!observer.applied && isSecondaryMergeInput(observer.source)) {
+        for (id modifier in nativeModifierObject(observer.source.superlayer, @"presentationModifiers")) {
+            id group = nativeModifierObject(modifier, @"group");
+            if (group && ![groups containsObject:group]) [groups addObject:group];
+        }
     }
     os_unfair_lock_lock(&maskStateLock);
     NSArray *previousGroups = observer.nativeMaskGroups ?: @[];
@@ -1836,7 +2061,7 @@ static void refreshAllNativeSceneOrigins(void) {
 
 __attribute__((constructor))
 static void installNativeNotchMask(void) {
-    if (strcmp(getprogname(), "MenuBarAgent") != 0) return;
+    if (!MacIslandIsMenuBarAgent()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         updateScreenGeometry();
         refreshAllNativeSceneOrigins();
@@ -1879,6 +2104,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1934,6 +2160,16 @@ def require_supported_build():
         raise RuntimeError(
             f"Unsupported OS build {build} (supported: {SUPPORTED_BUILD}); services left unchanged")
     return build
+
+
+def require_trusted_library(library):
+    """Refuse to inject code from a shared-writable or redirected install path."""
+    for path, expected in ((library.parent, stat.S_ISDIR), (library, stat.S_ISREG)):
+        info = path.lstat()
+        if not expected(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise RuntimeError(
+                f"{path} must be owned by the current user, not be a symbolic link, "
+                "and not be group- or world-writable")
 
 
 def find_lldb(*, required=True):
@@ -2155,6 +2391,7 @@ def prepare_music(library, lldb, *, launch=True):
     if not library.is_file():
         return None
     require_supported_build()
+    require_trusted_library(library)
     pid = music_pid()
     if pid is None and launch:
         subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.MediaRemoteUIService"],
@@ -2227,6 +2464,7 @@ def inject(state, *, force_debugger=False):
     library_path = Path(LIBRARY)
     if not library_path.is_file():
         raise RuntimeError("Missing island.dylib; service unchanged")
+    require_trusted_library(library_path)
     legacy = amfi_globally_disabled() and not force_debugger
     lldb = find_lldb(required=not legacy)
     if not legacy:
@@ -2322,12 +2560,14 @@ def print_status(force_debugger):
     print(f"Selected loader: {'legacy' if globally_disabled and not force_debugger else 'debugger'}")
     print(f"Debugger: {find_lldb(required=False) or 'not found'}")
     menubar = process_identity(menu_bar_agent_pid())
-    print(f"MenuBarAgent: {menubar or 'not running'}; patched: {bool(menubar) and menubar == state.get('menubar')}")
+    print(f"MenuBarAgent: {menubar or 'not running'}; matches last recorded instance: "
+          f"{bool(menubar) and menubar == state.get('menubar')}")
     try:
         music = process_identity(music_pid())
     except Exception:
         music = None
-    print(f"Music UI provider: {music or 'not running'}; patched: {bool(music) and music == state.get('music')}")
+    print(f"Music UI provider: {music or 'not running'}; matches last recorded instance: "
+          f"{bool(music) and music == state.get('music')}")
     for name in ("menubar", "music"):
         if state.get(f"{name}_paused"):
             print(f"Automatic {name} reapplication paused after repeated attempts")
@@ -2773,7 +3013,7 @@ struct NotchMusicHeader: Layout {
     let textWidth = min(width, cutoutWidth)
     let text = subviews[1].sizeThatFits(ProposedViewSize(width: textWidth, height: nil))
     let wing = max(0, (width - cutoutWidth) / 2)
-    let gap = subviews[0].spacing.distance(to: subviews[1].spacing, along: .vertical)
+    let gap = max(0, subviews[0].spacing.distance(to: subviews[1].spacing, along: .vertical))
     // Contents with large Dynamic Type or a narrow proposal flow under the camera.
     let fits = max(art.width, accessory.width) <= wing
     let top = fits ? 0 : cutoutHeight
@@ -2784,7 +3024,7 @@ struct NotchMusicHeader: Layout {
     let metadataTop = cutoutHeight + gap
     let artY =
       fits
-      ? max(0, metadataTop + (text.height - art.height) / 2)
+      ? max(cutoutHeight, metadataTop + (text.height - art.height) / 2)
       : top + (rowHeight - art.height) / 2
     let artFrame = CGRect(origin: CGPoint(x: artX, y: artY), size: art)
     let textY =
@@ -2794,12 +3034,11 @@ struct NotchMusicHeader: Layout {
     let accessoryY = stacksAccessory ? artFrame.maxY : artFrame.midY - accessory.height / 2
     let accessoryFrame = CGRect(
       origin: CGPoint(x: accessoryX, y: max(fits ? 0 : top, accessoryY)), size: accessory)
-    let titleWidth = min(text.width, textWidth)
     let titleX = fits ? wing : 0
     return Positions(
       size: CGSize(
         width: width, height: max(artFrame.maxY, accessoryFrame.maxY, textY + text.height)),
-      art: artFrame, metadata: CGRect(x: titleX, y: textY, width: titleWidth, height: text.height),
+      art: artFrame, metadata: CGRect(x: titleX, y: textY, width: textWidth, height: text.height),
       accessory: accessoryFrame)
   }
 
@@ -2814,7 +3053,8 @@ struct NotchMusicHeader: Layout {
     for (index, rect) in [(0, result.art), (1, result.metadata), (3, result.accessory)] {
       subviews[index].place(
         at: CGPoint(x: bounds.minX + rect.minX, y: bounds.minY + rect.minY),
-        anchor: .topLeading, proposal: ProposedViewSize(rect.size))
+        anchor: .topLeading,
+        proposal: ProposedViewSize(width: rect.width, height: index == 1 ? nil : rect.height))
     }
     subviews[2].place(at: bounds.origin, anchor: .topLeading, proposal: .zero)
   }
