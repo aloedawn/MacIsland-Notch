@@ -19,6 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/insta
 
 The installer contains all source, builds and signs the patch locally, saves existing MacIsland files and the three affected preferences, then reloads MenuBarAgent. It installs to `~/Library/MacIsland` and reuses `com.macisland.loader` for login injection. Existing MacIsland installations are supported; the original backup is retained across reinstalls. If an upgrade of an existing MacIsland Notch installation fails, the previously installed version is put back; only a failed first installation returns to the original pre-install state.
 
+Preference backup and restoration use Foundation through the system JavaScript for Automation runtime. MenuBarAgent's app-group container is addressed explicitly, and only the three affected keys are read; unrelated values, including dates that Python's plist parser cannot represent, are left alone.
+
 With the AMFI-disable flag absent, the loader requests a suspended MenuBarAgent launch, briefly attaches the system LLDB, and detaches to resume it. It verifies that `island.dylib` is mapped in the new process; a running PID alone is not treated as success. The launch environment is restored immediately after spawning the process. On debugger or load failure, the loader terminates the suspended instance and requests a normal restart. It refuses to restart MenuBarAgent while another debugger is attached.
 
 Existing boots with `amfi_get_out_of_my_way=1` or `=0x1` retain the legacy loading path. That flag can prevent Karabiner's DriverKit extension from loading; this installer does not remove it or reboot the Mac. If removing it separately, preserve any unrelated boot arguments and restart before testing.

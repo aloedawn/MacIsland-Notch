@@ -16,6 +16,59 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# defaults(1) with an absolute plist path can address a different preferences
+# namespace from the entitled app group. Use the same explicit container as
+# MenuBarAgent for both backup and restoration, leaving Apple's other keys alone.
+cat > "$SCRATCH/preferences.js" <<'MACISLAND_PREFERENCES_JS'
+ObjC.import('Foundation');
+ObjC.import('CoreFoundation');
+function run(args) {
+    if (args.length !== 2 && args.length !== 3) throw Error('Invalid arguments');
+    var domain = args[0], key = args[1];
+    var container = $.NSURL.fileURLWithPathIsDirectory($.NSHomeDirectory().stringByAppendingPathComponent('Library/Group Containers/com.apple.MenuBar'), true);
+    var menuBarDomain = ObjC.unwrap(container.path.stringByAppendingPathComponent('Library/Preferences/com.apple.MenuBar'));
+    var defaults;
+    if (domain === menuBarDomain && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
+        defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer('com.apple.MenuBar', container);
+    } else if (domain === 'com.apple.campo' && key === 'SupportsIslandMitosis') {
+        defaults = $.NSUserDefaults.alloc.initWithSuiteName(domain);
+    } else {
+        throw Error('Unsupported preference');
+    }
+    if (ObjC.unwrap(defaults) === undefined) throw Error('Preference store unavailable');
+    if (args.length === 3) {
+        var saved = $.NSJSONSerialization.JSONObjectWithDataOptionsError($(args[2]).dataUsingEncoding($.NSUTF8StringEncoding), 0, null);
+        var present = ObjC.unwrap(saved.objectForKey('present'));
+        if (typeof present !== 'boolean') throw Error('Invalid saved preference');
+        var target = saved.objectForKey('value');
+        if (present) {
+            if (!target.isKindOfClass($.NSNumber) && !target.isKindOfClass($.NSString)) throw Error('Unsupported preference type');
+            var previous = defaults.objectForKey(key);
+            // CFPreferences may retain false when assigned an equal integer 0.
+            if (ObjC.unwrap(previous) !== undefined && previous.isEqual(target) &&
+                $.CFGetTypeID(previous) !== $.CFGetTypeID(target)) {
+                defaults.removeObjectForKey(key);
+                if (!defaults.synchronize) throw Error('Preference synchronization failed');
+            }
+            defaults.setObjectForKey(target, key);
+        } else {
+            defaults.removeObjectForKey(key);
+        }
+        if (!defaults.synchronize) throw Error('Preference synchronization failed');
+        var actual = defaults.objectForKey(key);
+        var matches = present
+            ? ObjC.unwrap(actual) !== undefined && actual.isEqual(target) &&
+              $.CFGetTypeID(actual) === $.CFGetTypeID(target)
+            : ObjC.unwrap(actual) === undefined;
+        if (!matches) throw Error('Preference verification failed');
+    }
+    var value = defaults.objectForKey(key);
+    var result = ObjC.unwrap(value) === undefined ? $({present:false}) : $({present:true, value:value});
+    var json = $.NSJSONSerialization.dataWithJSONObjectOptionsError(result, 0, null);
+    return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(json, $.NSUTF8StringEncoding));
+}
+MACISLAND_PREFERENCES_JS
+
 if [[ "$MODE" != --uninstall ]]; then
   [[ "$(uname -m)" == arm64 ]] || { echo "Apple Silicon only" >&2; exit 1; }
   [[ "$(sw_vers -buildVersion)" == 26C5035r ]] || {
@@ -2822,7 +2875,7 @@ import fcntl
 import os
 from pathlib import Path
 import plistlib
-import xml.etree.ElementTree as ET
+import json
 import shutil
 import subprocess
 import sys
@@ -2853,36 +2906,14 @@ def run(*args, required=True):
 
 
 def preference(domain, key):
-    result = run('/usr/bin/defaults', 'export', domain, '-', required=False)
-    if result.returncode and b'does not exist' not in result.stderr:
-        raise RuntimeError(f'Cannot read preferences: {domain}; no settings changed')
-    if result.returncode:
-        return {'present': False}
-    # Only deserialize the key we own. Other menu-bar settings can contain
-    # CF dates outside Python's datetime range.
-    root = ET.fromstring(result.stdout).find('dict')
-    if root is None:
-        raise RuntimeError(f'Invalid preferences dictionary: {domain}')
-    items = iter(root)
-    for name, element in zip(items, items):
-        if name.tag == 'key' and name.text == key:
-            value = plistlib.loads(b'<plist version="1.0">' + ET.tostring(element) + b'</plist>')
-            break
-    else:
-        return {'present': False}
-    if type(value) not in (bool, int, str):
+    saved = json.loads(run('/usr/bin/osascript', '-l', 'JavaScript', str(SOURCE / 'preferences.js'), domain, key).stdout)
+    if saved['present'] and type(saved['value']) not in (bool, int, str):
         raise RuntimeError(f'Unsupported existing preference type: {key}; no settings changed')
-    return {'present': True, 'value': value}
+    return saved
 
 
 def write_preference(domain, key, saved):
-    if not saved['present']:
-        run('/usr/bin/defaults', 'delete', domain, key, required=False)
-        return
-    value = saved['value']
-    kind = {bool: '-bool', int: '-int', str: '-string'}[type(value)]
-    text = ('true' if value else 'false') if type(value) is bool else str(value)
-    run('/usr/bin/defaults', 'write', domain, key, kind, text)
+    run('/usr/bin/osascript', '-l', 'JavaScript', str(SOURCE / 'preferences.js'), domain, key, json.dumps(saved))
 
 
 def replace_file(source, destination, mode):
