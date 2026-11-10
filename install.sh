@@ -3422,6 +3422,7 @@ import os
 from pathlib import Path
 import plistlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -3598,6 +3599,20 @@ def agent_definition():
     }
 
 
+def reload_running_spotlight():
+    """Refresh the native cutout client after MenuBarAgent is ready."""
+    service = f'{DOMAIN}/com.apple.campo'
+    try:
+        state = run('/bin/launchctl', 'print', service, required=False)
+        if state.returncode or not re.search(rb'^\s*pid = [1-9]\d*\s*$', state.stdout, re.MULTILINE):
+            return
+        run('/bin/launchctl', 'kickstart', '-k', service)
+    except (OSError, subprocess.CalledProcessError) as error:
+        # The island is installed even if this optional consumer cannot reload.
+        print(f'Could not reload Spotlight: {error}. If it stays detached, run: '
+              f'launchctl kickstart -k {service}', file=sys.stderr)
+
+
 def install():
     upgrading = STATE.is_file()
     state = save_original()
@@ -3626,6 +3641,7 @@ def install():
             print('Installation failed; restoring the saved pre-install state.', file=sys.stderr)
             restore_original(state)
         raise
+    reload_running_spotlight()
     print('Installed MacIsland Notch. Login injection and automatic reapplication are enabled.')
     print(f'Original files and preferences: {BACKUP}')
 

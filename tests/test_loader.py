@@ -329,7 +329,14 @@ class ManagerTests(unittest.TestCase):
             self.manager = types.ModuleType("embedded_manager")
             exec(compile(MANAGER, "embedded_manager.py", "exec"), self.manager.__dict__)
         self.calls = []
-        self.manager.run = lambda *args, required=True: self.calls.append(args)
+        self.spotlight_pid = None
+        def run(*args, required=True):
+            self.calls.append(args)
+            if args[:2] == ('/bin/launchctl', 'print'):
+                output = f'\tpid = {self.spotlight_pid}\n'.encode() if self.spotlight_pid else b''
+                return subprocess.CompletedProcess(args, int(self.spotlight_pid is None), output, b'')
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        self.manager.run = run
         self.saved_preferences = {
             (domain, key): {"present": False} for domain, key, _ in self.manager.PREFERENCES
         }
@@ -366,6 +373,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.saved_preferences, original_preferences)
         self.assertTrue(m.STATE.is_file(), "the original backup must survive a failed upgrade")
         self.assertIn(("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)), self.calls)
+        self.assertFalse(any(args[-1].endswith('/com.apple.campo') for args in self.calls))
 
     def test_successful_install_enables_the_periodic_check(self):
         self.existing_install()
@@ -379,7 +387,65 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(agent["StartInterval"], m.CHECK_INTERVAL)
         self.assertEqual((m.ROOT / "island.dylib").read_text(), "new")
         # The periodic job is loaded only after the synchronous patch succeeded.
-        self.assertEqual(self.calls[-1], ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)))
+        self.assertEqual(self.calls[-2], ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)))
+        self.assertEqual(self.calls[-1], ("/bin/launchctl", "print", f"{m.DOMAIN}/com.apple.campo"))
+
+    def test_successful_install_reloads_running_spotlight_after_menu_bar_setup(self):
+        self.existing_install()
+        self.spotlight_pid = 4321
+        m = self.manager
+        with patch.object(m.subprocess, 'run'), patch('sys.stdout', new=io.StringIO()):
+            m.install()
+        service = f'{m.DOMAIN}/com.apple.campo'
+        self.assertEqual(self.calls[-3:], [
+            ('/bin/launchctl', 'bootstrap', m.DOMAIN, str(m.AGENT)),
+            ('/bin/launchctl', 'print', service),
+            ('/bin/launchctl', 'kickstart', '-k', service),
+        ])
+
+    def test_loaded_but_stopped_spotlight_is_not_started(self):
+        m = self.manager
+        state = subprocess.CompletedProcess([], 0, b'state = not running\n', b'')
+        with patch.object(m, 'run', return_value=state) as run:
+            m.reload_running_spotlight()
+        run.assert_called_once_with('/bin/launchctl', 'print',
+                                    f'{m.DOMAIN}/com.apple.campo', required=False)
+
+    def test_failed_agent_setup_does_not_reload_spotlight(self):
+        self.existing_install()
+        self.spotlight_pid = 4321
+        m = self.manager
+        original_run = m.run
+        def fail_bootstrap(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if args[:2] == ('/bin/launchctl', 'bootstrap') and kwargs.get('required', True):
+                raise subprocess.CalledProcessError(1, args)
+            return result
+        with patch.object(m, 'run', side_effect=fail_bootstrap), \
+             patch.object(m.subprocess, 'run'), patch('sys.stderr', new=io.StringIO()), \
+             self.assertRaises(subprocess.CalledProcessError):
+            m.install()
+        self.assertEqual((m.ROOT / 'island.dylib').read_text(), 'old')
+        self.assertFalse(any(args[-1].endswith('/com.apple.campo') for args in self.calls))
+
+    def test_spotlight_reload_failure_does_not_roll_back_a_successful_install(self):
+        self.existing_install()
+        self.spotlight_pid = 4321
+        m = self.manager
+        original_run = m.run
+        def fail_reload(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if args[:3] == ('/bin/launchctl', 'kickstart', '-k'):
+                raise subprocess.CalledProcessError(1, args)
+            return result
+        with patch.object(m, 'run', side_effect=fail_reload), \
+             patch.object(m.subprocess, 'run'), patch('sys.stdout', new=io.StringIO()), \
+             patch('sys.stderr', new=io.StringIO()) as stderr:
+            m.install()
+        self.assertIn('Could not reload Spotlight', stderr.getvalue())
+        self.assertEqual((m.ROOT / 'island.dylib').read_text(), 'new')
+        self.assertTrue(m.AGENT.is_file())
+        self.assertTrue(m.STATE.is_file())
 
     def test_removal_stops_the_periodic_check_before_the_music_layout(self):
         self.existing_install()
