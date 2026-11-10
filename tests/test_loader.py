@@ -251,7 +251,7 @@ class StrategyTests(unittest.TestCase):
 
 
 class EnsureTests(unittest.TestCase):
-    def run_ensure(self, state, *, menubar="10@a", music=None, build=None, music_library=False):
+    def run_ensure(self, state, *, menubar="10@a", music=None, spotlight=None, build=None, music_library=False):
         with tempfile.TemporaryDirectory() as scratch:
             library = Path(scratch) / "island.dylib"
             library.touch()
@@ -262,13 +262,17 @@ class EnsureTests(unittest.TestCase):
                 with patch.object(loader, "current_build", return_value=build or loader.SUPPORTED_BUILD), \
                      patch.object(loader, "menu_bar_agent_pid", return_value=1), \
                      patch.object(loader, "music_pid", return_value="2"), \
+                     patch.object(loader, "clock_pid", return_value=None), \
+                     patch.object(loader, "spotlight_pid", return_value="3"), \
                      patch.object(loader, "process_identity",
-                                  side_effect=lambda pid: {1: menubar, "2": music}.get(pid)), \
+                                  side_effect=lambda pid: {1: menubar, "2": music, "3": spotlight}.get(pid)), \
                      patch.object(loader, "find_lldb", return_value="/test/lldb"), \
                      patch.object(loader, "inject") as inject, \
                      patch.object(loader, "prepare_music_safely", return_value="2") as prepare, \
+                     patch.object(loader, "prepare_background_safely", return_value="3") as background, \
                      patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                     loader.ensure()
+                self.background = background
                 return loader.load_state(), inject, prepare
 
     def test_patched_instance_is_left_alone(self):
@@ -298,6 +302,16 @@ class EnsureTests(unittest.TestCase):
         inject.assert_not_called()
         prepare.assert_called_once()
         self.assertEqual(prepare.call_args.kwargs, {"launch": False})
+
+    def test_new_spotlight_process_is_patched_once_without_restarting_the_menu_bar(self):
+        state, inject, _ = self.run_ensure(
+            {"menubar": "10@a", "spotlight": "3@old"}, spotlight="3@new", music_library=True)
+        self.assertEqual(state["spotlight"], "3@new")
+        self.background.assert_called_once()
+        self.assertEqual(self.background.call_args.args[2], "spotlight")
+        inject.assert_not_called()
+        self.run_ensure(state, spotlight="3@new", music_library=True)
+        self.background.assert_not_called()
 
     def test_unsupported_build_pauses_quietly(self):
         state, inject, _ = self.run_ensure({"menubar": "9@old"}, build="99A999")
@@ -397,10 +411,11 @@ class ManagerTests(unittest.TestCase):
         with patch.object(m.subprocess, 'run'), patch('sys.stdout', new=io.StringIO()):
             m.install()
         service = f'{m.DOMAIN}/com.apple.campo'
-        self.assertEqual(self.calls[-3:], [
+        self.assertEqual(self.calls[-4:], [
             ('/bin/launchctl', 'bootstrap', m.DOMAIN, str(m.AGENT)),
             ('/bin/launchctl', 'print', service),
             ('/bin/launchctl', 'kickstart', '-k', service),
+            ('/usr/bin/python3', str(m.ROOT / 'loader.py'), '--ensure'),
         ])
 
     def test_loaded_but_stopped_spotlight_is_not_started(self):

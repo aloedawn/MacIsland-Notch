@@ -2501,6 +2501,10 @@ def clock_pid():
     return provider_pid(CLOCK_EXE)
 
 
+def spotlight_pid():
+    return provider_pid("/System/Applications/Siri AI.app/Contents/MacOS/Siri AI")
+
+
 def available_provider_pid(pid, get_pid):
     if get_pid() != pid:
         raise RuntimeError("The UI provider restarted")
@@ -2599,13 +2603,18 @@ def prepare_music(library, lldb, *, launch=True):
                             "com.apple.MediaRemoteUIService", "music", launch=launch)
 
 
-def prepare_clock_safely(library, lldb):
+def background_providers():
+    return (("clock", clock_pid, "com.apple.ClockAngel"),
+            ("spotlight", spotlight_pid, "com.apple.campo"))
+
+
+def prepare_background_safely(library, lldb, name, get_pid, bundle):
     try:
-        return prepare_provider(library, lldb, clock_pid,
-                                lambda pid: available_provider_pid(pid, clock_pid),
-                                "com.apple.ClockAngel", "clock", launch=False)
+        return prepare_provider(library, lldb, get_pid,
+                                lambda pid: available_provider_pid(pid, get_pid),
+                                bundle, name, launch=False)
     except Exception as error:
-        log(f"Native clock layout skipped: {error}", error=True)
+        log(f"Native {name} setup skipped: {error}", error=True)
         return None
 
 
@@ -2639,8 +2648,10 @@ def inject(state, *, force_debugger=False):
         raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
     music = prepare_music_safely(library_path.with_name("notch-music.dylib"), lldb)
     state["music"] = process_identity(music)
-    clock = prepare_clock_safely(library_path.with_name("notch-music.dylib"), lldb)
-    state["clock"] = process_identity(clock)
+    for name, get_pid, bundle in background_providers():
+        patched = prepare_background_safely(library_path.with_name("notch-music.dylib"),
+                                            lldb, name, get_pid, bundle)
+        state[name] = process_identity(patched)
     if legacy:
         new_pid = legacy_main(library_path)
     else:
@@ -2705,7 +2716,7 @@ def ensure_locked(library_path, state):
     library = library_path.with_name("notch-music.dylib")
     if not library.is_file():
         return
-    for name, get_pid in (("music", music_pid), ("clock", clock_pid)):
+    for name, get_pid, bundle in (("music", music_pid, None), *background_providers()):
         try:
             identity = process_identity(get_pid())
         except Exception:
@@ -2716,7 +2727,7 @@ def ensure_locked(library_path, state):
         log(f"{name.capitalize()} UI provider {identity} is not patched; applying")
         lldb = find_lldb(required=False)
         pid = (prepare_music_safely(library, lldb, launch=False) if name == "music"
-               else prepare_clock_safely(library, lldb))
+               else prepare_background_safely(library, lldb, name, get_pid, bundle))
         state[name] = process_identity(pid)
 
 
@@ -2731,14 +2742,14 @@ def print_status(force_debugger):
     menubar = process_identity(menu_bar_agent_pid())
     print(f"MenuBarAgent: {menubar or 'not running'}; matches last recorded instance: "
           f"{bool(menubar) and menubar == state.get('menubar')}")
-    for name, get_pid in (("music", music_pid), ("clock", clock_pid)):
+    for name, get_pid, _ in (("music", music_pid, None), *background_providers()):
         try:
             identity = process_identity(get_pid())
         except Exception:
             identity = None
         print(f"{name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
               f"{bool(identity) and identity == state.get(name)}")
-    for name in ("menubar", "music", "clock"):
+    for name in ("menubar", "music", "clock", "spotlight"):
         if state.get(f"{name}_paused"):
             print(f"Automatic {name} reapplication paused after repeated attempts")
 
@@ -2772,14 +2783,16 @@ def main():
                 if stop_managed_provider(library, clock_pid):
                     subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.ClockAngel"],
                                    check=True, timeout=15)
-                state.pop("music", None)
-                state.pop("clock", None)
+                if stop_managed_provider(library, spotlight_pid):
+                    print("Stopped patched Spotlight", flush=True)
+                for name in ("music", "clock", "spotlight"):
+                    state.pop(name, None)
             elif args.music_only:
                 pid = prepare_music(library_path.with_name("notch-music.dylib"), find_lldb())
                 state["music"] = process_identity(pid)
             else:
                 inject(state, force_debugger=args.debugger)
-                for name in ("menubar", "music", "clock"):
+                for name in ("menubar", "music", "clock", "spotlight"):
                     state.pop(f"{name}_attempts", None)
                     state.pop(f"{name}_paused", None)
         finally:
@@ -3393,6 +3406,68 @@ _mi_clock_body:
  retab
 MACISLAND_MUSIC_BODY_S
 
+  cat > "$SCRATCH/spotlight.m" <<'MACISLAND_SPOTLIGHT_M'
+#import <Foundation/Foundation.h>
+#import <dlfcn.h>
+#import <ptrauth.h>
+#import <stdatomic.h>
+#import <stdint.h>
+#import <string.h>
+#import <sys/sysctl.h>
+
+// Spotlight's island is gated per device, not per display. On hardware Apple
+// ships with a CenterHUD aperture, CampoDeviceSupportsCenterHUD() is true and
+// Siri AI only grows Spotlight out of a display that MenuBarAgent configured
+// with a cutout; every other display comes up detached as ordinary Spotlight.
+// On a notched Mac the function is false, so Campo falls back to a simulated
+// cutout on every display and abandons the search when the menu bar refuses
+// the cutout on an external monitor. Setting the function's cached answer
+// inside Siri AI selects Apple's hardware path without changing global
+// MobileGestalt answers or hooking any method.
+//
+// On 26C5035r the cached fast path is:
+//   adrp x8, sOnce@PAGE;  ldr x8, [x8, sOnce@PAGEOFF]; cmn x8, #1; b.ne slow
+//   adrp x8, sSupports@PAGE; ldrb w0, [x8, sSupports@PAGEOFF]; ret
+static atomic_int state;
+
+static uintptr_t adrpPage(uint32_t insn, uintptr_t pc) {
+    int64_t imm = ((int64_t)((insn >> 5) & 0x7ffff) << 2) | ((insn >> 29) & 3);
+    imm = (imm << 43) >> 31;  // sign-extend 21 bits, then scale by 4 KiB
+    return (pc & ~(uintptr_t)0xfff) + imm;
+}
+
+int mi_spotlight_patch(void) {
+    void *symbol = dlsym(RTLD_DEFAULT, "CampoDeviceSupportsCenterHUD");
+    if (!symbol) return -2;
+    bool (*supports)(void) = (bool (*)(void))symbol;
+    bool original = supports();  // completes the dispatch_once initialiser
+    const uint32_t *code = ptrauth_strip(symbol, ptrauth_key_function_pointer);
+    uintptr_t pc = (uintptr_t)code;
+    if ((code[0] & 0x9f00001f) != 0x90000008 ||      // adrp x8
+        (code[1] & 0xffc003ff) != 0xf9400108 ||      // ldr x8, [x8, #imm]
+        (code[4] & 0x9f00001f) != 0x90000008 ||      // adrp x8
+        (code[5] & 0xffc003ff) != 0x39400100 ||      // ldrb w0, [x8, #imm]
+        code[6] != 0xd65f03c0)                       // ret
+        return -3;
+    volatile uint8_t *cached = (volatile uint8_t *)(adrpPage(code[4], pc + 16) + ((code[5] >> 10) & 0xfff));
+    if (*cached != (uint8_t)original) return -4;
+    *cached = 1;
+    return supports() ? 1 : -5;
+}
+
+int mi_spotlight_enable(void) {
+    char build[64] = {0};
+    size_t size = sizeof(build);
+    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || strcmp(build, "26C5035r") ||
+        ![NSBundle.mainBundle.executablePath isEqualToString:@"/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"])
+        return -1;
+    atomic_store(&state, mi_spotlight_patch());
+    return 0;
+}
+
+int mi_spotlight_status(void) { return atomic_load(&state); }
+MACISLAND_SPOTLIGHT_M
+
   echo "Building native notch patch from embedded source..."
   /usr/bin/xcrun clang -arch arm64e -dynamiclib -fobjc-arc -Wall -Wextra -Werror \
     -o "$SCRATCH/island.dylib" "$SCRATCH/island.c" "$SCRATCH/notch.m" \
@@ -3401,11 +3476,12 @@ MACISLAND_MUSIC_BODY_S
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/island.dylib"
+  /usr/bin/xcrun clang -arch arm64e -fobjc-arc -Wall -Wextra -Werror -c "$SCRATCH/spotlight.m" -o "$SCRATCH/spotlight.o"
   /usr/bin/xcrun clang -arch arm64e -c "$SCRATCH/music-abi.c" -o "$SCRATCH/music-abi.o"
   /usr/bin/xcrun clang -arch arm64e -c "$SCRATCH/music-body.S" -o "$SCRATCH/music-body.o"
   /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \
     -module-cache-path "$SCRATCH/swift-modules" -O -emit-library \
-    "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" "$SCRATCH/music-abi.o" "$SCRATCH/music-body.o" \
+    "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" "$SCRATCH/music-abi.o" "$SCRATCH/music-body.o" "$SCRATCH/spotlight.o" \
     -Xlinker -undefined -Xlinker dynamic_lookup -Xlinker -install_name -Xlinker @rpath/notch-music.dylib \
     -o "$SCRATCH/notch-music.dylib"
   /usr/bin/codesign -f -s - "$SCRATCH/notch-music.dylib"
@@ -3517,16 +3593,18 @@ def save_original():
 
 def stop_installed_music(state):
     if MUSIC.name in state['files'] and MUSIC.is_file():
-        run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music')
+        result = run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music')
+        return b'Stopped patched Spotlight' in result.stdout.splitlines()
+    return False
 
 
-def restore_original(state):
+def restore_original(state, stopped_spotlight=False):
     for name, details in state['files'].items():
         if details['existed'] and not (BACKUP / name).is_file():
             raise RuntimeError(f'Missing backup: {BACKUP / name}; restoration stopped')
     # Stop the periodic check first, so it cannot reapply what is being removed.
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    stop_installed_music(state)
+    stopped_spotlight = stop_installed_music(state) or stopped_spotlight
     for name, details in state['files'].items():
         path = FILES[name]
         if details['existed']:
@@ -3539,6 +3617,8 @@ def restore_original(state):
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
     else:
         run('/bin/launchctl', 'kickstart', '-k', MENU_SERVICE)
+    if stopped_spotlight:
+        reload_running_spotlight(stopped=True, ensure=False)
     for name in FILES:
         (BACKUP / name).unlink(missing_ok=True)
     STATE.unlink()
@@ -3565,13 +3645,14 @@ def snapshot_current():
     return snapshot, preferences
 
 
-def restore_previous(previous):
+def restore_previous(previous, stopped_spotlight=False):
     """Return to the installation that was working before this upgrade."""
     snapshot, preferences = previous
     folder = SOURCE / 'previous'
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
     if MUSIC.is_file():
-        run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music', required=False)
+        result = run('/usr/bin/python3', str(ROOT / 'loader.py'), '--stop-music', required=False)
+        stopped_spotlight |= b'Stopped patched Spotlight' in result.stdout.splitlines()
     for name, details in snapshot.items():
         path = FILES[name]
         if details['existed']:
@@ -3585,6 +3666,8 @@ def restore_previous(previous):
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT), required=False)
     else:
         run('/bin/launchctl', 'kickstart', '-k', MENU_SERVICE, required=False)
+    if stopped_spotlight:
+        reload_running_spotlight(stopped=True, ensure=False)
 
 
 def agent_definition():
@@ -3599,14 +3682,17 @@ def agent_definition():
     }
 
 
-def reload_running_spotlight():
+def reload_running_spotlight(*, stopped=False, ensure=True):
     """Refresh the native cutout client after MenuBarAgent is ready."""
     service = f'{DOMAIN}/com.apple.campo'
     try:
-        state = run('/bin/launchctl', 'print', service, required=False)
-        if state.returncode or not re.search(rb'^\s*pid = [1-9]\d*\s*$', state.stdout, re.MULTILINE):
-            return
+        if not stopped:
+            state = run('/bin/launchctl', 'print', service, required=False)
+            if state.returncode or not re.search(rb'^\s*pid = [1-9]\d*\s*$', state.stdout, re.MULTILINE):
+                return
         run('/bin/launchctl', 'kickstart', '-k', service)
+        if ensure:
+            run('/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure')
     except (OSError, subprocess.CalledProcessError) as error:
         # The island is installed even if this optional consumer cannot reload.
         print(f'Could not reload Spotlight: {error}. If it stays detached, run: '
@@ -3617,10 +3703,11 @@ def install():
     upgrading = STATE.is_file()
     state = save_original()
     previous = snapshot_current() if upgrading else None
+    stopped_spotlight = False
     try:
         # Stop the previous periodic check before replacing what it loads.
         run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-        stop_installed_music(state)
+        stopped_spotlight = stop_installed_music(state)
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
         replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)
@@ -3636,12 +3723,12 @@ def install():
     except BaseException:
         if previous is not None:
             print('Upgrade failed; restoring the previously installed version.', file=sys.stderr)
-            restore_previous(previous)
+            restore_previous(previous, stopped_spotlight)
         else:
             print('Installation failed; restoring the saved pre-install state.', file=sys.stderr)
-            restore_original(state)
+            restore_original(state, stopped_spotlight)
         raise
-    reload_running_spotlight()
+    reload_running_spotlight(stopped=stopped_spotlight)
     print('Installed MacIsland Notch. Login injection and automatic reapplication are enabled.')
     print(f'Original files and preferences: {BACKUP}')
 
