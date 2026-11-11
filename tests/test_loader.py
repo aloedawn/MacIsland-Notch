@@ -1,4 +1,4 @@
-"""Exercise the embedded loader and installer without restarting any desktop service."""
+"""Exercise the loader and installer without restarting any desktop service."""
 
 from contextlib import nullcontext
 import io
@@ -12,30 +12,51 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "install.sh"
-TEXT = SCRIPT.read_text()
-START = '  cat > "$SCRATCH/loader.py" <<\'MACISLAND_LOADER_PY\'\n'
-SOURCE = TEXT.split(START, 1)[1].split("\nMACISLAND_LOADER_PY", 1)[0]
-MANAGER = TEXT.split("<<'MACISLAND_MANAGER'\n", 1)[1].split("\nMACISLAND_MANAGER", 1)[0]
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "install.sh"
+TEXT = SCRIPT.read_text(encoding="utf-8")
+MODULAR_LOADER = (ROOT / "src/loader/loader.py").read_text(encoding="utf-8")
+MODULAR_MANAGER = (ROOT / "src/installer/manager.py").read_text(encoding="utf-8")
+EMBEDDED_LOADER = TEXT.split("<<'MACISLAND_LOADER_PY'\n", 1)[1].split("\nMACISLAND_LOADER_PY", 1)[0]
+EMBEDDED_MANAGER = TEXT.split("<<'MACISLAND_MANAGER'\n", 1)[1].split("\nMACISLAND_MANAGER", 1)[0]
+
 loader = types.ModuleType("embedded_loader")
-exec(compile(SOURCE, "embedded_loader.py", "exec"), loader.__dict__)
+exec(compile(MODULAR_LOADER, str(ROOT / "src/loader/loader.py"), "exec"), loader.__dict__)
+
+
+class SourceParityTests(unittest.TestCase):
+    def test_embedded_loader_and_manager_match_modular_sources(self):
+        self.assertEqual(MODULAR_LOADER.rstrip("\n"), EMBEDDED_LOADER.rstrip("\n"))
+        self.assertEqual(MODULAR_MANAGER.rstrip("\n"), EMBEDDED_MANAGER.rstrip("\n"))
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
     def test_prior_value_is_restored_after_launch_failure(self):
         domain = "\tenvironment = {\n\t\tDYLD_INSERT_LIBRARIES => /old.dylib\n\t}\n"
         with patch.object(loader.subprocess, "check_output", return_value=domain), \
-             patch.object(loader.subprocess, "run") as run:
+             patch.object(loader.subprocess, "run") as run, \
+             patch("sys.stdout", new=io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "launch failed"):
                 with loader.temporary_launch_environment(Path("/new.dylib")):
                     raise RuntimeError("launch failed")
         self.assertEqual(run.call_args_list[-1].args[0],
                          [loader.LAUNCHCTL, "setenv", loader.ENVIRONMENT_KEY, "/old.dylib"])
 
+    def test_duplicate_library_entry_is_not_appended_twice(self):
+        domain = "\tenvironment = {\n\t\tDYLD_INSERT_LIBRARIES => /a.dylib:/new.dylib\n\t}\n"
+        with patch.object(loader.subprocess, "check_output", return_value=domain), \
+             patch.object(loader.subprocess, "run") as run, \
+             patch("sys.stdout", new=io.StringIO()):
+            with loader.temporary_launch_environment(Path("/new.dylib")):
+                pass
+        self.assertEqual(run.call_args_list[0].args[0],
+                         [loader.LAUNCHCTL, "setenv", loader.ENVIRONMENT_KEY, "/a.dylib:/new.dylib"])
+
     def test_absent_variable_is_unset_after_success(self):
         with patch.object(loader.subprocess, "check_output",
                           return_value="\tenvironment = {\n\t}\n"), \
-             patch.object(loader.subprocess, "run") as run:
+             patch.object(loader.subprocess, "run") as run, \
+             patch("sys.stdout", new=io.StringIO()):
             with loader.temporary_launch_environment(Path("/new.dylib")):
                 pass
         self.assertEqual(run.call_args_list[-1].args[0],
@@ -112,12 +133,34 @@ class MusicProviderTests(unittest.TestCase):
             loader.stop_managed_music(Path("/managed/notch-music.dylib"))
         kill.assert_not_called()
 
-    def prepare(self, statuses):
+    def test_exiting_provider_during_pgrep_ps_race_returns_none(self):
+        def run_cmd(argv, **kwargs):
+            if argv[0] == "/usr/bin/pgrep":
+                return subprocess.CompletedProcess(argv, 0, "444\n555\n", "")
+            if argv[0] == "/bin/ps" and "444" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if argv[0] == "/bin/ps" and "555" in argv:
+                return subprocess.CompletedProcess(argv, 0, loader.MUSIC_EXE + "\n", "")
+            raise AssertionError(argv)
+
+        with patch.object(loader.subprocess, "run", side_effect=run_cmd):
+            self.assertEqual(loader.music_pid(), "555")
+
+    def test_is_traced_returns_false_when_process_exited(self):
+        with patch.object(
+            loader.subprocess,
+            "check_output",
+            side_effect=subprocess.CalledProcessError(1, ["/bin/ps"]),
+        ):
+            self.assertFalse(loader.is_traced(999))
+
+    def prepare(self, statuses, *, enable_rc="0"):
         statuses = iter(statuses)
 
         def execute(argv, **kwargs):
-            status = next(statuses) if "mi_music_status" in " ".join(argv) else "0"
-            return subprocess.CompletedProcess(argv, 0, f"(int) $0 = {status}\n", "")
+            joined = " ".join(argv)
+            value = next(statuses) if "mi_music_status" in joined else enable_rc
+            return subprocess.CompletedProcess(argv, 0, f"(int) $0 = {value}\n", "")
 
         with tempfile.TemporaryDirectory() as tmp:
             library = Path(tmp) / "notch-music.dylib"
@@ -129,6 +172,14 @@ class MusicProviderTests(unittest.TestCase):
                  patch.object(loader.time, "sleep"), \
                  patch("sys.stdout", new=io.StringIO()):
                 return loader.prepare_music(library, "/test/lldb")
+
+    def test_dlopen_failure_and_missing_symbol_have_distinct_diagnostics(self):
+        with self.assertRaisesRegex(RuntimeError, "Could not load notch-music.dylib"):
+            self.prepare([], enable_rc="-101")
+        with self.assertRaisesRegex(RuntimeError, "Symbol mi_music_enable is missing"):
+            self.prepare([], enable_rc="-100")
+        with self.assertRaisesRegex(RuntimeError, "rejected the build or bundle"):
+            self.prepare([], enable_rc="-1")
 
     def test_failed_witness_install_is_not_reported_as_ready(self):
         with self.assertRaisesRegex(RuntimeError, "state -6"):
@@ -178,8 +229,35 @@ class StrategyTests(unittest.TestCase):
     def test_music_failure_does_not_block_the_island(self):
         self.check_strategy("", traced=False, expected="debugger", music_error=True)
 
-    def test_music_only_does_not_restart_menu_bar_agent(self):
+    def test_music_only_and_providers_only_do_not_restart_menu_bar_agent(self):
         self.check_strategy("", traced=False, expected="music", argv=["--music-only"])
+        self.check_strategy("", traced=False, expected="music", argv=["--providers-only"])
+
+    def test_only_unpatched_providers_skips_already_patched_instances(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            library = Path(scratch) / "island.dylib"
+            library.touch()
+            state = {"music": "77@t", "clock": "88@t", "spotlight": None}
+            with patch.object(loader, "LIBRARY", str(library)), \
+                 patch.object(loader, "require_supported_build"), \
+                 patch.object(loader, "amfi_globally_disabled", return_value=False), \
+                 patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+                 patch.object(loader.subprocess, "check_output", return_value="status: disabled"), \
+                 patch.object(loader, "menu_bar_agent_pid", return_value=123), \
+                 patch.object(loader, "is_traced", return_value=False), \
+                 patch.object(loader, "music_pid", return_value="77"), \
+                 patch.object(loader, "clock_pid", return_value="88"), \
+                 patch.object(loader, "spotlight_pid", return_value=None), \
+                 patch.object(loader, "process_identity", side_effect=lambda pid: pid and f"{pid}@t"), \
+                 patch.object(loader, "prepare_music_safely") as prep_music, \
+                 patch.object(loader, "prepare_background_safely", return_value=None) as prep_bg, \
+                 patch.object(loader, "debugger_load", return_value=456):
+                loader.inject(state, only_unpatched_providers=True, launch_music=False)
+            prep_music.assert_not_called()
+            self.assertEqual([call.args[2] for call in prep_bg.call_args_list], ["spotlight"])
+            self.assertEqual(state["menubar"], "456@t")
+            self.assertEqual(state["music"], "77@t")
+            self.assertEqual(state["clock"], "88@t")
 
     def test_shared_writable_install_is_rejected_before_loading_either_patch(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -228,6 +306,8 @@ class StrategyTests(unittest.TestCase):
                  patch.object(loader, "current_boot_arguments", return_value=boot_arguments), \
                  patch.object(loader.subprocess, "check_output", side_effect=output), \
                  patch.object(loader, "menu_bar_agent_pid", return_value=123), \
+                 patch.object(loader, "clock_pid", return_value=None), \
+                 patch.object(loader, "spotlight_pid", return_value=None), \
                  patch.object(loader, "process_identity", side_effect=lambda pid: pid and f"{pid}@t"), \
                  patch.object(loader, "prepare_music", side_effect=music) as prepare, \
                  patch.object(loader, "debugger_load", return_value=456) as debugger, \
@@ -280,9 +360,9 @@ class EnsureTests(unittest.TestCase):
         inject.assert_not_called()
         prepare.assert_not_called()
 
-    def test_restarted_menu_bar_agent_is_patched_again(self):
+    def test_restarted_menu_bar_agent_is_patched_without_reattaching_patched_providers(self):
         state, inject, _ = self.run_ensure({"menubar": "9@old"})
-        inject.assert_called_once()
+        inject.assert_called_once_with(state, only_unpatched_providers=True, launch_music=False)
         self.assertEqual(len(state["menubar_attempts"]), 1)
 
     def test_restart_loop_is_paused(self):
@@ -291,10 +371,17 @@ class EnsureTests(unittest.TestCase):
         inject.assert_not_called()
         self.assertTrue(state["menubar_paused"])
 
-    def test_old_attempts_expire(self):
+    def test_old_attempts_and_idle_provider_pause_flags_expire(self):
         old = loader.time.time() - loader.REAPPLY_WINDOW - 1
-        _, inject, _ = self.run_ensure({"menubar": "9@old", "menubar_attempts": [old] * 3})
+        state, inject, _ = self.run_ensure({
+            "menubar": "9@old",
+            "menubar_attempts": [old] * 3,
+            "music_attempts": [old] * 3,
+            "music_paused": True,
+        })
         inject.assert_called_once()
+        self.assertNotIn("music_paused", state)
+        self.assertNotIn("music_attempts", state)
 
     def test_restarted_music_provider_is_patched_without_menu_bar_restart(self):
         state, inject, prepare = self.run_ensure({"menubar": "10@a", "music": "1@old"},
@@ -337,26 +424,31 @@ class ManagerTests(unittest.TestCase):
         self.source = Path(self.tmp.name) / "source"
         self.source.mkdir()
         for name in ("island.dylib", "loader.py", "notch-music.dylib"):
-            (self.source / name).write_text("new")
+            (self.source / name).write_text("new", encoding="utf-8")
         with patch.dict(os.environ, {"HOME": str(self.home)}), \
              patch("sys.argv", ["manager", "install", str(self.source)]):
             self.manager = types.ModuleType("embedded_manager")
-            exec(compile(MANAGER, "embedded_manager.py", "exec"), self.manager.__dict__)
+            exec(compile(MODULAR_MANAGER, str(ROOT / "src/installer/manager.py"), "exec"),
+                 self.manager.__dict__)
         self.calls = []
         self.spotlight_pid = None
+
         def run(*args, required=True):
             self.calls.append(args)
-            if args[:2] == ('/bin/launchctl', 'print'):
-                output = f'\tpid = {self.spotlight_pid}\n'.encode() if self.spotlight_pid else b''
-                return subprocess.CompletedProcess(args, int(self.spotlight_pid is None), output, b'')
-            return subprocess.CompletedProcess(args, 0, b'', b'')
+            if args[:2] == ("/bin/launchctl", "print"):
+                output = f"\tpid = {self.spotlight_pid}\n".encode() if self.spotlight_pid else b""
+                return subprocess.CompletedProcess(args, int(self.spotlight_pid is None), output, b"")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
         self.manager.run = run
         self.saved_preferences = {
             (domain, key): {"present": False} for domain, key, _ in self.manager.PREFERENCES
         }
         self.manager.preference = lambda domain, key: self.saved_preferences[domain, key]
+
         def write_preference(domain, key, saved):
             self.saved_preferences[domain, key] = saved
+
         self.manager.write_preference = write_preference
 
     def tearDown(self):
@@ -367,27 +459,37 @@ class ManagerTests(unittest.TestCase):
         m.ROOT.mkdir(parents=True)
         m.AGENT.parent.mkdir(parents=True)
         for path in (m.ROOT / "island.dylib", m.ROOT / "loader.py", m.MUSIC, m.AGENT):
-            path.write_text("old")
+            path.write_text("old", encoding="utf-8")
         m.BACKUP.mkdir()
         state = {"version": 1, "preferences": [], "auxiliary_existed": {},
                  "files": {name: {"existed": False, "mode": 0o644} for name in m.FILES}}
         m.STATE.write_bytes(plistlib.dumps(state))
 
-    def test_failed_upgrade_returns_to_the_working_version(self):
+    def test_failed_upgrade_returns_to_the_working_version_and_reruns_previous_loader(self):
         self.existing_install()
         m = self.manager
+        (m.ROOT / "loader-state.json").write_text('{"menubar": "new"}', encoding="utf-8")
         original_preferences = dict(self.saved_preferences)
-        failure = subprocess.CalledProcessError(1, ["loader"])
-        with patch.object(m.subprocess, "run", side_effect=failure), \
+        sub_calls = []
+
+        def fake_subprocess_run(argv, **kwargs):
+            sub_calls.append((argv, kwargs.get("check")))
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(m.subprocess, "run", side_effect=fake_subprocess_run), \
              patch("sys.stderr", new=io.StringIO()), \
              self.assertRaises(subprocess.CalledProcessError):
             m.install()
-        self.assertEqual((m.ROOT / "island.dylib").read_text(), "old")
-        self.assertEqual(m.AGENT.read_text(), "old")
+        self.assertEqual((m.ROOT / "island.dylib").read_text(encoding="utf-8"), "old")
+        self.assertEqual(m.AGENT.read_text(encoding="utf-8"), "old")
+        self.assertFalse((m.ROOT / "loader-state.json").exists())
+        self.assertEqual(sub_calls[-1], (["/usr/bin/python3", str(m.ROOT / "loader.py")], False))
         self.assertEqual(self.saved_preferences, original_preferences)
         self.assertTrue(m.STATE.is_file(), "the original backup must survive a failed upgrade")
         self.assertIn(("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)), self.calls)
-        self.assertFalse(any(args[-1].endswith('/com.apple.campo') for args in self.calls))
+        self.assertFalse(any(args[-1].endswith("/com.apple.campo") for args in self.calls))
 
     def test_successful_install_enables_the_periodic_check(self):
         self.existing_install()
@@ -399,7 +501,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(agent["ProgramArguments"][-1], "--ensure")
         self.assertTrue(agent["RunAtLoad"])
         self.assertEqual(agent["StartInterval"], m.CHECK_INTERVAL)
-        self.assertEqual((m.ROOT / "island.dylib").read_text(), "new")
+        self.assertEqual((m.ROOT / "island.dylib").read_text(encoding="utf-8"), "new")
         # The periodic job is loaded only after the synchronous patch succeeded.
         self.assertEqual(self.calls[-2], ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)))
         self.assertEqual(self.calls[-1], ("/bin/launchctl", "print", f"{m.DOMAIN}/com.apple.campo"))
@@ -408,68 +510,100 @@ class ManagerTests(unittest.TestCase):
         self.existing_install()
         self.spotlight_pid = 4321
         m = self.manager
-        with patch.object(m.subprocess, 'run'), patch('sys.stdout', new=io.StringIO()):
+        with patch.object(m.subprocess, "run"), patch("sys.stdout", new=io.StringIO()):
             m.install()
-        service = f'{m.DOMAIN}/com.apple.campo'
+        service = f"{m.DOMAIN}/com.apple.campo"
         self.assertEqual(self.calls[-4:], [
-            ('/bin/launchctl', 'bootstrap', m.DOMAIN, str(m.AGENT)),
-            ('/bin/launchctl', 'print', service),
-            ('/bin/launchctl', 'kickstart', '-k', service),
-            ('/usr/bin/python3', str(m.ROOT / 'loader.py'), '--ensure'),
+            ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)),
+            ("/bin/launchctl", "print", service),
+            ("/bin/launchctl", "kickstart", "-k", service),
+            ("/usr/bin/python3", str(m.ROOT / "loader.py"), "--ensure", "--wait"),
         ])
 
     def test_loaded_but_stopped_spotlight_is_not_started(self):
         m = self.manager
-        state = subprocess.CompletedProcess([], 0, b'state = not running\n', b'')
-        with patch.object(m, 'run', return_value=state) as run:
+        state = subprocess.CompletedProcess([], 0, b"state = not running\n", b"")
+        with patch.object(m, "run", return_value=state) as run:
             m.reload_running_spotlight()
-        run.assert_called_once_with('/bin/launchctl', 'print',
-                                    f'{m.DOMAIN}/com.apple.campo', required=False)
+        run.assert_called_once_with("/bin/launchctl", "print",
+                                    f"{m.DOMAIN}/com.apple.campo", required=False)
 
     def test_failed_agent_setup_does_not_reload_spotlight(self):
         self.existing_install()
         self.spotlight_pid = 4321
         m = self.manager
         original_run = m.run
+
         def fail_bootstrap(*args, **kwargs):
             result = original_run(*args, **kwargs)
-            if args[:2] == ('/bin/launchctl', 'bootstrap') and kwargs.get('required', True):
+            if args[:2] == ("/bin/launchctl", "bootstrap") and kwargs.get("required", True):
                 raise subprocess.CalledProcessError(1, args)
             return result
-        with patch.object(m, 'run', side_effect=fail_bootstrap), \
-             patch.object(m.subprocess, 'run'), patch('sys.stderr', new=io.StringIO()), \
+
+        with patch.object(m, "run", side_effect=fail_bootstrap), \
+             patch.object(m.subprocess, "run"), patch("sys.stderr", new=io.StringIO()), \
              self.assertRaises(subprocess.CalledProcessError):
             m.install()
-        self.assertEqual((m.ROOT / 'island.dylib').read_text(), 'old')
-        self.assertFalse(any(args[-1].endswith('/com.apple.campo') for args in self.calls))
+        self.assertEqual((m.ROOT / "island.dylib").read_text(encoding="utf-8"), "old")
+        self.assertFalse(any(args[-1].endswith("/com.apple.campo") for args in self.calls))
 
     def test_spotlight_reload_failure_does_not_roll_back_a_successful_install(self):
         self.existing_install()
         self.spotlight_pid = 4321
         m = self.manager
         original_run = m.run
+
         def fail_reload(*args, **kwargs):
             result = original_run(*args, **kwargs)
-            if args[:3] == ('/bin/launchctl', 'kickstart', '-k'):
+            if args[:3] == ("/bin/launchctl", "kickstart", "-k"):
                 raise subprocess.CalledProcessError(1, args)
             return result
-        with patch.object(m, 'run', side_effect=fail_reload), \
-             patch.object(m.subprocess, 'run'), patch('sys.stdout', new=io.StringIO()), \
-             patch('sys.stderr', new=io.StringIO()) as stderr:
+
+        with patch.object(m, "run", side_effect=fail_reload), \
+             patch.object(m.subprocess, "run"), patch("sys.stdout", new=io.StringIO()), \
+             patch("sys.stderr", new=io.StringIO()) as stderr:
             m.install()
-        self.assertIn('Could not reload Spotlight', stderr.getvalue())
-        self.assertEqual((m.ROOT / 'island.dylib').read_text(), 'new')
+        self.assertIn("Could not reload Spotlight", stderr.getvalue())
+        self.assertEqual((m.ROOT / "island.dylib").read_text(encoding="utf-8"), "new")
         self.assertTrue(m.AGENT.is_file())
         self.assertTrue(m.STATE.is_file())
 
-    def test_removal_stops_the_periodic_check_before_the_music_layout(self):
+    def test_removal_stops_periodic_check_prefers_staged_loader_and_survives_stop_failure(self):
         self.existing_install()
         m = self.manager
-        state = plistlib.loads(m.STATE.read_bytes())
-        m.restore_original(state)
+        original_run = m.run
+
+        def fail_stop_music(*args, **kwargs):
+            self.calls.append(args)
+            if args[-1] == "--stop-music":
+                self.assertFalse(kwargs.get("required", True))
+                return subprocess.CompletedProcess(args, 1, b"", b"stop failed")
+            return original_run(*args, **kwargs)
+
+        with patch.object(m, "run", side_effect=fail_stop_music):
+            state = plistlib.loads(m.STATE.read_bytes())
+            m.restore_original(state)
         self.assertEqual(self.calls[0], ("/bin/launchctl", "bootout", m.DOMAIN, str(m.AGENT)))
-        self.assertEqual(self.calls[1][-1], "--stop-music")
+        self.assertIn(("/usr/bin/python3", str(self.source / "loader.py"), "--stop-music"), self.calls)
         self.assertFalse(m.BACKUP.exists())
+
+    def test_backup_and_restore_preserve_preexisting_symlinks(self):
+        m = self.manager
+        m.ROOT.mkdir(parents=True)
+        m.AGENT.parent.mkdir(parents=True)
+        external_target = Path(self.tmp.name) / "external-island.dylib"
+        external_target.write_text("external", encoding="utf-8")
+        external_target.chmod(0o600)
+        (m.ROOT / "island.dylib").symlink_to(external_target)
+        state = m.save_original()
+        self.assertTrue((m.BACKUP / "island.dylib").is_symlink())
+        m.replace_file(self.source / "island.dylib", m.ROOT / "island.dylib", 0o755)
+        self.assertFalse((m.ROOT / "island.dylib").is_symlink())
+        self.assertEqual(external_target.read_text(encoding="utf-8"), "external")
+        m.restore_original(state)
+        self.assertTrue((m.ROOT / "island.dylib").is_symlink())
+        self.assertEqual(os.readlink(m.ROOT / "island.dylib"), str(external_target))
+        self.assertEqual(external_target.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

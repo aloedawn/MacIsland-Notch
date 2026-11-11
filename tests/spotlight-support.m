@@ -10,7 +10,8 @@ int main(void) {
     }
     bool (*supports)(void) = (bool (*)(void))dlsym(RTLD_DEFAULT, "CampoDeviceSupportsCenterHUD");
     bool before = supports();
-    int result = mi_spotlight_patch();
-    printf("before=%d patch=%d after=%d\n", before, result, supports());
-    return result == 1 && supports() ? 0 : 1;
+    int first = mi_spotlight_patch();
+    int second = mi_spotlight_patch();
+    printf("before=%d patch=%d repeat=%d after=%d\n", before, first, second, supports());
+    return first == 1 && second == 1 && supports() ? 0 : 1;
 }

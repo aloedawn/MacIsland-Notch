@@ -31,22 +31,39 @@ The loader attaches briefly to Apple’s MediaRemoteUIService and to ClockAngel 
 
 `com.macisland.loader` runs at login and then every 30 seconds with `--ensure`. Each run compares the current MenuBarAgent, MediaRemoteUIService, ClockAngel, and Siri AI instances (PID and start time) with the ones last patched. Restarted providers get their layouts back without restarting MenuBarAgent. To stop a crash loop, each component gets at most 3 automatic attempts per 15 minutes; after that, automatic reapplication pauses and the pause is logged. Running the loader manually resets the budget.
 
-Inspect the current boot and selected strategy without reloading anything. The report compares current process identities with the loader's records. HUD visibility is checked on screen.
+Inspect the current boot and selected strategy without reloading anything. The report compares current process identities with the loader's records; confirm visible HUD behavior on screen:
 
 ```bash
 /usr/bin/python3 ~/Library/MacIsland/loader.py --status
 ```
 
-Reapply only the music layout, without restarting MenuBarAgent:
+Reapply only the provider layouts (Music and any running Clock or Spotlight instances), without restarting MenuBarAgent (`--music-only` is kept as an alias):
 
 ```bash
-/usr/bin/python3 ~/Library/MacIsland/loader.py --music-only
+/usr/bin/python3 ~/Library/MacIsland/loader.py --providers-only
 ```
 
 Build without installing or changing preferences:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/install.sh | bash -s -- --check
+```
+
+## Source layout
+
+Sources are organized per subsystem under `src/` and bundled into the self-contained root `install.sh` by `scripts/build_installer.py`:
+
+- `src/island/` — `MenuBarAgent` interposer (`island.dylib`): `notch-layout.h`, `island.c`, `notch.m`, `short-host.m`, `safearea.m`, `mask.m`
+- `src/providers/` — UI provider patches (`notch-music.dylib`): `provider-abi.c`, `provider-body.S`, `witness.swift`, `music.swift`, `music-layout.swift`, `clock.swift`, `spotlight.m`
+- `src/loader/loader.py` — process-scoped LLDB / legacy loader and periodic `--ensure` daemon
+- `src/installer/` — `preferences.js`, `manager.py`, and shell template `runner.sh`
+- `scripts/` — `build_installer.py` (bundle generator/checker) and `audit_island.py` (opt-in `FBSSceneSettings` layout diagnostics)
+
+After editing files under `src/`, regenerate and verify `install.sh`:
+
+```bash
+python3 scripts/build_installer.py
+python3 scripts/build_installer.py --check
 ```
 
 ## Remove
@@ -69,7 +86,7 @@ The primary background and its detached circle publish their geometry through th
 
 During absorption, the filtered circle and its matching native background layers stop painting before they protrude into the main contour. The original detached background takes over when the circle separates. On the tested Mac with music in the right-hand slot, the sampled frames showed no outline protrusion or flicker when opening and closing either activity. The expanded panel also displayed a test track with a title and no artist below the physical notch.
 
-Expanded activity scenes move their content below the notch through the top margin, keep a 360-point floor for standard panels on the tested Mac, and retain the provider's ability to request more width. The compact timer panel places its original controls beside the countdown and measured about 314 × 104 points on the same Mac. Hosted system banners such as the volume and brightness HUD keep the width they request themselves (309 points for volume). The expanded music panel uses Apple’s original artwork, text, waveform, timeline, and controls. As on iPhone, the artwork shares the timeline's leading edge and the waveform its trailing edge; the panel is sized so the artwork sits in the left wing with a 12-point clearance from the camera housing, and the title/artist metadata and waveform are centered vertically on the artwork below the cutout. The outgoing panel retains this layout when its native mode changes to compact during dismissal. The native compact island allocates a trailing music slot when music is the sole activity. With two activities, the second activity occupies its own slot.
+Expanded activity scenes (`elementView`) preserve side-wing clearance around the physical notch (`notchWidth + 164` floor — 384 points on a 220-point notch — with at least a 504-point maximum ceiling) while keeping Apple's wing-based `BaselineRow` / obstruction geometry intact; detached secondary minimal islands (`noObstruction`) remain unpatched. ClockAngel's expanded Timer, Alarm, and Stopwatch views resolve `BaselineRow` across `_VariadicView.Tree` wrappers and fall back to the physical notch width before frame-0 obstruction propagation settles. Hosted system banners such as the volume and brightness HUD keep the width they request themselves (309 points for volume). The expanded music panel uses Apple’s original artwork, text, waveform, timeline, and controls. As on iPhone, the artwork shares the timeline's leading edge and the waveform its trailing edge; the panel is sized so the artwork sits in the left wing with a 12-point clearance from the camera housing, and the title/artist metadata and waveform are centered vertically on the artwork below the cutout. The outgoing panel retains this layout when its native mode changes to compact during dismissal. The native compact island allocates a trailing music slot when music is the sole activity. With two activities, the second activity occupies its own slot.
 
 The scene-layout accessors (margins, minimum size, obstruction) only appear on `FBSSceneSettings` once FrontBoardServices registers their settings extensions, which Apple does lazily for the first expanded or hosted scene. The patch registers the known extensions itself and re-verifies its hooks after every extension registration, so a late first expansion still receives the notch layout instead of the native pill width.
 
