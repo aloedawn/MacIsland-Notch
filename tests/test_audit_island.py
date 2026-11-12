@@ -61,12 +61,45 @@ class AuditIslandTests(unittest.TestCase):
         self.assertEqual(analyzed_ok["minUsableWing"], 57.0)
         self.assertEqual(analyzed_ok["flags"], ["OK"])
 
-        # ClockAngel B안 wing width: 494pt -> (494 - 222)/2 - 12 - 12 = 112pt (>= 52pt)
+        # ClockAngel B안 wing width: 522pt -> (522 - 222)/2 - 12 - 12 = 126pt (>= 52pt)
         clock_b = json.loads(json.dumps(healthy))
-        clock_b["viewport"]["w"] = 494.0
+        clock_b["viewport"]["w"] = 522.0
         analyzed_clock = audit_island.analyze_scene_record(clock_b)
-        self.assertEqual(analyzed_clock["viewportUsableWing"], 112.0)
+        self.assertEqual(analyzed_clock["viewportUsableWing"], 126.0)
         self.assertEqual(analyzed_clock["flags"], ["OK"])
+
+        # General Live Activity (WidgetRenderer_Activities): unpatched 374pt @ 0.80 around 277.5pt
+        # leaves only ((374 - 277.5)/2 - 20) * 0.80 = 22.6pt -> ACTIVITY_METRICS_STARVED;
+        # rewritten 470pt @ 1.0 around 222pt gives (470 - 222)/2 - 20 = 104pt -> OK.
+        la_starved = json.loads(json.dumps(healthy))
+        la_starved["client"] = "com.apple.chrono.WidgetRenderer-Activities"
+        la_starved["patched"]["activityMetrics"] = {
+            "applied": False,
+            "obstructionSize": {"w": 277.5, "h": 50.0},
+            "expandedMinWidth": 374.0,
+            "expandedMaxWidth": 374.0,
+            "expandedScale": 0.8,
+            "expandedCornerRadius": 32.0,
+        }
+        analyzed_la_starved = audit_island.analyze_scene_record(la_starved)
+        self.assertEqual(analyzed_la_starved["activityUsableWing"], 22.6)
+        self.assertIn("ACTIVITY_METRICS_STARVED", analyzed_la_starved["flags"])
+
+        la_fixed = json.loads(json.dumps(healthy))
+        la_fixed["client"] = "com.apple.chrono.WidgetRenderer-Activities"
+        la_fixed["viewport"]["w"] = 470.0
+        la_fixed["patched"]["min"]["w"] = 470.0
+        la_fixed["patched"]["activityMetrics"] = {
+            "applied": True,
+            "obstructionSize": {"w": 222.0, "h": 40.0},
+            "expandedMinWidth": 470.0,
+            "expandedMaxWidth": 470.0,
+            "expandedScale": 1.0,
+            "expandedCornerRadius": 25.6,
+        }
+        analyzed_la_fixed = audit_island.analyze_scene_record(la_fixed)
+        self.assertEqual(analyzed_la_fixed["activityUsableWing"], 104.0)
+        self.assertEqual(analyzed_la_fixed["flags"], ["OK"])
 
     def test_analyze_scene_record_flags_detached_minimal_and_compact_jitter(self):
         detached_minimal = {

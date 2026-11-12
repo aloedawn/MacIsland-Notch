@@ -73,6 +73,37 @@ bool mi_is_optional_some(const void *enum_addr, const void *wrapped_metadata) {
     return get_tag(enum_addr, 1, wrapped_metadata) == 0;
 }
 
+#ifdef MACISLAND_TESTING
+extern const void *swift_getTypeByMangledNameInContext2(
+    const char *typeNameStart, size_t typeNameLength,
+    const void *context, const void *const *genericArgs);
+
+const void *mi_get_type_by_mangled_name(const char *start, size_t len) {
+    if (!start || len == 0) return NULL;
+    return swift_getTypeByMangledNameInContext2(start, len, NULL, NULL);
+}
+
+void mi_store_optional_tag(void *enum_addr, unsigned which_case, const void *wrapped_metadata) {
+    if (!enum_addr || !wrapped_metadata) return;
+    const void *const *slot = ((const void *const *)wrapped_metadata) - 1;
+    const void *vwt = *slot;
+#if __has_feature(ptrauth_calls)
+    vwt = ptrauth_auth_data(
+        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
+    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
+    // Swift SpecialPointerAuthDiscriminators::StoreEnumTagSinglePayload = 0xa0d1.
+    void (*store_tag)(void *, unsigned, unsigned, const void *) = ptrauth_auth_and_resign(
+        (void *)*fn_slot, ptrauth_key_asia, ptrauth_blend_discriminator(fn_slot, 0xa0d1),
+        ptrauth_key_function_pointer, 0);
+#else
+    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
+    void (*store_tag)(void *, unsigned, unsigned, const void *) =
+        (void (*)(void *, unsigned, unsigned, const void *))*fn_slot;
+#endif
+    store_tag(enum_addr, which_case, 1, wrapped_metadata);
+}
+#endif
+
 extern void mi_surface_body(void);
 extern void mi_clock_body_1(void);
 extern void mi_clock_body_2(void);

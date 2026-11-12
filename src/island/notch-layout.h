@@ -17,6 +17,9 @@ static const CGFloat MacIslandNotchFlare = 6;
 static const CGFloat MacIslandShortContentClearance = 14;
 // Keep room for native controls even before the Clock UI provider is patched.
 static const CGFloat MacIslandShortPanelClearance = 6;
+// MenuBarAgent's CenterHUD clamps expanded hosted/element containers to 408pt
+// (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden.
+#define MacIslandHostedMaxContentWidthKey @"HostedSceneMetricsMaximumContentWidth"
 
 static inline BOOL MacIslandScreenNotchCutout(NSScreen *screen, NSRect *cutoutOut) {
     if (!screen) return NO;
@@ -31,6 +34,24 @@ static inline BOOL MacIslandScreenNotchCutout(NSScreen *screen, NSRect *cutoutOu
 
 static inline BOOL MacIslandScreenHasNotch(NSScreen *screen) {
     return MacIslandScreenNotchCutout(screen, NULL);
+}
+
+static inline CGFloat MacIslandCenteredDisplayWidth(NSScreen *screen, NSRect cutout) {
+    if (!screen) return 0;
+    CGFloat center = NSMidX(cutout);
+    CGFloat span = 2 * MIN(center - NSMinX(screen.frame), NSMaxX(screen.frame) - center);
+    return span > 0 ? span : 0;
+}
+
+static inline CGFloat MacIslandExpandedMaxWidth(CGFloat notchWidth, CGFloat centeredDisplayWidth) {
+    if (notchWidth <= 0 || centeredDisplayWidth <= 0) return 0;
+    return MIN(MAX(notchWidth + 320.0, 408.0), centeredDisplayWidth);
+}
+
+static inline CGFloat MacIslandScreenExpandedMaxWidth(NSScreen *screen) {
+    NSRect cutout = NSZeroRect;
+    if (!MacIslandScreenNotchCutout(screen, &cutout)) return 0;
+    return MacIslandExpandedMaxWidth(cutout.size.width, MacIslandCenteredDisplayWidth(screen, cutout));
 }
 
 static inline CGFloat MacIslandShortViewportInset(CGFloat cutoutHeight) {

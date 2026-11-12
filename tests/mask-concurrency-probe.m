@@ -53,10 +53,18 @@ int main(void) {
 
         CGColorRef black = CGColorCreateGenericRGB(0, 0, 0, 1);
 
+        [NSApplication sharedApplication];
+        NSWindow *hostWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1800, 1169)
+                                                           styleMask:NSWindowStyleMaskBorderless
+                                                             backing:NSBackingStoreBuffered
+                                                               defer:NO];
+        hostWindow.contentView.wantsLayer = YES;
+
         MBGated_TestLayer *root = [MBGated_TestLayer layer];
         root.bounds = CGRectMake(0, 0, 1800, 1169);
         root.anchorPoint = CGPointZero;
         root.position = CGPointZero;
+        hostWindow.contentView.layer = root;
         MacIslandSetSceneEdgeCompensationForTesting(root, 0.25);
 
         MBGated_TestLayer *scene = [MBGated_TestLayer layer];

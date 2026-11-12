@@ -21,7 +21,7 @@ AUDIT_LOG_NAME = "scene-audit.jsonl"
 # Wing clearance from camera housing edge used when evaluating B안 usable wing width.
 DEFAULT_NOTCH_CLEARANCE = 12.0
 # Minimum single-wing content capacity in Expanded B안 (standard 52pt artwork/icon;
-# wider dual-button providers such as ClockAngel negotiate their own 494pt width).
+# wider dual-button providers such as ClockAngel negotiate their own 522pt width).
 TARGET_EXPANDED_WING_CONTENT = 52.0
 
 STOCK_TARGETS: tuple[dict[str, str], ...] = (
@@ -312,6 +312,17 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
     if min_w is not None and obs_w is not None and min_w >= obs_w:
         min_usable_wing = round((min_w - obs_w) / 2.0 - max(lead, trail) - DEFAULT_NOTCH_CLEARANCE, 2)
 
+    p_act = patched.get("activityMetrics")
+    activity_usable_wing: float | None = None
+    if isinstance(p_act, dict):
+        act_max_w = _as_float(p_act.get("expandedMaxWidth"))
+        act_scale = _as_float(p_act.get("expandedScale")) or 1.0
+        act_obs = p_act.get("obstructionSize") or {}
+        act_obs_w = _as_float(act_obs.get("w"))
+        if act_max_w is not None and act_obs_w is not None and act_max_w >= act_obs_w:
+            # Jindo SystemAperture expanded layout applies 20pt horizontal edgeInsets in unscaled space.
+            activity_usable_wing = round(((act_max_w - act_obs_w) / 2.0 - 20.0) * act_scale, 2)
+
     flags: list[str] = []
     family = record.get("family")
     mode = record.get("layoutMode")
@@ -323,6 +334,15 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
         flags.append("DROPPED_BELOW_NOTCH")
     if intersects and extends_below and short_h == 0 and notch_h is not None and top < notch_h:
         flags.append("TOP_MARGIN_COLLISION")
+    if (
+        family == "elementView"
+        and role == "expanded_platter"
+        and (mode == "expanded" or extends_below)
+        and short_h == 0
+        and activity_usable_wing is not None
+        and activity_usable_wing < TARGET_EXPANDED_WING_CONTENT
+    ):
+        flags.append("ACTIVITY_METRICS_STARVED")
     if (
         family == "elementView"
         and role == "expanded_platter"
@@ -356,12 +376,15 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
         "nativeMin": native.get("min"),
         "nativeMax": native.get("max"),
         "nativeMargins": native.get("margins"),
+        "nativeActivityMetrics": native.get("activityMetrics"),
         "patchedMin": p_min,
         "patchedMax": p_max,
         "patchedMargins": p_margins,
+        "patchedActivityMetrics": p_act,
         "shortHeight": short_h,
         "minUsableWing": min_usable_wing,
         "viewportUsableWing": usable_wing,
+        "activityUsableWing": activity_usable_wing,
         "flags": flags,
     }
 

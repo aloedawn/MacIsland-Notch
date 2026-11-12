@@ -283,10 +283,55 @@ static CGFloat nativeSceneEdgeCompensation(CALayer *layer) {
     }
     return 0;
 }
+static id nativeModifierObject(id object, NSString *name);
+static BOOL nativeModifierEnabled(id modifier);
+
+// Core Animation releases its transaction lock as soon as CALayer.sublayers /
+// filters / presentationModifiers returns its internal array wrapper, so an
+// unlocked [layer.sublayers copy] on the background DisplayLink thread can race
+// with main-thread addSublayer:/removeFromSuperlayer inside __NSArrayI_new.
+// Snapshot under +[CATransaction lock] (recursive on main, never nested inside
+// maskStateLock).
+static NSArray<CALayer *> *copyLayerSublayers(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray<CALayer *> *snapshot = [layer.sublayers copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static BOOL layerHasSublayers(CALayer *layer) {
+    if (!layer) return NO;
+    [CATransaction lock];
+    BOOL has = layer.sublayers.count != 0;
+    [CATransaction unlock];
+    return has;
+}
+static NSArray *copyLayerFilters(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray *snapshot = [layer.filters copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static NSArray *copyLayerModifiers(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray *snapshot = [nativeModifierObject(layer, @"presentationModifiers") copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static NSArray<NSString *> *copyLayerAnimationKeys(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray<NSString *> *snapshot = [layer.animationKeys copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+
 static BOOL hasMergeFilters(CALayer *layer) {
     if (!layer) return NO;
     BOOL blur = NO, threshold = NO;
-    NSArray *filters = [layer.filters copy];
+    NSArray *filters = copyLayerFilters(layer);
     for (id filter in filters) {
         id type = nativeModifierObject(filter, @"type");
         blur |= [type isEqual:@"gaussianBlur"];
@@ -311,7 +356,7 @@ static id activeMergeBlur(CALayer *group) {
     if (!group) return nil;
     id blur = nil;
     BOOL threshold = NO;
-    NSArray *filters = [group.filters copy];
+    NSArray *filters = copyLayerFilters(group);
     for (id filter in filters) {
         if (!nativeModifierEnabled(filter)) continue;
         id type = nativeModifierObject(filter, @"type");
@@ -332,7 +377,7 @@ static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize
     CGPoint position = layer.position;
     CGPoint anchor = layer.anchorPoint;
     CATransform3D transform = layer.transform;
-    NSArray *modifiers = [nativeModifierObject(layer, @"presentationModifiers") copy];
+    NSArray *modifiers = copyLayerModifiers(layer);
     for (id modifier in modifiers) {
         if (!nativeModifierEnabled(modifier)) continue;
         NSString *key = nativeModifierObject(modifier, @"keyPath");
@@ -404,13 +449,13 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
     if (!scene) return @[leaf];
     CGRect circle = presentationLayerFrameInAncestor(leaf, scene);
     CALayer *match = nil;
-    NSArray<CALayer *> *sceneBranches = [scene.sublayers copy];
+    NSArray<CALayer *> *sceneBranches = copyLayerSublayers(scene);
     for (CALayer *branch in sceneBranches) {
         if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = [branch.sublayers copy];
+        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
         for (CALayer *candidate in candidates) {
             if (![candidate.name hasPrefix:@"SimpleViewDisplayItem-"] ||
-                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || candidate.sublayers.count)
+                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || layerHasSublayers(candidate))
                 continue;
             CGRect rect = presentationLayerFrameInAncestor(candidate, scene);
             if (!sameCircleFrame(circle, rect)) continue;
@@ -427,12 +472,12 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
     NSMutableArray<CALayer *> *paints = [NSMutableArray arrayWithArray:@[leaf, match]];
     for (CALayer *branch in sceneBranches) {
         if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = [branch.sublayers copy];
+        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
         for (CALayer *candidate in candidates) {
-            if (candidate.contents || candidate.sublayers.count) continue;
+            if (candidate.contents || layerHasSublayers(candidate)) continue;
             CGRect expected = fallback;
             if ([candidate.name hasPrefix:@"BackdropViewDisplayItem-"]) {
-                NSArray *filters = [candidate.filters copy];
+                NSArray *filters = copyLayerFilters(candidate);
                 NSArray *types = [filters valueForKey:@"type"];
                 if (types.count) {
                     if (types.count != 2 || ![types containsObject:@"colorMatrix"] ||
@@ -450,9 +495,9 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
 }
 
 static void clearSecondaryMergeInputs(CALayer *unionLayer) {
-    NSArray<CALayer *> *branches = [unionLayer.sublayers copy];
+    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
     for (CALayer *branch in branches) {
-        NSArray<CALayer *> *children = [branch.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(branch);
         if (children.count != 1) continue;
         MacIslandNativeMaskObserver *secondary = modelMaskObserver(children.firstObject);
         if (observerDesiredObservedUnion(secondary))
@@ -464,15 +509,15 @@ static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRe
     CALayer *unionLayer = input.source.superlayer;
     if (!unionLayer) return;
     id blur = activeMergeBlur(unionLayer);
-    NSArray<CALayer *> *branches = [unionLayer.sublayers copy];
+    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
     for (CALayer *branch in branches) {
         if (branch == input.source || branch.contents ||
             (branch.backgroundColor && CGColorGetAlpha(branch.backgroundColor) > 0))
             continue;
-        NSArray<CALayer *> *children = [branch.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(branch);
         if (children.count != 1) continue;
         CALayer *leaf = children.firstObject;
-        if (!isSecondaryMergeInput(leaf) || leaf.contents || leaf.sublayers.count) continue;
+        if (!isSecondaryMergeInput(leaf) || leaf.contents || layerHasSublayers(leaf)) continue;
         MacIslandNativeMaskObserver *secondaryObserver = modelMaskObserver(leaf);
         CGRect circle = presentationLayerFrameInAncestor(leaf, unionLayer);
         BOOL trailing = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody);
@@ -504,7 +549,7 @@ static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRe
 }
 
 static void notifyUnionPrimaryObserver(CALayer *secondary) {
-    NSArray<CALayer *> *siblings = [secondary.superlayer.superlayer.sublayers copy];
+    NSArray<CALayer *> *siblings = copyLayerSublayers(secondary.superlayer.superlayer);
     for (CALayer *sibling in siblings) {
         if (!isNativeUnionFill(sibling)) continue;
         MacIslandNativeMaskObserver *primary = modelMaskObserver(sibling);
@@ -539,7 +584,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
         CAShapeLayer *prevMask = [previous shapeMask];
         if (heldMaterial && heldMaterial.superlayer == scene &&
             prevMask && heldMaterial.mask == prevMask && !heldMaterial.hidden &&
-            heldMaterial.opacity >= 1 && !heldMaterial.contents && !heldMaterial.sublayers.count &&
+            heldMaterial.opacity >= 1 && !heldMaterial.contents && !layerHasSublayers(heldMaterial) &&
             isOpaqueBlack(heldMaterial.backgroundColor)) {
             return YES;
         }
@@ -548,7 +593,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
     MacIslandNativeMaskObserver *selected = nil;
     if (scene && unionLayer) {
         CGRect body = [unionLayer convertRect:nativeBodyFrame(input) toLayer:scene];
-        NSArray<CALayer *> *sublayers = [scene.sublayers copy];
+        NSArray<CALayer *> *sublayers = copyLayerSublayers(scene);
         for (CALayer *layer in sublayers) {
             if (layer.superlayer != scene || !isOpaqueBlack(layer.backgroundColor)) continue;
             id association = objc_getAssociatedObject(layer, &maskObserverKey);
@@ -565,7 +610,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
             os_unfair_lock_lock(&maskStateLock);
             peer->_mergeInput = input;
             os_unfair_lock_unlock(&maskStateLock);
-            if (layer.opacity >= 1 && !layer.contents && !layer.sublayers.count &&
+            if (layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
                 (!layer.hidden || (blur && !source.hidden && source.opacity >= 1 &&
                                     !unionLayer.hidden && unionLayer.opacity >= 1))) {
                 selected = peer;
@@ -901,7 +946,7 @@ static void observeNativeAnimations(CALayer *layer) {
             BOOL newlyApplied = !self.applied;
             self.applied = YES;
             if (newlyApplied) {
-                NSArray<NSString *> *animKeys = [source.animationKeys copy];
+                NSArray<NSString *> *animKeys = copyLayerAnimationKeys(source);
                 for (NSString *key in animKeys) {
                     CAAnimation *animation = [source animationForKey:key];
                     CAAnimation *adjusted = animationWithoutPillCorners(animation);
@@ -1374,7 +1419,7 @@ static void modifierListChanged(CALayer *layer) {
     if (observer.applied) [observer refreshMask];
     else if (observer) synchronizeNativeMaskGeometry(observer);
     else if (hasMergeFilters(layer.superlayer)) {
-        NSArray<CALayer *> *children = [layer.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(layer);
         for (CALayer *child in children) {
             MacIslandNativeMaskObserver *childObserver = modelMaskObserver(child);
             if (childObserver) synchronizeNativeMaskGeometry(childObserver);
@@ -1429,7 +1474,7 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         BOOL applied = observer.applied;
         BOOL secondary = !applied && source && isSecondaryMergeInput(source);
         BOOL member = applied || secondary;
-        NSArray *modifiers = (member && source) ? [nativeModifierObject(source, @"presentationModifiers") copy] : nil;
+        NSArray *modifiers = (member && source) ? copyLayerModifiers(source) : nil;
 
         os_unfair_lock_lock(&maskStateLock);
         NSArray *currentBindings = observer->_modifierBindings;
@@ -1465,7 +1510,7 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
             if (group && ![groups containsObject:group]) [groups addObject:group];
         }
         if (secondary) {
-            NSArray *parentModifiers = [nativeModifierObject(source.superlayer, @"presentationModifiers") copy];
+            NSArray *parentModifiers = copyLayerModifiers(source.superlayer);
             for (id modifier in parentModifiers) {
                 id group = nativeModifierObject(modifier, @"group");
                 if (group && ![groups containsObject:group]) [groups addObject:group];
@@ -1616,7 +1661,7 @@ static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
                 CALayer *group = inputSource ? inputSource.superlayer : nil;
                 CAShapeLayer *peerMask = [peer shapeMask];
                 if (isContourPeer && input.applied && peer.applied && group &&
-                    !layer.hidden && layer.opacity >= 1 && !layer.contents && layer.sublayers.count == 0 &&
+                    !layer.hidden && layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
                     isOpaqueBlack(layer.backgroundColor) && peerMask && layer.mask == peerMask &&
                     layer.superlayer == group.superlayer) {
                     id blur = activeMergeBlur(group);
@@ -1725,7 +1770,7 @@ static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
 static void refreshNativeBackgroundCoverage(CALayer *layer) {
     id observer = objc_getAssociatedObject(layer, &maskObserverKey);
     if ([observer isKindOfClass:MacIslandNativeMaskObserver.class]) [observer refresh];
-    NSArray<CALayer *> *children = [layer.sublayers copy];
+    NSArray<CALayer *> *children = copyLayerSublayers(layer);
     for (CALayer *child in children) refreshNativeBackgroundCoverage(child);
 }
 

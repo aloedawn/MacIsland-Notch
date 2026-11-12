@@ -1093,6 +1093,9 @@ static const CGFloat MacIslandNotchFlare = 6;
 static const CGFloat MacIslandShortContentClearance = 14;
 // Keep room for native controls even before the Clock UI provider is patched.
 static const CGFloat MacIslandShortPanelClearance = 6;
+// MenuBarAgent's CenterHUD clamps expanded hosted/element containers to 408pt
+// (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden.
+#define MacIslandHostedMaxContentWidthKey @"HostedSceneMetricsMaximumContentWidth"
 
 static inline BOOL MacIslandScreenNotchCutout(NSScreen *screen, NSRect *cutoutOut) {
     if (!screen) return NO;
@@ -1107,6 +1110,24 @@ static inline BOOL MacIslandScreenNotchCutout(NSScreen *screen, NSRect *cutoutOu
 
 static inline BOOL MacIslandScreenHasNotch(NSScreen *screen) {
     return MacIslandScreenNotchCutout(screen, NULL);
+}
+
+static inline CGFloat MacIslandCenteredDisplayWidth(NSScreen *screen, NSRect cutout) {
+    if (!screen) return 0;
+    CGFloat center = NSMidX(cutout);
+    CGFloat span = 2 * MIN(center - NSMinX(screen.frame), NSMaxX(screen.frame) - center);
+    return span > 0 ? span : 0;
+}
+
+static inline CGFloat MacIslandExpandedMaxWidth(CGFloat notchWidth, CGFloat centeredDisplayWidth) {
+    if (notchWidth <= 0 || centeredDisplayWidth <= 0) return 0;
+    return MIN(MAX(notchWidth + 320.0, 408.0), centeredDisplayWidth);
+}
+
+static inline CGFloat MacIslandScreenExpandedMaxWidth(NSScreen *screen) {
+    NSRect cutout = NSZeroRect;
+    if (!MacIslandScreenNotchCutout(screen, &cutout)) return 0;
+    return MacIslandExpandedMaxWidth(cutout.size.width, MacIslandCenteredDisplayWidth(screen, cutout));
 }
 
 static inline CGFloat MacIslandShortViewportInset(CGFloat cutoutHeight) {
@@ -1510,6 +1531,7 @@ MACISLAND_SHORT_HOST_M
 
   cat > "$SCRATCH/safearea.m" <<'MACISLAND_SAFEAREA_M'
 #import <AppKit/AppKit.h>
+#import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "notch-layout.h"
@@ -1528,8 +1550,70 @@ static void (*originalObstruction[2])(id, SEL, id);
 static void (*originalSpace[2])(id, SEL, id);
 static void (*originalCorners[2])(id, SEL, id);
 static void (*originalLocation[2])(id, SEL, id);
+static void (*originalActivityMetricsData)(id, SEL, id);
+static void (*originalActivityMetricsRequest)(id, SEL, id);
 static void (*originalFrame)(id, SEL, CGRect);
 static void (*originalDisplayConfiguration)(id, SEL, id);
+
+typedef struct {
+    BOOL present;
+    BOOL patched;
+    CGSize nativeObstruction;
+    CGFloat nativeExpandedMinW;
+    CGFloat nativeExpandedMaxW;
+    CGFloat nativeExpandedScale;
+    CGFloat nativeExpandedCornerRadius;
+    CGSize patchedObstruction;
+    CGFloat patchedExpandedMinW;
+    CGFloat patchedExpandedMaxW;
+    CGFloat patchedExpandedMinH;
+    CGFloat patchedExpandedMaxH;
+    CGFloat patchedExpandedScale;
+    CGFloat patchedExpandedCornerRadius;
+} MacIslandActivityMetricsSummary;
+
+@protocol MacIslandSizeDimensionRequest <NSObject, NSCopying>
+- (instancetype)initWithMinimum:(double)minimum maximum:(double)maximum type:(NSInteger)type;
+- (double)minimum;
+- (double)maximum;
+- (NSInteger)type;
+@end
+
+@protocol MacIslandActivityEdgeInsets <NSObject, NSCopying>
+- (double)leading;
+- (double)trailing;
+- (void)setLeading:(double)value;
+- (void)setTrailing:(double)value;
+@end
+
+@protocol MacIslandActivityItemMetricsRequest <NSObject, NSCopying>
+- (id<MacIslandSizeDimensionRequest>)widthRequest;
+- (void)setWidthRequest:(id<MacIslandSizeDimensionRequest>)value;
+- (id<MacIslandSizeDimensionRequest>)heightRequest;
+- (void)setHeightRequest:(id<MacIslandSizeDimensionRequest>)value;
+- (id<MacIslandActivityEdgeInsets>)edgeInsets;
+- (void)setEdgeInsets:(id<MacIslandActivityEdgeInsets>)value;
+- (double)cornerRadius;
+- (void)setCornerRadius:(double)value;
+- (double)scaleFactor;
+- (void)setScaleFactor:(double)value;
+@end
+
+@protocol MacIslandSystemApertureMetricsRequest <NSObject, NSCopying>
+- (CGSize)obstructionSize;
+- (void)setObstructionSize:(CGSize)value;
+- (double)obstructionTopMargin;
+- (void)setObstructionTopMargin:(double)value;
+- (id<MacIslandActivityItemMetricsRequest>)expandedMetricsRequest;
+- (void)setExpandedMetricsRequest:(id<MacIslandActivityItemMetricsRequest>)value;
+@end
+
+@protocol MacIslandActivityMetricsRequest <NSObject, NSCopying>
+- (id<MacIslandSystemApertureMetricsRequest>)systemApertureMetrics;
+- (void)setSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
+- (id<MacIslandSystemApertureMetricsRequest>)limitedWidthSystemApertureMetrics;
+- (void)setLimitedWidthSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
+@end
 
 @interface MacIslandNativeLayout : NSObject
 @property(nonatomic, strong) NSData *margins;
@@ -1555,6 +1639,15 @@ static void (*originalDisplayConfiguration)(id, SEL, id);
 @property(nonatomic, strong) NSArray<MacIslandNativeLayout *> *layouts;
 @property(nonatomic, strong) NSArray<MacIslandNativeObstruction *> *obstructions;
 @property(nonatomic, strong) NSMutableArray<NSString *> *auditSignatures;
+@property(nonatomic, strong) NSData *nativeActivityMetricsData;
+@property(nonatomic, strong) NSData *cachedActivityMetricsSource;
+@property(nonatomic, strong) NSData *cachedPatchedActivityMetricsData;
+@property(nonatomic) NSRect cachedActivityMetricsCutout;
+@property(nonatomic) CGFloat cachedActivityMetricsDisplayWidth;
+@property(nonatomic) MacIslandActivityMetricsSummary cachedActivitySummary;
+@property(nonatomic) BOOL activityMetricsDataApplied;
+@property(nonatomic, strong) id nativeActivityMetricsRequest;
+@property(nonatomic) BOOL activityMetricsRequestApplied;
 @property(nonatomic) CGRect frame;
 @property(nonatomic) BOOL updating;
 @end
@@ -1698,6 +1791,14 @@ static MacIslandSceneInsets *sceneState(id settings) {
             native.space = isSizeValue(space) ? space : nil;
             native.nativeCorners = nativePayload(rawCorners);
         }
+        id rawMetricsData = rawObjectSetting(settings, @"metrics");
+        state.activityMetricsDataApplied = isPatchedPayload(rawMetricsData);
+        id metricsData = nativePayload(rawMetricsData);
+        state.nativeActivityMetricsData = [metricsData isKindOfClass:NSData.class] ? metricsData : nil;
+
+        id rawMetricsReq = rawObjectSetting(settings, @"metricsRequest");
+        state.activityMetricsRequestApplied = isPatchedPayload(rawMetricsReq);
+        state.nativeActivityMetricsRequest = nativePayload(rawMetricsReq);
         state.frame = existingFrame(settings);
     }
     return state;
@@ -1710,6 +1811,8 @@ static BOOL settingsHaveTrackedValues(id settings) {
             rawObjectSetting(settings, obstructionSetting(family, @"CornerRadii")))
             return YES;
     }
+    if (rawObjectSetting(settings, @"metrics") || rawObjectSetting(settings, @"metricsRequest"))
+        return YES;
     return NO;
 }
 
@@ -1774,8 +1877,7 @@ static MacIslandNotchAvoidance notchAvoidance(NSRect obstruction, NSSize viewpor
         policy.physical = YES;
         policy.notchWidth = width;
         policy.notchHeight = height;
-        CGFloat center = NSMidX(cutout);
-        policy.centeredDisplayWidth = 2 * MIN(center - NSMinX(screen.frame), NSMaxX(screen.frame) - center);
+        policy.centeredDisplayWidth = MacIslandCenteredDisplayWidth(screen, cutout);
         NSRect physical = NSInsetRect(obstruction, (obstruction.size.width - width) / 2,
                                                   (obstruction.size.height - height) / 2);
         NSRect area = NSMakeRect(0, 0, viewport.width, viewport.height);
@@ -1812,6 +1914,371 @@ static NSData *safeMargins(NSData *native, NSDictionary *decoded, MacIslandNotch
     NSData *data = raw ? [NSData dataWithData:raw] : nil;
     return layoutPayload(data ?: native, native);
 }
+typedef struct {
+    uint64_t w0;
+    uint64_t w1;
+} MacIslandSwiftData;
+
+typedef struct {
+    void *metadata;
+    uint64_t state;
+} MacIslandSwiftMetadataResponse;
+
+typedef __attribute__((swiftcall)) MacIslandSwiftMetadataResponse (*MacIslandTypeMetadataAccessorFn)(uint64_t request);
+typedef __attribute__((swiftcall)) MacIslandSwiftData (*MacIslandReplicatorEncodeFn)(
+    void *object,
+    __attribute__((swift_context)) void *coderMetadata,
+    __attribute__((swift_error_result)) void **errorOut
+);
+typedef __attribute__((swiftcall)) void *(*MacIslandReplicatorDecodeFn)(
+    void *targetMetadata,
+    uint64_t dataW0,
+    uint64_t dataW1,
+    void *genericMetadata,
+    __attribute__((swift_context)) void *coderMetadata,
+    __attribute__((swift_error_result)) void **errorOut
+);
+typedef __attribute__((swiftcall)) void *(*MacIslandDataToNSDataFn)(uint64_t w0, uint64_t w1);
+typedef __attribute__((swiftcall)) MacIslandSwiftData (*MacIslandNSDataToDataFn)(void *nsData);
+typedef void (*MacIslandSwiftArrayDestroyFn)(void *begin, size_t count, const void *typeMetadata);
+typedef void (*MacIslandSwiftErrorReleaseFn)(void *error);
+
+static pthread_mutex_t activityBridgeLock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL activityBridgeReady;
+static void *activityCoderMetadata;
+static void *activityMetricsRequestMetadata;
+static void *foundationDataMetadata;
+static MacIslandReplicatorEncodeFn replicatorEncodeFn;
+static MacIslandReplicatorDecodeFn replicatorDecodeFn;
+static MacIslandDataToNSDataFn foundationDataToNSDataFn;
+static MacIslandNSDataToDataFn nsDataToFoundationDataFn;
+static MacIslandSwiftArrayDestroyFn swiftArrayDestroyFn;
+static MacIslandSwiftErrorReleaseFn swiftErrorReleaseFn;
+
+static BOOL ensureActivityMetricsBridge(void) {
+    pthread_mutex_lock(&activityBridgeLock);
+    if (activityBridgeReady) {
+        pthread_mutex_unlock(&activityBridgeLock);
+        return YES;
+    }
+    if (!NSClassFromString(@"ActivityUIServices.ActivityMetricsRequest")) {
+        pthread_mutex_unlock(&activityBridgeLock);
+        return NO;
+    }
+    const char *repPath = "/System/Library/PrivateFrameworks/ReplicatorServices.framework/ReplicatorServices";
+    void *repHandle = dlopen(repPath, RTLD_LAZY | RTLD_NOLOAD);
+    if (!repHandle) repHandle = dlopen(repPath, RTLD_LAZY);
+    void *swiftCore = dlopen("/usr/lib/swift/libswiftCore.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (!swiftCore) swiftCore = RTLD_DEFAULT;
+    if (repHandle) {
+        MacIslandTypeMetadataAccessorFn coderMetaFn =
+            (MacIslandTypeMetadataAccessorFn)dlsym(repHandle, "$s18ReplicatorServices0A5CoderCMa");
+        MacIslandTypeMetadataAccessorFn reqMetaFn =
+            (MacIslandTypeMetadataAccessorFn)dlsym(RTLD_DEFAULT, "$s18ActivityUIServices0A14MetricsRequestCMa");
+        MacIslandTypeMetadataAccessorFn dataMetaFn =
+            (MacIslandTypeMetadataAccessorFn)dlsym(RTLD_DEFAULT, "$s10Foundation4DataVMa");
+        replicatorEncodeFn = (MacIslandReplicatorEncodeFn)dlsym(
+            repHandle, "$s18ReplicatorServices0A5CoderC20encodeNSSecureCodingy10Foundation4DataVSo0eF0_So8NSObjectpKFZ");
+        replicatorDecodeFn = (MacIslandReplicatorDecodeFn)dlsym(
+            repHandle, "$s18ReplicatorServices0A5CoderC20decodeNSSecureCoding_4fromxxm_10Foundation4DataVtKSo0eF0RzlFZ");
+        foundationDataToNSDataFn = (MacIslandDataToNSDataFn)dlsym(
+            RTLD_DEFAULT, "$s10Foundation4DataV19_bridgeToObjectiveCSo6NSDataCyF");
+        nsDataToFoundationDataFn = (MacIslandNSDataToDataFn)dlsym(
+            RTLD_DEFAULT, "$s10Foundation4DataV36_unconditionallyBridgeFromObjectiveCyACSo6NSDataCSgFZ");
+        swiftArrayDestroyFn = (MacIslandSwiftArrayDestroyFn)dlsym(swiftCore, "swift_arrayDestroy");
+        swiftErrorReleaseFn = (MacIslandSwiftErrorReleaseFn)dlsym(swiftCore, "swift_errorRelease");
+        if (coderMetaFn && reqMetaFn && dataMetaFn && replicatorEncodeFn && replicatorDecodeFn &&
+            foundationDataToNSDataFn && nsDataToFoundationDataFn && swiftArrayDestroyFn && swiftErrorReleaseFn) {
+            activityCoderMetadata = coderMetaFn(0).metadata;
+            activityMetricsRequestMetadata = reqMetaFn(0).metadata;
+            foundationDataMetadata = dataMetaFn(0).metadata;
+            activityBridgeReady = (activityCoderMetadata && activityMetricsRequestMetadata && foundationDataMetadata);
+        }
+    }
+    BOOL ready = activityBridgeReady;
+    pthread_mutex_unlock(&activityBridgeLock);
+    return ready;
+}
+
+static id<MacIslandActivityMetricsRequest> decodeActivityMetricsData(NSData *data) {
+    if (![data isKindOfClass:NSData.class] || data.length == 0 || !ensureActivityMetricsBridge()) return nil;
+    MacIslandSwiftData sdata = nsDataToFoundationDataFn((__bridge void *)data);
+    void *err = NULL;
+    void *raw = replicatorDecodeFn(activityMetricsRequestMetadata, sdata.w0, sdata.w1,
+                                   activityMetricsRequestMetadata, activityCoderMetadata, &err);
+    swiftArrayDestroyFn(&sdata, 1, foundationDataMetadata);
+    if (err) {
+        swiftErrorReleaseFn(err);
+        return nil;
+    }
+    return (__bridge_transfer id<MacIslandActivityMetricsRequest>)raw;
+}
+
+static NSData *encodeActivityMetricsData(id<MacIslandActivityMetricsRequest> request) {
+    if (!request || !ensureActivityMetricsBridge()) return nil;
+    void *err = NULL;
+    MacIslandSwiftData sdata = replicatorEncodeFn((__bridge void *)request, activityCoderMetadata, &err);
+    if (err) {
+        swiftErrorReleaseFn(err);
+        return nil;
+    }
+    NSData *bridged = (__bridge_transfer NSData *)foundationDataToNSDataFn(sdata.w0, sdata.w1);
+    swiftArrayDestroyFn(&sdata, 1, foundationDataMetadata);
+    return bridged ? [NSData dataWithData:bridged] : nil;
+}
+
+static BOOL readSystemApertureSummary(id<MacIslandActivityMetricsRequest> req,
+                                      CGSize *obsOut, CGFloat *minWOut, CGFloat *maxWOut,
+                                      CGFloat *minHOut, CGFloat *maxHOut,
+                                      CGFloat *scaleOut, CGFloat *cornerOut) {
+    if (!req || ![req respondsToSelector:@selector(systemApertureMetrics)]) return NO;
+    id<MacIslandSystemApertureMetricsRequest> sa = [req systemApertureMetrics];
+    if (!sa || ![sa respondsToSelector:@selector(obstructionSize)] ||
+        ![sa respondsToSelector:@selector(expandedMetricsRequest)]) return NO;
+    id<MacIslandActivityItemMetricsRequest> expanded = [sa expandedMetricsRequest];
+    if (!expanded || ![expanded respondsToSelector:@selector(widthRequest)] ||
+        ![expanded respondsToSelector:@selector(heightRequest)] ||
+        ![expanded respondsToSelector:@selector(scaleFactor)] ||
+        ![expanded respondsToSelector:@selector(cornerRadius)]) return NO;
+    id<MacIslandSizeDimensionRequest> w = [expanded widthRequest];
+    id<MacIslandSizeDimensionRequest> h = [expanded heightRequest];
+    if (!w || !h) return NO;
+    if (obsOut) *obsOut = [sa obstructionSize];
+    if (minWOut) *minWOut = [w minimum];
+    if (maxWOut) *maxWOut = [w maximum];
+    if (minHOut) *minHOut = [h minimum];
+    if (maxHOut) *maxHOut = [h maximum];
+    if (scaleOut) *scaleOut = [expanded scaleFactor];
+    if (cornerOut) *cornerOut = [expanded cornerRadius];
+    return YES;
+}
+
+static id<MacIslandSystemApertureMetricsRequest> patchedSystemApertureMetrics(
+    id<MacIslandSystemApertureMetricsRequest> sa,
+    CGSize notchObstruction,
+    CGFloat centeredDisplayWidth) {
+    if (!sa ||
+        ![sa respondsToSelector:@selector(obstructionSize)] ||
+        ![sa respondsToSelector:@selector(obstructionTopMargin)] ||
+        ![sa respondsToSelector:@selector(expandedMetricsRequest)] ||
+        ![sa respondsToSelector:@selector(copyWithZone:)]) {
+        return sa;
+    }
+    CGSize oldObs = [sa obstructionSize];
+    id<MacIslandActivityItemMetricsRequest> expanded = [sa expandedMetricsRequest];
+    if (!expanded || !(oldObs.width > 0.0) || !(oldObs.height > 0.0)) return sa;
+    if (![expanded respondsToSelector:@selector(widthRequest)] ||
+        ![expanded respondsToSelector:@selector(heightRequest)] ||
+        ![expanded respondsToSelector:@selector(scaleFactor)] ||
+        ![expanded respondsToSelector:@selector(cornerRadius)] ||
+        ![expanded respondsToSelector:@selector(copyWithZone:)]) {
+        return sa;
+    }
+    id<MacIslandSizeDimensionRequest> oldW = [expanded widthRequest];
+    id<MacIslandSizeDimensionRequest> oldH = [expanded heightRequest];
+    Class sizeDimCls = NSClassFromString(@"ActivityUIServices.SizeDimensionRequest");
+    if (!oldW || !oldH || !sizeDimCls ||
+        ![sizeDimCls instancesRespondToSelector:@selector(initWithMinimum:maximum:type:)]) {
+        return sa;
+    }
+    double oldScale = [expanded scaleFactor];
+    if (!(oldScale > 0.0) || !isfinite(oldScale)) oldScale = 1.0;
+    double unscale = (oldScale < 1.0) ? oldScale : 1.0;
+
+    // Preserve native iPhone Pro System Aperture wing capacity (374 - 126 = 248pt total
+    // wing span -> 124pt per side around canonical notch obstruction, 104pt usable inside
+    // Jindo's 20pt horizontal edge insets) at crisp 1.0x Retina scale.
+    double effectiveOldMaxW = [oldW maximum] * unscale;
+    double targetWidth = MIN(MAX(notchObstruction.width + 248.0, effectiveOldMaxW), centeredDisplayWidth);
+    NSInteger widthType = [oldW type];
+    double newMinW = (widthType == 0) ? MIN([oldW minimum] * unscale, targetWidth) : targetWidth;
+    id<MacIslandSizeDimensionRequest> newW =
+        [(id<MacIslandSizeDimensionRequest>)[sizeDimCls alloc] initWithMinimum:newMinW
+                                                                       maximum:targetWidth
+                                                                          type:widthType];
+
+    double rawOldMinH = [oldH minimum];
+    NSInteger heightType = [oldH type];
+    double newMinH = (rawOldMinH > 0.0) ? MAX(rawOldMinH * unscale, notchObstruction.height + 8.0) : 0.0;
+    double rawOldMaxH = [oldH maximum];
+    double newMaxH = (heightType == 1) ? MAX(rawOldMaxH * unscale, newMinH) : MAX(rawOldMaxH, newMinH);
+    id<MacIslandSizeDimensionRequest> newH =
+        [(id<MacIslandSizeDimensionRequest>)[sizeDimCls alloc] initWithMinimum:newMinH
+                                                                       maximum:newMaxH
+                                                                          type:heightType];
+
+    double oldCR = [expanded cornerRadius];
+    double newCR = (oldScale < 1.0) ? (oldCR * oldScale) : oldCR;
+
+    id<MacIslandActivityItemMetricsRequest> newExpanded = [(NSObject *)expanded copy];
+    [newExpanded setWidthRequest:newW];
+    [newExpanded setHeightRequest:newH];
+    [newExpanded setCornerRadius:newCR];
+    [newExpanded setScaleFactor:1.0];
+    if ([expanded respondsToSelector:@selector(edgeInsets)] &&
+        [newExpanded respondsToSelector:@selector(setEdgeInsets:)]) {
+        id<MacIslandActivityEdgeInsets> insets = [expanded edgeInsets];
+        double minOutside = MacIslandNotchFlare + 6.0;
+        if (insets &&
+            [insets respondsToSelector:@selector(leading)] &&
+            [insets respondsToSelector:@selector(trailing)] &&
+            [insets respondsToSelector:@selector(copyWithZone:)] &&
+            ([insets leading] < minOutside || [insets trailing] < minOutside)) {
+            id<MacIslandActivityEdgeInsets> newInsets = [(NSObject *)insets copy];
+            [newInsets setLeading:MAX([insets leading], minOutside)];
+            [newInsets setTrailing:MAX([insets trailing], minOutside)];
+            [newExpanded setEdgeInsets:newInsets];
+        }
+    }
+
+    double oldTopMargin = [sa obstructionTopMargin];
+    double newTopMargin = (oldScale < 1.0) ? (oldTopMargin * oldScale) : oldTopMargin;
+    id<MacIslandSystemApertureMetricsRequest> newSA = [(NSObject *)sa copy];
+    [newSA setObstructionSize:notchObstruction];
+    [newSA setObstructionTopMargin:newTopMargin];
+    [newSA setExpandedMetricsRequest:newExpanded];
+    return [newSA isEqual:sa] ? sa : newSA;
+}
+
+static id<MacIslandActivityMetricsRequest> patchedActivityMetricsRequest(
+    id<MacIslandActivityMetricsRequest> nativeReq,
+    NSScreen *targetScreen,
+    BOOL physicalDisplay) {
+    if (!nativeReq || !physicalDisplay ||
+        ![nativeReq respondsToSelector:@selector(systemApertureMetrics)] ||
+        ![nativeReq respondsToSelector:@selector(setSystemApertureMetrics:)] ||
+        ![nativeReq respondsToSelector:@selector(copyWithZone:)]) {
+        return nativeReq;
+    }
+    NSRect cutout = NSZeroRect;
+    if (!MacIslandScreenNotchCutout(targetScreen, &cutout)) return nativeReq;
+    CGSize notchObstruction = CGSizeMake(cutout.size.width + 2.0, cutout.size.height + 2.0);
+    CGFloat center = NSMidX(cutout);
+    CGFloat centeredDisplayWidth = 2.0 * MIN(center - NSMinX(targetScreen.frame),
+                                             NSMaxX(targetScreen.frame) - center);
+    if (!(centeredDisplayWidth > notchObstruction.width)) return nativeReq;
+
+    id<MacIslandSystemApertureMetricsRequest> oldSA = [nativeReq systemApertureMetrics];
+    id<MacIslandSystemApertureMetricsRequest> newSA =
+        patchedSystemApertureMetrics(oldSA, notchObstruction, centeredDisplayWidth);
+    id<MacIslandSystemApertureMetricsRequest> oldLimSA = nil, newLimSA = nil;
+    if ([nativeReq respondsToSelector:@selector(limitedWidthSystemApertureMetrics)] &&
+        [nativeReq respondsToSelector:@selector(setLimitedWidthSystemApertureMetrics:)]) {
+        oldLimSA = [nativeReq limitedWidthSystemApertureMetrics];
+        if (oldLimSA) {
+            newLimSA = patchedSystemApertureMetrics(oldLimSA, notchObstruction, centeredDisplayWidth);
+        }
+    }
+    if (newSA == oldSA && newLimSA == oldLimSA) return nativeReq;
+
+    id<MacIslandActivityMetricsRequest> copy = [(NSObject *)nativeReq copy];
+    if (newSA != oldSA) [copy setSystemApertureMetrics:newSA];
+    if (newLimSA != oldLimSA) [copy setLimitedWidthSystemApertureMetrics:newLimSA];
+    return [copy isEqual:nativeReq] ? nativeReq : copy;
+}
+
+static MacIslandActivityMetricsSummary refreshActivityMetrics(id settings, MacIslandSceneInsets *state,
+                                                              NSScreen *targetScreen, BOOL physicalDisplay) {
+    if (!state.nativeActivityMetricsData) {
+        id existing = existingObjectSetting(settings, @"metrics");
+        if ([existing isKindOfClass:NSData.class]) state.nativeActivityMetricsData = existing;
+    }
+    if (!state.nativeActivityMetricsRequest) {
+        state.nativeActivityMetricsRequest = existingObjectSetting(settings, @"metricsRequest");
+    }
+
+    MacIslandActivityMetricsSummary summary = {0};
+    NSRect cutout = NSZeroRect;
+    BOOL hasCutout = physicalDisplay && MacIslandScreenNotchCutout(targetScreen, &cutout);
+    CGFloat center = hasCutout ? NSMidX(cutout) : 0.0;
+    CGFloat centeredWidth = hasCutout
+        ? 2.0 * MIN(center - NSMinX(targetScreen.frame), NSMaxX(targetScreen.frame) - center)
+        : 0.0;
+    if (!hasCutout) cutout = NSZeroRect;
+
+    if (state.nativeActivityMetricsData) {
+        NSData *patchedData = nil;
+        if (state.cachedActivityMetricsSource == state.nativeActivityMetricsData &&
+            NSEqualRects(state.cachedActivityMetricsCutout, cutout) &&
+            fabs(state.cachedActivityMetricsDisplayWidth - centeredWidth) < 0.001) {
+            patchedData = state.cachedPatchedActivityMetricsData;
+            summary = state.cachedActivitySummary;
+        } else {
+            id<MacIslandActivityMetricsRequest> decoded = decodeActivityMetricsData(state.nativeActivityMetricsData);
+            if (decoded) {
+                id<MacIslandActivityMetricsRequest> rewritten =
+                    patchedActivityMetricsRequest(decoded, targetScreen, physicalDisplay);
+                BOOL changed = (rewritten != decoded && ![rewritten isEqual:decoded]);
+                if (changed) patchedData = encodeActivityMetricsData(rewritten);
+                id<MacIslandActivityMetricsRequest> active = (changed && patchedData) ? rewritten : decoded;
+                CGFloat unusedMinH = 0.0, unusedMaxH = 0.0;
+                if (readSystemApertureSummary(decoded, &summary.nativeObstruction,
+                                              &summary.nativeExpandedMinW, &summary.nativeExpandedMaxW,
+                                              &unusedMinH, &unusedMaxH,
+                                              &summary.nativeExpandedScale, &summary.nativeExpandedCornerRadius) &&
+                    readSystemApertureSummary(active, &summary.patchedObstruction,
+                                              &summary.patchedExpandedMinW, &summary.patchedExpandedMaxW,
+                                              &summary.patchedExpandedMinH, &summary.patchedExpandedMaxH,
+                                              &summary.patchedExpandedScale, &summary.patchedExpandedCornerRadius)) {
+                    summary.present = YES;
+                    summary.patched = (changed && patchedData != nil);
+                }
+            }
+            state.cachedActivityMetricsSource = state.nativeActivityMetricsData;
+            state.cachedActivityMetricsCutout = cutout;
+            state.cachedActivityMetricsDisplayWidth = centeredWidth;
+            state.cachedPatchedActivityMetricsData = patchedData;
+            state.cachedActivitySummary = summary;
+        }
+        BOOL shouldApply = (patchedData != nil);
+        if (originalActivityMetricsData && (shouldApply || state.activityMetricsDataApplied)) {
+            NSData *toWrite = shouldApply
+                ? layoutPayload(patchedData, state.nativeActivityMetricsData)
+                : state.nativeActivityMetricsData;
+            originalActivityMetricsData(settings, @selector(setMetrics:), toWrite);
+            if (shouldApply) {
+                id stored = rawObjectSetting(settings, @"metrics");
+                if (stored && stored != state.nativeActivityMetricsData) {
+                    layoutPayload(stored, state.nativeActivityMetricsData);
+                }
+            }
+        }
+        state.activityMetricsDataApplied = shouldApply;
+    }
+
+    if (state.nativeActivityMetricsRequest) {
+        id<MacIslandActivityMetricsRequest> nativeReq = state.nativeActivityMetricsRequest;
+        id<MacIslandActivityMetricsRequest> rewritten =
+            patchedActivityMetricsRequest(nativeReq, targetScreen, physicalDisplay);
+        BOOL shouldApply = (rewritten != nativeReq && ![rewritten isEqual:nativeReq]);
+        if (!summary.present) {
+            CGFloat unusedMinH = 0.0, unusedMaxH = 0.0;
+            id<MacIslandActivityMetricsRequest> active = shouldApply ? rewritten : nativeReq;
+            if (readSystemApertureSummary(nativeReq, &summary.nativeObstruction,
+                                          &summary.nativeExpandedMinW, &summary.nativeExpandedMaxW,
+                                          &unusedMinH, &unusedMaxH,
+                                          &summary.nativeExpandedScale, &summary.nativeExpandedCornerRadius) &&
+                readSystemApertureSummary(active, &summary.patchedObstruction,
+                                          &summary.patchedExpandedMinW, &summary.patchedExpandedMaxW,
+                                          &summary.patchedExpandedMinH, &summary.patchedExpandedMaxH,
+                                          &summary.patchedExpandedScale, &summary.patchedExpandedCornerRadius)) {
+                summary.present = YES;
+                summary.patched = shouldApply;
+            }
+        }
+        if (originalActivityMetricsRequest && (shouldApply || state.activityMetricsRequestApplied)) {
+            id toWrite = shouldApply ? layoutPayload(rewritten, nativeReq) : nativeReq;
+            originalActivityMetricsRequest(settings, @selector(setMetricsRequest:), toWrite);
+            if (shouldApply) {
+                id stored = rawObjectSetting(settings, @"metricsRequest");
+                if (stored && stored != nativeReq) layoutPayload(stored, nativeReq);
+            }
+        }
+        state.activityMetricsRequestApplied = shouldApply;
+    }
+    return summary;
+}
+
 static void writeFamily(id settings, NSUInteger family, MacIslandNativeLayout *native, NSData *margins,
                         NSValue *minimum, NSValue *maximum) {
     void (*marginSetter)(id, SEL, id) = originalMargins[family];
@@ -1861,7 +2328,8 @@ static id auditMarginsDict(NSDictionary *decoded) {
 static void emitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInsets *state,
                            NSScreen *targetScreen, BOOL displayKnown, BOOL physicalDisplay,
                            const NSRect rects[2], const NSRect publishedRects[2],
-                           const MacIslandFamilyAuditSnapshot snapshots[2]) {
+                           const MacIslandFamilyAuditSnapshot snapshots[2],
+                           MacIslandActivityMetricsSummary activitySummary) {
     NSRect cutout = NSZeroRect;
     BOOL hasCutout = MacIslandScreenNotchCutout(targetScreen, &cutout);
     id client = MacIslandAuditDataValue(existingObjectSetting(settings, @"clientIdentifier"));
@@ -1887,6 +2355,7 @@ static void emitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInset
         NSDictionary *nativeMargins = decodedMargins(nativeLayout.margins);
         NSDictionary *afterMargins = snap.patchedMargins == nativeLayout.margins
             ? nativeMargins : decodedMargins(snap.patchedMargins);
+        BOOL includeActivity = (family == 0 && activitySummary.present);
 
         NSDictionary *record = @{
             @"event": @"scene_settings",
@@ -1917,6 +2386,13 @@ static void emitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInset
                 @"max": nativeLayout.maximum ? MacIslandAuditSizeDict(nativeLayout.maximum.sizeValue) : NSNull.null,
                 @"obstructionRect": nativeObs.rect ? MacIslandAuditRectDict(nativeObs.rect.rectValue) : NSNull.null,
                 @"obstructionSpace": nativeObs.space ? MacIslandAuditSizeDict(nativeObs.space.sizeValue) : NSNull.null,
+                @"activityMetrics": includeActivity ? @{
+                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.nativeObstruction),
+                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMinW),
+                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMaxW),
+                    @"expandedScale": MacIslandAuditNumber(activitySummary.nativeExpandedScale),
+                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.nativeExpandedCornerRadius),
+                } : NSNull.null,
             },
             @"policy": @{
                 @"physical": @(snap.policy.physical),
@@ -1935,6 +2411,14 @@ static void emitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInset
                 @"canonicalObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(rects[obsFamily]) : NSNull.null,
                 @"publishedObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(publishedRects[obsFamily]) : NSNull.null,
                 @"cornersZeroed": @(nativeObs.cornersApplied),
+                @"activityMetrics": includeActivity ? @{
+                    @"applied": @(activitySummary.patched),
+                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.patchedObstruction),
+                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMinW),
+                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMaxW),
+                    @"expandedScale": MacIslandAuditNumber(activitySummary.patchedExpandedScale),
+                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.patchedExpandedCornerRadius),
+                } : NSNull.null,
             },
         };
         NSString *signature = MacIslandAuditSerialize(record);
@@ -1956,6 +2440,8 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     NSRect publishedRects[2] = {NSZeroRect, NSZeroRect};
     BOOL detached[2] = {NO, NO};
     MacIslandFamilyAuditSnapshot snapshots[2] = {{0}, {0}};
+    MacIslandActivityMetricsSummary activitySummary =
+        refreshActivityMetrics(settings, state, targetScreen, physicalDisplay);
     for (NSUInteger family = 0; family < state.obstructions.count; family++) {
         MacIslandNativeObstruction *native = state.obstructions[family];
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
@@ -2027,27 +2513,52 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
                              [after[@"trailing"] doubleValue] - [before[@"trailing"] doubleValue];
             CGFloat extraY = [after[@"top"] doubleValue] - [before[@"top"] doubleValue];
             NSSize minimum = native.minimum.sizeValue, maximum = native.maximum.sizeValue;
-            minimum.width += extraX;
-            minimum.height = MAX(minimum.height + extraY, shortHeight);
-            // Hosted system banners (volume, brightness, AirPods) size their
-            // own content below the cutout; their native width stays.
-            if (policy.extendsBelow && family == 0) {
-                // Element activities place wing or body content around the cutout.
-                // Reserve at least 57pt per wing outside the 12pt shoulder margin
-                // and 12pt camera clearance (384pt on a 220pt notch for 52pt artwork
-                // or icons), while raising the ceiling (>= 504pt) so wider providers
-                // such as ClockAngel (494pt) and NowPlaying (~390pt) negotiate freely.
-                CGFloat width = policy.notchWidth + 164;
+            if (policy.extendsBelow && family == 0 && activitySummary.present) {
+                // ActivityKit / WidgetRenderer_Activities scenes render Jindo wings from
+                // y=0 around SystemApertureMetricsRequest.obstructionSize rather than
+                // below elementViewLayoutMargins.top. Match the rewritten Jindo width
+                // and height bounds directly without inflating minimum height by extraY.
+                CGFloat width = MAX(policy.notchWidth + 164, activitySummary.patchedExpandedMinW);
                 CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
-                CGFloat growth = floor - minimum.width;
-                maximum.width += MIN(growth, MAX(0, policy.centeredDisplayWidth - maximum.width - extraX));
-                CGFloat ceiling = MIN(policy.notchWidth + 284, policy.centeredDisplayWidth);
+                CGFloat ceiling = MIN(MAX(MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth),
+                                          activitySummary.patchedExpandedMaxW),
+                                      policy.centeredDisplayWidth);
                 minimum.width = floor;
-                maximum.width = MAX(maximum.width + extraX, MAX(minimum.width, ceiling));
+                if (isfinite(maximum.width)) {
+                    maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                }
+                CGFloat minExpandedH = MAX(rect.size.height + 8.0, activitySummary.patchedExpandedMinH);
+                minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
+                if (isfinite(maximum.height)) {
+                    maximum.height = MAX(maximum.height, MAX(minimum.height, activitySummary.patchedExpandedMaxH));
+                }
             } else {
-                maximum.width = MAX(maximum.width + extraX, minimum.width);
+                minimum.width += extraX;
+                minimum.height = MAX(minimum.height + extraY, shortHeight);
+                // Hosted system banners (volume, brightness, AirPods) size their
+                // own content below the cutout; their native width stays.
+                if (policy.extendsBelow && family == 0) {
+                    // Element activities place wing or body content around the cutout.
+                    // Reserve at least 57pt per wing outside the 12pt shoulder margin
+                    // and 12pt camera clearance (384pt on a 220pt notch for 52pt artwork
+                    // or icons), while aligning the ceiling with MenuBarAgent's overridden
+                    // HostedSceneMetricsMaximumContentWidth (540pt on a 220pt notch) so
+                    // wider providers such as ClockAngel (522pt) and NowPlaying (~390pt)
+                    // negotiate freely without CenterHUD outer-platter clipping.
+                    CGFloat width = policy.notchWidth + 164;
+                    CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
+                    CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+                    minimum.width = floor;
+                    if (isfinite(maximum.width)) {
+                        maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                    }
+                } else if (isfinite(maximum.width)) {
+                    maximum.width = MAX(maximum.width + extraX, minimum.width);
+                }
+                if (isfinite(maximum.height)) {
+                    maximum.height = MAX(maximum.height, minimum.height);
+                }
             }
-            maximum.height = MAX(maximum.height, minimum.height);
             minimumValue = layoutPayload([NSValue valueWithSize:minimum], native.minimum);
             maximumValue = layoutPayload([NSValue valueWithSize:maximum], native.maximum);
             applies |= !NSEqualSizes(minimum, native.minimum.sizeValue) || !NSEqualSizes(maximum, native.maximum.sizeValue);
@@ -2056,7 +2567,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         native.applied = applies;
         snapshots[family] = (MacIslandFamilyAuditSnapshot){
             .hasData = (native.margins != nil || native.minimum != nil || native.maximum != nil ||
-                        state.obstructions[family].rect != nil),
+                        state.obstructions[family].rect != nil || (family == 0 && activitySummary.present)),
             .obstructionFamily = obstructionFamily,
             .viewport = layoutViewport,
             .policy = policy,
@@ -2103,7 +2614,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     NSString *auditPath = MacIslandAuditLogPath();
     if (auditPath) {
         emitSceneAudit(auditPath, settings, state, targetScreen, displayKnown, physicalDisplay,
-                       rects, publishedRects, snapshots);
+                       rects, publishedRects, snapshots, activitySummary);
     }
     state.updating = NO;
 }
@@ -2155,6 +2666,20 @@ static void setFamilyLocation(id settings, SEL selector, id value, NSUInteger fa
     originalLocation[family](settings, selector, value);
     if (!settingsHaveTrackedValues(settings)) return;
     MacIslandSceneInsets *state = sceneState(settings);
+    refreshSceneInsets(settings, state);
+}
+static void setActivityMetricsData(id settings, SEL selector, id value) {
+    value = nativePayload(value);
+    originalActivityMetricsData(settings, selector, value);
+    MacIslandSceneInsets *state = sceneState(settings);
+    state.nativeActivityMetricsData = [value isKindOfClass:NSData.class] ? value : nil;
+    refreshSceneInsets(settings, state);
+}
+static void setActivityMetricsRequest(id settings, SEL selector, id value) {
+    value = nativePayload(value);
+    originalActivityMetricsRequest(settings, selector, value);
+    MacIslandSceneInsets *state = sceneState(settings);
+    state.nativeActivityMetricsRequest = value;
     refreshSceneInsets(settings, state);
 }
 
@@ -2242,7 +2767,9 @@ static void registerKnownSettingsExtensions(Class cls) {
     if (![cls respondsToSelector:selector]) return;
     for (NSString *name in @[@"ElementRegistryFoundation.ElementRegistrySceneExtension",
                              @"MenuBarClient.HostedMetricsExtension",
-                             @"MenuBarClient.HostedIntegratedObstructionExtension"]) {
+                             @"MenuBarClient.HostedIntegratedObstructionExtension",
+                             @"ActivityUIServices.ElementActivitySceneExtension",
+                             @"ActivityUIServices.ActivitySceneExtension"]) {
         Class extension = NSClassFromString(name);
         if (extension) ((id (*)(id, SEL, Class))objc_msgSend)(cls, selector, extension);
     }
@@ -2264,10 +2791,12 @@ static BOOL installContentInsetsHooksLocked(void) {
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRect:", (IMP)setObstructionHosted, &originalObstruction[1]);
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionRectCoordinateSpace:", (IMP)setSpaceHosted, &originalSpace[1]);
     ready &= replaceObjectSetter(cls, @"setHostedIntegratedObstructionCornerRadii:", (IMP)setCornersHosted, &originalCorners[1]);
-    // Obstruction location, display configuration, and frame are optional or
-    // base FBSSceneSettings accessors: hook them when present without blocking readiness.
+    // Obstruction location, Live Activity metrics, display configuration, and frame are
+    // optional or base FBSSceneSettings accessors: hook them when present without blocking readiness.
     replaceObjectSetter(cls, @"setIntegratedObstructionLocation:", (IMP)setLocationElement, &originalLocation[0]);
     replaceObjectSetter(cls, @"setHostedIntegratedObstructionLocation:", (IMP)setLocationHosted, &originalLocation[1]);
+    replaceObjectSetter(cls, @"setMetrics:", (IMP)setActivityMetricsData, &originalActivityMetricsData);
+    replaceObjectSetter(cls, @"setMetricsRequest:", (IMP)setActivityMetricsRequest, &originalActivityMetricsRequest);
     replaceObjectSetter(cls, @"setDisplayConfiguration:", (IMP)setDisplayConfiguration, &originalDisplayConfiguration);
     Method frameMethod = class_getInstanceMethod(cls, NSSelectorFromString(@"setFrame:"));
     if (frameMethod && strstr(method_getTypeEncoding(frameMethod), "CGRect")
@@ -2281,7 +2810,51 @@ static BOOL installContentInsetsHooksLocked(void) {
     }
     return ready;
 }
+// MenuBarAgent's SystemSettingsController clamps expanded CenterHUD containers
+// to Settings.hostedSceneMetrics.maximumContentWidth (408pt iPhone default),
+// clipping wider notched layouts (470pt Live Activities, 522pt ClockAngel).
+// Registering HostedSceneMetricsMaximumContentWidth in volatile NSRegistrationDomain
+// lifts the cap in-memory, fires SystemSettingsController's KVO reload immediately,
+// leaves zero disk state on uninstall, and restores 408pt when no notch is active.
+static void syncHostedSceneMaximumContentWidthWithDefaults(NSUserDefaults *defaults) {
+    if (!defaults) return;
+    CGFloat targetWidth = 0;
+    for (NSScreen *screen in NSScreen.screens) {
+        CGFloat screenMax = MacIslandScreenExpandedMaxWidth(screen);
+        if (screenMax > targetWidth) targetWidth = screenMax;
+    }
+    NSDictionary<NSString *, id> *registered = [defaults volatileDomainForName:NSRegistrationDomain];
+    id current = registered[MacIslandHostedMaxContentWidthKey];
+    if (targetWidth > 0) {
+        if ([current isKindOfClass:NSNumber.class] && fabs([current doubleValue] - targetWidth) <= 0.001) {
+            return;
+        }
+        [defaults registerDefaults:@{MacIslandHostedMaxContentWidthKey: @(targetWidth)}];
+    } else if (current != nil) {
+        // Trigger cross-suite KVO reload (e.g. MenuBarAgent's group suite) back to
+        // Apple's 408pt baseline before stripping the volatile registration key.
+        [defaults registerDefaults:@{MacIslandHostedMaxContentWidthKey: @(408.0)}];
+        NSMutableDictionary<NSString *, id> *updated = [[defaults volatileDomainForName:NSRegistrationDomain] mutableCopy];
+        [updated removeObjectForKey:MacIslandHostedMaxContentWidthKey];
+        [defaults removeVolatileDomainForName:NSRegistrationDomain];
+        if (updated.count > 0) {
+            [defaults setVolatileDomain:updated forName:NSRegistrationDomain];
+        }
+    }
+}
+static void syncHostedSceneMaximumContentWidth(void) {
+    syncHostedSceneMaximumContentWidthWithDefaults(NSUserDefaults.standardUserDefaults);
+}
+static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *context) {
+    (void)display;
+    (void)context;
+    if (flags & kCGDisplayBeginConfigurationFlag) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        syncHostedSceneMaximumContentWidth();
+    });
+}
 static void waitForSceneSettings(NSUInteger attempt) {
+    syncHostedSceneMaximumContentWidth();
     Class cls = NSClassFromString(@"FBSSceneSettings");
     if (cls) registerKnownSettingsExtensions(cls);
     if (installContentInsetsHooks()) return;
@@ -2296,10 +2869,20 @@ BOOL MacIslandInstallSceneSettingsHooksForTesting(void) {
     if (cls) registerKnownSettingsExtensions(cls);
     return installContentInsetsHooks();
 }
+void MacIslandSyncHostedSceneMaximumContentWidthForTesting(NSUserDefaults *defaults) {
+    syncHostedSceneMaximumContentWidthWithDefaults(defaults);
+}
 #endif
 __attribute__((constructor)) static void installNotchContentInsets(void) {
     if (!MacIslandIsMenuBarAgent()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                                                        object:nil
+                                                         queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *__unused note) {
+            syncHostedSceneMaximumContentWidth();
+        }];
+        CGDisplayRegisterReconfigurationCallback(displayReconfigured, NULL);
         waitForSceneSettings(0);
     });
 }
@@ -2591,10 +3174,55 @@ static CGFloat nativeSceneEdgeCompensation(CALayer *layer) {
     }
     return 0;
 }
+static id nativeModifierObject(id object, NSString *name);
+static BOOL nativeModifierEnabled(id modifier);
+
+// Core Animation releases its transaction lock as soon as CALayer.sublayers /
+// filters / presentationModifiers returns its internal array wrapper, so an
+// unlocked [layer.sublayers copy] on the background DisplayLink thread can race
+// with main-thread addSublayer:/removeFromSuperlayer inside __NSArrayI_new.
+// Snapshot under +[CATransaction lock] (recursive on main, never nested inside
+// maskStateLock).
+static NSArray<CALayer *> *copyLayerSublayers(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray<CALayer *> *snapshot = [layer.sublayers copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static BOOL layerHasSublayers(CALayer *layer) {
+    if (!layer) return NO;
+    [CATransaction lock];
+    BOOL has = layer.sublayers.count != 0;
+    [CATransaction unlock];
+    return has;
+}
+static NSArray *copyLayerFilters(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray *snapshot = [layer.filters copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static NSArray *copyLayerModifiers(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray *snapshot = [nativeModifierObject(layer, @"presentationModifiers") copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+static NSArray<NSString *> *copyLayerAnimationKeys(CALayer *layer) {
+    if (!layer) return nil;
+    [CATransaction lock];
+    NSArray<NSString *> *snapshot = [layer.animationKeys copy];
+    [CATransaction unlock];
+    return snapshot;
+}
+
 static BOOL hasMergeFilters(CALayer *layer) {
     if (!layer) return NO;
     BOOL blur = NO, threshold = NO;
-    NSArray *filters = [layer.filters copy];
+    NSArray *filters = copyLayerFilters(layer);
     for (id filter in filters) {
         id type = nativeModifierObject(filter, @"type");
         blur |= [type isEqual:@"gaussianBlur"];
@@ -2619,7 +3247,7 @@ static id activeMergeBlur(CALayer *group) {
     if (!group) return nil;
     id blur = nil;
     BOOL threshold = NO;
-    NSArray *filters = [group.filters copy];
+    NSArray *filters = copyLayerFilters(group);
     for (id filter in filters) {
         if (!nativeModifierEnabled(filter)) continue;
         id type = nativeModifierObject(filter, @"type");
@@ -2640,7 +3268,7 @@ static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize
     CGPoint position = layer.position;
     CGPoint anchor = layer.anchorPoint;
     CATransform3D transform = layer.transform;
-    NSArray *modifiers = [nativeModifierObject(layer, @"presentationModifiers") copy];
+    NSArray *modifiers = copyLayerModifiers(layer);
     for (id modifier in modifiers) {
         if (!nativeModifierEnabled(modifier)) continue;
         NSString *key = nativeModifierObject(modifier, @"keyPath");
@@ -2712,13 +3340,13 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
     if (!scene) return @[leaf];
     CGRect circle = presentationLayerFrameInAncestor(leaf, scene);
     CALayer *match = nil;
-    NSArray<CALayer *> *sceneBranches = [scene.sublayers copy];
+    NSArray<CALayer *> *sceneBranches = copyLayerSublayers(scene);
     for (CALayer *branch in sceneBranches) {
         if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = [branch.sublayers copy];
+        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
         for (CALayer *candidate in candidates) {
             if (![candidate.name hasPrefix:@"SimpleViewDisplayItem-"] ||
-                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || candidate.sublayers.count)
+                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || layerHasSublayers(candidate))
                 continue;
             CGRect rect = presentationLayerFrameInAncestor(candidate, scene);
             if (!sameCircleFrame(circle, rect)) continue;
@@ -2735,12 +3363,12 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
     NSMutableArray<CALayer *> *paints = [NSMutableArray arrayWithArray:@[leaf, match]];
     for (CALayer *branch in sceneBranches) {
         if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = [branch.sublayers copy];
+        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
         for (CALayer *candidate in candidates) {
-            if (candidate.contents || candidate.sublayers.count) continue;
+            if (candidate.contents || layerHasSublayers(candidate)) continue;
             CGRect expected = fallback;
             if ([candidate.name hasPrefix:@"BackdropViewDisplayItem-"]) {
-                NSArray *filters = [candidate.filters copy];
+                NSArray *filters = copyLayerFilters(candidate);
                 NSArray *types = [filters valueForKey:@"type"];
                 if (types.count) {
                     if (types.count != 2 || ![types containsObject:@"colorMatrix"] ||
@@ -2758,9 +3386,9 @@ static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
 }
 
 static void clearSecondaryMergeInputs(CALayer *unionLayer) {
-    NSArray<CALayer *> *branches = [unionLayer.sublayers copy];
+    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
     for (CALayer *branch in branches) {
-        NSArray<CALayer *> *children = [branch.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(branch);
         if (children.count != 1) continue;
         MacIslandNativeMaskObserver *secondary = modelMaskObserver(children.firstObject);
         if (observerDesiredObservedUnion(secondary))
@@ -2772,15 +3400,15 @@ static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRe
     CALayer *unionLayer = input.source.superlayer;
     if (!unionLayer) return;
     id blur = activeMergeBlur(unionLayer);
-    NSArray<CALayer *> *branches = [unionLayer.sublayers copy];
+    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
     for (CALayer *branch in branches) {
         if (branch == input.source || branch.contents ||
             (branch.backgroundColor && CGColorGetAlpha(branch.backgroundColor) > 0))
             continue;
-        NSArray<CALayer *> *children = [branch.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(branch);
         if (children.count != 1) continue;
         CALayer *leaf = children.firstObject;
-        if (!isSecondaryMergeInput(leaf) || leaf.contents || leaf.sublayers.count) continue;
+        if (!isSecondaryMergeInput(leaf) || leaf.contents || layerHasSublayers(leaf)) continue;
         MacIslandNativeMaskObserver *secondaryObserver = modelMaskObserver(leaf);
         CGRect circle = presentationLayerFrameInAncestor(leaf, unionLayer);
         BOOL trailing = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody);
@@ -2812,7 +3440,7 @@ static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRe
 }
 
 static void notifyUnionPrimaryObserver(CALayer *secondary) {
-    NSArray<CALayer *> *siblings = [secondary.superlayer.superlayer.sublayers copy];
+    NSArray<CALayer *> *siblings = copyLayerSublayers(secondary.superlayer.superlayer);
     for (CALayer *sibling in siblings) {
         if (!isNativeUnionFill(sibling)) continue;
         MacIslandNativeMaskObserver *primary = modelMaskObserver(sibling);
@@ -2847,7 +3475,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
         CAShapeLayer *prevMask = [previous shapeMask];
         if (heldMaterial && heldMaterial.superlayer == scene &&
             prevMask && heldMaterial.mask == prevMask && !heldMaterial.hidden &&
-            heldMaterial.opacity >= 1 && !heldMaterial.contents && !heldMaterial.sublayers.count &&
+            heldMaterial.opacity >= 1 && !heldMaterial.contents && !layerHasSublayers(heldMaterial) &&
             isOpaqueBlack(heldMaterial.backgroundColor)) {
             return YES;
         }
@@ -2856,7 +3484,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
     MacIslandNativeMaskObserver *selected = nil;
     if (scene && unionLayer) {
         CGRect body = [unionLayer convertRect:nativeBodyFrame(input) toLayer:scene];
-        NSArray<CALayer *> *sublayers = [scene.sublayers copy];
+        NSArray<CALayer *> *sublayers = copyLayerSublayers(scene);
         for (CALayer *layer in sublayers) {
             if (layer.superlayer != scene || !isOpaqueBlack(layer.backgroundColor)) continue;
             id association = objc_getAssociatedObject(layer, &maskObserverKey);
@@ -2873,7 +3501,7 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
             os_unfair_lock_lock(&maskStateLock);
             peer->_mergeInput = input;
             os_unfair_lock_unlock(&maskStateLock);
-            if (layer.opacity >= 1 && !layer.contents && !layer.sublayers.count &&
+            if (layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
                 (!layer.hidden || (blur && !source.hidden && source.opacity >= 1 &&
                                     !unionLayer.hidden && unionLayer.opacity >= 1))) {
                 selected = peer;
@@ -3209,7 +3837,7 @@ static void observeNativeAnimations(CALayer *layer) {
             BOOL newlyApplied = !self.applied;
             self.applied = YES;
             if (newlyApplied) {
-                NSArray<NSString *> *animKeys = [source.animationKeys copy];
+                NSArray<NSString *> *animKeys = copyLayerAnimationKeys(source);
                 for (NSString *key in animKeys) {
                     CAAnimation *animation = [source animationForKey:key];
                     CAAnimation *adjusted = animationWithoutPillCorners(animation);
@@ -3682,7 +4310,7 @@ static void modifierListChanged(CALayer *layer) {
     if (observer.applied) [observer refreshMask];
     else if (observer) synchronizeNativeMaskGeometry(observer);
     else if (hasMergeFilters(layer.superlayer)) {
-        NSArray<CALayer *> *children = [layer.sublayers copy];
+        NSArray<CALayer *> *children = copyLayerSublayers(layer);
         for (CALayer *child in children) {
             MacIslandNativeMaskObserver *childObserver = modelMaskObserver(child);
             if (childObserver) synchronizeNativeMaskGeometry(childObserver);
@@ -3737,7 +4365,7 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         BOOL applied = observer.applied;
         BOOL secondary = !applied && source && isSecondaryMergeInput(source);
         BOOL member = applied || secondary;
-        NSArray *modifiers = (member && source) ? [nativeModifierObject(source, @"presentationModifiers") copy] : nil;
+        NSArray *modifiers = (member && source) ? copyLayerModifiers(source) : nil;
 
         os_unfair_lock_lock(&maskStateLock);
         NSArray *currentBindings = observer->_modifierBindings;
@@ -3773,7 +4401,7 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
             if (group && ![groups containsObject:group]) [groups addObject:group];
         }
         if (secondary) {
-            NSArray *parentModifiers = [nativeModifierObject(source.superlayer, @"presentationModifiers") copy];
+            NSArray *parentModifiers = copyLayerModifiers(source.superlayer);
             for (id modifier in parentModifiers) {
                 id group = nativeModifierObject(modifier, @"group");
                 if (group && ![groups containsObject:group]) [groups addObject:group];
@@ -3924,7 +4552,7 @@ static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
                 CALayer *group = inputSource ? inputSource.superlayer : nil;
                 CAShapeLayer *peerMask = [peer shapeMask];
                 if (isContourPeer && input.applied && peer.applied && group &&
-                    !layer.hidden && layer.opacity >= 1 && !layer.contents && layer.sublayers.count == 0 &&
+                    !layer.hidden && layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
                     isOpaqueBlack(layer.backgroundColor) && peerMask && layer.mask == peerMask &&
                     layer.superlayer == group.superlayer) {
                     id blur = activeMergeBlur(group);
@@ -4033,7 +4661,7 @@ static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
 static void refreshNativeBackgroundCoverage(CALayer *layer) {
     id observer = objc_getAssociatedObject(layer, &maskObserverKey);
     if ([observer isKindOfClass:MacIslandNativeMaskObserver.class]) [observer refresh];
-    NSArray<CALayer *> *children = [layer.sublayers copy];
+    NSArray<CALayer *> *children = copyLayerSublayers(layer);
     for (CALayer *child in children) refreshNativeBackgroundCoverage(child);
 }
 
@@ -4196,6 +4824,37 @@ bool mi_is_optional_some(const void *enum_addr, const void *wrapped_metadata) {
 #endif
     return get_tag(enum_addr, 1, wrapped_metadata) == 0;
 }
+
+#ifdef MACISLAND_TESTING
+extern const void *swift_getTypeByMangledNameInContext2(
+    const char *typeNameStart, size_t typeNameLength,
+    const void *context, const void *const *genericArgs);
+
+const void *mi_get_type_by_mangled_name(const char *start, size_t len) {
+    if (!start || len == 0) return NULL;
+    return swift_getTypeByMangledNameInContext2(start, len, NULL, NULL);
+}
+
+void mi_store_optional_tag(void *enum_addr, unsigned which_case, const void *wrapped_metadata) {
+    if (!enum_addr || !wrapped_metadata) return;
+    const void *const *slot = ((const void *const *)wrapped_metadata) - 1;
+    const void *vwt = *slot;
+#if __has_feature(ptrauth_calls)
+    vwt = ptrauth_auth_data(
+        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
+    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
+    // Swift SpecialPointerAuthDiscriminators::StoreEnumTagSinglePayload = 0xa0d1.
+    void (*store_tag)(void *, unsigned, unsigned, const void *) = ptrauth_auth_and_resign(
+        (void *)*fn_slot, ptrauth_key_asia, ptrauth_blend_discriminator(fn_slot, 0xa0d1),
+        ptrauth_key_function_pointer, 0);
+#else
+    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
+    void (*store_tag)(void *, unsigned, unsigned, const void *) =
+        (void (*)(void *, unsigned, unsigned, const void *))*fn_slot;
+#endif
+    store_tag(enum_addr, which_case, 1, wrapped_metadata);
+}
+#endif
 
 extern void mi_surface_body(void);
 extern void mi_clock_body_1(void);
@@ -4836,16 +5495,23 @@ import os
 
 // Pure B안 (Wing-Preserving Dynamic Notch) layout for ClockAngel's three
 // stock activities: Timer, Alarm, and Stopwatch.
-// Each expanded view stays anchored at y = 0 with 494pt width on a 222pt
-// canonical notch (136pt per wing): 84x38pt dual controls in the left wing,
-// and vertically centered digits/status in the right wing.
-private let clockWingSpan: CGFloat = 136
+// Each expanded view stays anchored at y = 0 with 522pt width on a 222pt
+// canonical notch (150pt per wing): 84x38pt dual controls in the left wing,
+// and 120pt of vertically centered digits/status in the right wing (matching
+// ClockAngel's native 119pt BaselineRow budget so multi-hour H:MM:SS timers fit).
+private let clockWingSpan: CGFloat = 150
 private let clockOuterMargin: CGFloat = 18
 private let clockControlsWidth: CGFloat = 84
 private let clockNotchClearance: CGFloat = 12
 private let clockStopwatchInnerTrailing: CGFloat = 5
 // BaselineRow.placeSubviews selects centeredBaselineY only when topInset > 0.
 private let clockCenteredBaselineTopInset: CGFloat = 0.01
+
+private enum ClockActivityKind: Int {
+  case timer = 0
+  case alarm = 1
+  case stopwatch = 2
+}
 
 private typealias ClockBodyHandler = (UnsafeRawPointer, UnsafeMutableRawPointer) -> Void
 
@@ -4859,6 +5525,7 @@ private struct ClockPatchSpec {
 
 private let clockReadiness = OSAllocatedUnfairLock<Int32>(initialState: 0)
 private nonisolated(unsafe) var clockHandlers: [ClockBodyHandler?] = Array(repeating: nil, count: 7)
+private nonisolated(unsafe) var clockHostCutoutSizes: [CGSize?] = Array(repeating: nil, count: 3)
 private nonisolated(unsafe) var clockInstalledSlots: [(UnsafeMutablePointer<UInt>, UInt, UInt)] = []
 
 private func makeModifiedViewType(
@@ -4877,10 +5544,12 @@ private func clockTypeDescriptors() -> [String: UnsafeRawPointer] {
   var found: [String: UnsafeRawPointer] = [:]
   let wanted: Set<String> = [
     "ElementObstructionRectModifier", "TimerHost", "AlarmHost", "StopwatchHost",
+    "IntegratedViewGroup_V1",
   ]
   for imageIndex in 0..<_dyld_image_count() {
-    guard let imageName = _dyld_get_image_name(imageIndex),
-      String(cString: imageName).hasSuffix("/ClockAngel"),
+    guard let imageName = _dyld_get_image_name(imageIndex) else { continue }
+    let path = String(cString: imageName)
+    guard path.hasSuffix("/ClockAngel") || path.hasSuffix("/ElementRegistryClient"),
       let header = _dyld_get_image_header(imageIndex)
     else { continue }
     let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
@@ -4902,7 +5571,7 @@ private func clockTypeDescriptors() -> [String: UnsafeRawPointer] {
         found[name] = desc
       }
     }
-    break
+    if found.count == wanted.count { break }
   }
   return found
 }
@@ -5032,25 +5701,70 @@ private func findHostFlexFrameSpec(
     return HostFlexFrameSpec(
       minW: inner.minW, idealW: inner.idealW, maxW: inner.maxW, optionalGuards: guards)
   }
-  if let next = fieldInfo(type, "content") ?? fieldInfo(type, "_tree") {
+  if let next = fieldInfo(type, "content") ?? fieldInfo(type, "_tree") ?? fieldInfo(type, "expanded")
+  {
     return findHostFlexFrameSpec(
       next.1, baseOffset: baseOffset + next.0, totalSize: totalSize)
   }
   return nil
 }
 
+private struct HostObstructionSpec {
+  let integratedOptOffset: Int
+  let integratedWrappedType: Any.Type
+  let integratedRectOffset: Int
+  let legacyRectOffset: Int
+}
+
+private func resolveHostObstructionSpec<T>(
+  _ hostType: T.Type, hostSize: Int
+) -> HostObstructionSpec? {
+  guard
+    let legacyField = resolveDynamicPath(
+      hostType,
+      ["content", "expanded", "modifier", "metrics", "obstructionMetrics", "obstructionRect"]),
+    legacyField.type == CGRect.self,
+    legacyField.offset >= 0,
+    legacyField.offset % MemoryLayout<CGRect>.alignment == 0,
+    legacyField.offset + MemoryLayout<CGRect>.size <= hostSize,
+    let integratedOpt = resolveDynamicPath(
+      hostType, ["content", "expanded", "modifier", "metrics", "obstruction"]),
+    String(reflecting: integratedOpt.type).hasPrefix("Swift.Optional<")
+  else { return nil }
+
+  let optSize = typeLayoutSize(integratedOpt.type)
+  let wrappedType = genericTypeArguments(integratedOpt.type, count: 1)[0]
+  let wrappedSize = typeLayoutSize(wrappedType)
+  guard
+    integratedOpt.offset >= 0,
+    optSize >= wrappedSize,
+    integratedOpt.offset + optSize <= hostSize,
+    let rectField = fieldInfo(wrappedType, "rect"),
+    rectField.1 == CGRect.self
+  else { return nil }
+
+  let integratedRectOffset = integratedOpt.offset + rectField.0
+  guard
+    rectField.0 >= 0,
+    rectField.0 + MemoryLayout<CGRect>.size <= wrappedSize,
+    integratedRectOffset % MemoryLayout<CGRect>.alignment == 0,
+    integratedRectOffset + MemoryLayout<CGRect>.size <= hostSize
+  else { return nil }
+
+  return HostObstructionSpec(
+    integratedOptOffset: integratedOpt.offset,
+    integratedWrappedType: wrappedType,
+    integratedRectOffset: integratedRectOffset,
+    legacyRectOffset: legacyField.offset)
+}
+
 private func prepareHostPatch<T: View>(
-  _ hostType: T.Type, index: UInt32, discriminator: UInt32
+  _ hostType: T.Type, kind: ClockActivityKind, index: UInt32, discriminator: UInt32
 ) -> ClockPatchSpec? {
   let hostSize = MemoryLayout<T>.size
   let bodySize = MemoryLayout<T.Body>.size
   guard
-    let obsField = resolveDynamicPath(
-      T.self, ["content", "modifier", "metrics", "obstructionMetrics", "obstructionRect"]),
-    obsField.type == CGRect.self,
-    obsField.offset >= 0,
-    obsField.offset % MemoryLayout<CGRect>.alignment == 0,
-    obsField.offset + MemoryLayout<CGRect>.size <= hostSize,
+    let obs = resolveHostObstructionSpec(T.self, hostSize: hostSize),
     let flex = findHostFlexFrameSpec(T.Body.self, baseOffset: 0, totalSize: bodySize)
   else { return nil }
 
@@ -5059,14 +5773,23 @@ private func prepareHostPatch<T: View>(
   let replacement = prepareWitnessBody(index, slot, discriminator)
   guard replacement != 0 else { return nil }
 
-  let obsOffset = obsField.offset
   let optionalGuards = flex.optionalGuards
   let handler: ClockBodyHandler = { native, out in
+    let obsRect: CGRect
+    if isOptionalSome(native.advanced(by: obs.integratedOptOffset), obs.integratedWrappedType) {
+      obsRect = native.load(fromByteOffset: obs.integratedRectOffset, as: CGRect.self)
+    } else {
+      obsRect = native.load(fromByteOffset: obs.legacyRectOffset, as: CGRect.self)
+    }
+    guard cutoutScreen(obsRect.size) != nil else {
+      clockHostCutoutSizes[kind.rawValue] = nil
+      return
+    }
+    clockHostCutoutSizes[kind.rawValue] = obsRect.size
+
     for optGuard in optionalGuards {
       guard isOptionalSome(out.advanced(by: optGuard.offset), optGuard.wrappedType) else { return }
     }
-    let obsRect = native.load(fromByteOffset: obsOffset, as: CGRect.self)
-    guard cutoutScreen(obsRect.size) != nil else { return }
     let maxPtr = out.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self)
     guard let currentMax = maxPtr.pointee, abs(currentMax - 260) < 1 else { return }
     let targetWidth = obsRect.width + 2 * clockWingSpan
@@ -5079,13 +5802,22 @@ private func prepareHostPatch<T: View>(
 }
 
 private func resolveCutoutGeometry(
-  _ native: UnsafeRawPointer, rectEnvOffset: Int, sizeEnvOffset: Int
+  _ native: UnsafeRawPointer, rectEnvOffset: Int, sizeEnvOffset: Int, kind: ClockActivityKind
 ) -> (notchMaxX: CGFloat, targetWidth: CGFloat)? {
   let rectOpt = native.advanced(by: rectEnvOffset)
     .assumingMemoryBound(to: Environment<CGRect?>.self).pointee.wrappedValue
   let fallbackSize = native.advanced(by: sizeEnvOffset)
     .assumingMemoryBound(to: Environment<CGSize>.self).pointee.wrappedValue
-  let size = rectOpt?.size ?? fallbackSize
+  let size: CGSize
+  if let rect = rectOpt {
+    size = rect.size
+  } else if cutoutScreen(fallbackSize) != nil {
+    size = fallbackSize
+  } else if let hostSize = clockHostCutoutSizes[kind.rawValue] {
+    size = hostSize
+  } else {
+    return nil
+  }
   guard cutoutScreen(size) != nil else { return nil }
   let targetWidth = size.width + 2 * clockWingSpan
   let centeredMaxX = (targetWidth + size.width) * 0.5
@@ -5166,7 +5898,7 @@ private func prepareTimerExpandedPatch<T: View>(
   let handler: ClockBodyHandler = { native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv)
+        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .timer)
     else { return }
     // Keep tag == 0 (alerting/firing ViewThatFits) untouched below the notch.
     guard out.load(fromByteOffset: tagOffset, as: UInt8.self) == 1 else { return }
@@ -5240,7 +5972,7 @@ private func prepareAlarmExpandedPatch<T: View>(
   let handler: ClockBodyHandler = { native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv)
+        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .alarm)
     else { return }
     // Keep tag == 1 (firing/ringing alarm) untouched.
     guard out.load(fromByteOffset: tagOffset, as: UInt8.self) == 0 else { return }
@@ -5303,7 +6035,7 @@ private func prepareStopwatchExpandedPatch<T: View>(
   let handler: ClockBodyHandler = { native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv)
+        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .stopwatch)
     else { return }
 
     let targetWidth = geom.targetWidth
@@ -5328,49 +6060,116 @@ private func prepareStopwatchExpandedPatch<T: View>(
     index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
 }
 
-private func installAllClockPatches() -> Int32 {
-  if !clockInstalledSlots.isEmpty { return 1 }
+private struct ClockResolvedTypes {
+  let timerView: any View.Type
+  let alarmView: any View.Type
+  let stopwatchView: any View.Type
+  let timerHost: any View.Type
+  let alarmHost: any View.Type
+  let stopwatchHost: any View.Type
+}
+
+private func resolveClockTypes() -> (types: ClockResolvedTypes?, errorCode: Int32) {
   guard
+    let timerMinimal = _typeByName("10ClockAngel16TimerMinimalViewV") as? any View.Type,
+    let timerCompactL = _typeByName("10ClockAngel23TimerCompactLeadingViewV") as? any View.Type,
+    let timerCompactT = _typeByName("10ClockAngel24TimerCompactTrailingViewV") as? any View.Type,
     let timerView = _typeByName("10ClockAngel17TimerExpandedViewV") as? any View.Type,
+    let alarmMinimal = _typeByName("10ClockAngel16AlarmMinimalViewV") as? any View.Type,
+    let alarmCompactL = _typeByName("10ClockAngel23AlarmCompactLeadingViewV") as? any View.Type,
+    let alarmCompactT = _typeByName("10ClockAngel24AlarmCompactTrailingViewV") as? any View.Type,
     let alarmView = _typeByName("10ClockAngel17AlarmExpandedViewV") as? any View.Type,
+    let stopwatchMinimal = _typeByName("10ClockAngel20StopwatchMinimalViewV") as? any View.Type,
+    let stopwatchCompactL = _typeByName("10ClockAngel27StopwatchCompactLeadingViewV")
+      as? any View.Type,
+    let stopwatchCompactT = _typeByName("10ClockAngel28StopwatchCompactTrailingViewV")
+      as? any View.Type,
     let stopwatchView = _typeByName("10ClockAngel21StopwatchExpandedViewV") as? any View.Type
-  else { return -2 }
+  else { return (nil, -2) }
 
   let descriptors = clockTypeDescriptors()
   guard
     let obsDesc = descriptors["ElementObstructionRectModifier"],
+    let groupDesc = descriptors["IntegratedViewGroup_V1"],
     let timerHostDesc = descriptors["TimerHost"],
     let alarmHostDesc = descriptors["AlarmHost"],
     let stopwatchHostDesc = descriptors["StopwatchHost"],
-    let obsModType = resolveConcreteModifierType(obsDesc),
-    let req = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$s7SwiftUI4ViewP4body4BodyQzvgTq")
+    let obsModType = resolveConcreteModifierType(obsDesc)
+  else { return (nil, -3) }
+
+  let sizeEnvMod = _EnvironmentKeyWritingModifier<CGSize>.self
+
+  func instantiateHost(
+    _ hostDesc: UnsafeRawPointer,
+    minimal: any View.Type,
+    compactLeading: any View.Type,
+    compactTrailing: any View.Type,
+    expanded: any View.Type
+  ) -> (any View.Type)? {
+    let clEnv = makeModifiedViewType(compactLeading, sizeEnvMod)
+    let ctEnv = makeModifiedViewType(compactTrailing, sizeEnvMod)
+    let expEnv = makeModifiedViewType(expanded, sizeEnvMod)
+    let expFramed = makeModifiedViewType(expEnv, _FlexFrameLayout.self)
+    let expFull = makeModifiedViewType(expFramed, obsModType)
+
+    let groupArgs: [UnsafeRawPointer] = [
+      unsafeBitCast(minimal as Any.Type, to: UnsafeRawPointer.self),
+      unsafeBitCast(clEnv as Any.Type, to: UnsafeRawPointer.self),
+      unsafeBitCast(ctEnv as Any.Type, to: UnsafeRawPointer.self),
+      unsafeBitCast(expFull as Any.Type, to: UnsafeRawPointer.self),
+      UnsafeRawPointer(witnessTable(minimal)),
+      UnsafeRawPointer(witnessTable(clEnv)),
+      UnsafeRawPointer(witnessTable(ctEnv)),
+      UnsafeRawPointer(witnessTable(expFull)),
+    ]
+    let rawGroup = groupArgs.withUnsafeBufferPointer {
+      getGenericTypeMetadata(0, UnsafeRawPointer($0.baseAddress!), groupDesc)
+    }
+    guard let groupView = unsafeBitCast(rawGroup, to: Any.Type.self) as? any View.Type else {
+      return nil
+    }
+    let hostArgs: [UnsafeRawPointer] = [
+      unsafeBitCast(groupView as Any.Type, to: UnsafeRawPointer.self),
+      UnsafeRawPointer(witnessTable(groupView)),
+    ]
+    let rawHost = hostArgs.withUnsafeBufferPointer {
+      getGenericTypeMetadata(0, UnsafeRawPointer($0.baseAddress!), hostDesc)
+    }
+    return unsafeBitCast(rawHost, to: Any.Type.self) as? any View.Type
+  }
+
+  guard
+    let timerHost = instantiateHost(
+      timerHostDesc, minimal: timerMinimal, compactLeading: timerCompactL,
+      compactTrailing: timerCompactT, expanded: timerView),
+    let alarmHost = instantiateHost(
+      alarmHostDesc, minimal: alarmMinimal, compactLeading: alarmCompactL,
+      compactTrailing: alarmCompactT, expanded: alarmView),
+    let stopwatchHost = instantiateHost(
+      stopwatchHostDesc, minimal: stopwatchMinimal, compactLeading: stopwatchCompactL,
+      compactTrailing: stopwatchCompactT, expanded: stopwatchView)
+  else { return (nil, -3) }
+
+  return (
+    ClockResolvedTypes(
+      timerView: timerView, alarmView: alarmView, stopwatchView: stopwatchView,
+      timerHost: timerHost, alarmHost: alarmHost, stopwatchHost: stopwatchHost),
+    0
+  )
+}
+
+private func installAllClockPatches() -> Int32 {
+  if !clockInstalledSlots.isEmpty { return 1 }
+  let resolved = resolveClockTypes()
+  guard let types = resolved.types else { return resolved.errorCode }
+  guard let req = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$s7SwiftUI4ViewP4body4BodyQzvgTq")
   else { return -3 }
 
   let discriminator = req.load(as: UInt32.self) >> 16
 
-  func instantiateHost(_ hostDesc: UnsafeRawPointer, _ expandedView: any View.Type) -> (any View.Type)? {
-    let framed = makeModifiedViewType(expandedView, _FlexFrameLayout.self)
-    let fullContent = makeModifiedViewType(framed, obsModType)
-    let wt = witnessTable(fullContent)
-    let args: [UnsafeRawPointer] = [
-      unsafeBitCast(fullContent as Any.Type, to: UnsafeRawPointer.self),
-      UnsafeRawPointer(wt),
-    ]
-    let raw = args.withUnsafeBufferPointer {
-      getGenericTypeMetadata(0, UnsafeRawPointer($0.baseAddress!), hostDesc)
-    }
-    return unsafeBitCast(raw, to: Any.Type.self) as? any View.Type
-  }
-
-  guard
-    let timerHost = instantiateHost(timerHostDesc, timerView),
-    let alarmHost = instantiateHost(alarmHostDesc, alarmView),
-    let stopwatchHost = instantiateHost(stopwatchHostDesc, stopwatchView)
-  else { return -3 }
-
-  func buildHost(_ v: any View.Type, _ idx: UInt32) -> ClockPatchSpec? {
+  func buildHost(_ v: any View.Type, _ kind: ClockActivityKind, _ idx: UInt32) -> ClockPatchSpec? {
     func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
-      prepareHostPatch(t, index: idx, discriminator: discriminator)
+      prepareHostPatch(t, kind: kind, index: idx, discriminator: discriminator)
     }
     return open(v)
   }
@@ -5394,12 +6193,12 @@ private func installAllClockPatches() -> Int32 {
   }
 
   guard
-    let p1 = buildHost(timerHost, 1),
-    let p2 = buildHost(alarmHost, 2),
-    let p3 = buildHost(stopwatchHost, 3),
-    let p4 = buildTimer(timerView, 4),
-    let p5 = buildAlarm(alarmView, 5),
-    let p6 = buildStopwatch(stopwatchView, 6)
+    let p1 = buildHost(types.timerHost, .timer, 1),
+    let p2 = buildHost(types.alarmHost, .alarm, 2),
+    let p3 = buildHost(types.stopwatchHost, .stopwatch, 3),
+    let p4 = buildTimer(types.timerView, 4),
+    let p5 = buildAlarm(types.alarmView, 5),
+    let p6 = buildStopwatch(types.stopwatchView, 6)
   else { return -4 }
 
   let specs = [p1, p2, p3, p4, p5, p6]
@@ -5432,6 +6231,176 @@ private func installAllClockPatches() -> Int32 {
   guard index >= 1, Int(index) < clockHandlers.count else { return }
   clockHandlers[Int(index)]?(native, out)
 }
+
+#if MACISLAND_TESTING
+@_silgen_name("mi_store_optional_tag") private func rawStoreOptionalTag(
+  _ enumAddr: UnsafeMutableRawPointer, _ whichCase: UInt32, _ wrappedMetadata: UnsafeRawPointer
+)
+
+@_silgen_name("mi_get_type_by_mangled_name") private func rawGetTypeByMangledName(
+  _ start: UnsafePointer<UInt8>, _ length: Int
+) -> UnsafeRawPointer?
+
+private func clockBinaryHostSpecializations() -> [String: Any.Type] {
+  var hosts: [String: Any.Type] = [:]
+  for imageIndex in 0..<_dyld_image_count() {
+    guard let imageName = _dyld_get_image_name(imageIndex),
+      String(cString: imageName).hasSuffix("/ClockAngel"),
+      let header = _dyld_get_image_header(imageIndex)
+    else { continue }
+    let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
+    var constSize: UInt = 0
+    var typerefSize: UInt = 0
+    guard
+      let constSec = getsectiondata(header64, "__TEXT", "__const", &constSize),
+      let typerefSec = getsectiondata(header64, "__TEXT", "__swift5_typeref", &typerefSize)
+    else { break }
+    let constBase = Int(bitPattern: constSec)
+    let typerefStart = Int(bitPattern: typerefSec)
+    let typerefEnd = typerefStart + Int(typerefSize)
+    var off = 0
+    while off + 8 <= Int(constSize) {
+      let entry = UnsafeRawPointer(constSec).advanced(by: off)
+      let rel = Int(entry.load(as: Int32.self))
+      let rawLen = Int(entry.advanced(by: 4).load(as: Int32.self))
+      let length = abs(rawLen)
+      let target = constBase + off + rel
+      if length > 6, length < 512, target >= typerefStart, target + length < typerefEnd,
+        let ptr = UnsafePointer<UInt8>(bitPattern: target),
+        ptr[length] == 0,
+        (ptr[0] == 0x01 || ptr[0] == 0x02),
+        ptr[5] == 0x79,
+        ptr[length - 1] == 0x47,
+        let meta = rawGetTypeByMangledName(ptr, length)
+      {
+        let resolved = unsafeBitCast(meta, to: Any.Type.self)
+        let reflected = String(reflecting: resolved)
+        for prefix in [
+          "ClockAngel.TimerHost<", "ClockAngel.AlarmHost<", "ClockAngel.StopwatchHost<",
+        ] where reflected.hasPrefix(prefix) {
+          hosts[prefix] = resolved
+        }
+      }
+      off += 4
+    }
+    break
+  }
+  return hosts
+}
+
+@_cdecl("mi_clock_self_test") public func clockSelfTest() -> Int32 {
+  guard installAllClockPatches() == 1, installAllClockPatches() == 1 else { return -10 }
+  guard let types = resolveClockTypes().types else { return -11 }
+
+  let binaryHosts = clockBinaryHostSpecializations()
+  guard
+    let binTimer = binaryHosts["ClockAngel.TimerHost<"],
+    let binAlarm = binaryHosts["ClockAngel.AlarmHost<"],
+    let binStopwatch = binaryHosts["ClockAngel.StopwatchHost<"],
+    binTimer == (types.timerHost as Any.Type),
+    binAlarm == (types.alarmHost as Any.Type),
+    binStopwatch == (types.stopwatchHost as Any.Type)
+  else { return -12 }
+
+  guard
+    let notched = NSScreen.screens.first(where: {
+      $0.auxiliaryTopLeftArea != nil && $0.auxiliaryTopRightArea != nil && $0.safeAreaInsets.top > 0
+    }),
+    let left = notched.auxiliaryTopLeftArea,
+    let right = notched.auxiliaryTopRightArea
+  else {
+    // Non-notched machine: patch installation succeeded; skip screen-dependent assertion.
+    return 1
+  }
+  let canonicalSize = CGSize(
+    width: (right.minX - left.maxX) + 2, height: notched.safeAreaInsets.top + 2)
+
+  func verifyHost(_ viewType: any View.Type, index: UInt32, kind: ClockActivityKind) -> Int32 {
+    func open<H: View>(_: H.Type) -> Int32 {
+      let hostSize = MemoryLayout<H>.size
+      let bodySize = MemoryLayout<H.Body>.size
+      guard
+        let obs = resolveHostObstructionSpec(H.self, hostSize: hostSize),
+        let flex = findHostFlexFrameSpec(H.Body.self, baseOffset: 0, totalSize: bodySize)
+      else { return -13 }
+
+      let nativeBuf = UnsafeMutableRawPointer.allocate(
+        byteCount: max(hostSize, 16), alignment: 16)
+      let outBuf = UnsafeMutableRawPointer.allocate(
+        byteCount: max(bodySize, 16), alignment: 16)
+      defer {
+        nativeBuf.deallocate()
+        outBuf.deallocate()
+      }
+      nativeBuf.initializeMemory(as: UInt8.self, repeating: 0, count: max(hostSize, 16))
+      // Non-zero fill ensures pointer/reference extra inhabitants inside H.Body (e.g. LazyState.Storage)
+      // do not encode Optional.none before the target _FlexFrameLayout fields are initialized.
+      outBuf.initializeMemory(as: UInt8.self, repeating: 1, count: max(bodySize, 16))
+
+      // Mark any Optional payloads in H.Body as .some, and initialize stock maxWidth = 260.
+      for optGuard in flex.optionalGuards {
+        rawStoreOptionalTag(
+          outBuf.advanced(by: optGuard.offset), 0,
+          unsafeBitCast(optGuard.wrappedType, to: UnsafeRawPointer.self))
+      }
+      outBuf.advanced(by: flex.minW).assumingMemoryBound(to: CGFloat?.self).initialize(to: nil)
+      outBuf.advanced(by: flex.idealW).assumingMemoryBound(to: CGFloat?.self).initialize(to: nil)
+      outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self).initialize(to: 260.0)
+
+      // 1. Element scene state: legacy obstructionRect == .zero, integrated obstruction == .some(canonicalSize).
+      nativeBuf.storeBytes(of: CGRect.zero, toByteOffset: obs.legacyRectOffset, as: CGRect.self)
+      nativeBuf.storeBytes(
+        of: CGRect(origin: CGPoint(x: 81, y: 0), size: canonicalSize),
+        toByteOffset: obs.integratedRectOffset, as: CGRect.self)
+      rawStoreOptionalTag(
+        nativeBuf.advanced(by: obs.integratedOptOffset), 0,
+        unsafeBitCast(obs.integratedWrappedType, to: UnsafeRawPointer.self))
+
+      adjustClockBody(index, UnsafeRawPointer(nativeBuf), outBuf)
+
+      let expectedWidth = canonicalSize.width + 2 * clockWingSpan
+      guard
+        let patchedMin = outBuf.advanced(by: flex.minW).assumingMemoryBound(to: CGFloat?.self)
+          .pointee,
+        let patchedIdeal = outBuf.advanced(by: flex.idealW).assumingMemoryBound(to: CGFloat?.self)
+          .pointee,
+        let patchedMax = outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self)
+          .pointee,
+        abs(patchedMin - expectedWidth) < 0.001,
+        abs(patchedIdeal - expectedWidth) < 0.001,
+        abs(patchedMax - expectedWidth) < 0.001,
+        clockHostCutoutSizes[kind.rawValue] == canonicalSize
+      else { return -14 }
+
+      // 2. Non-notched / detached state: integrated obstruction == .none, legacy == .zero -> stays 260pt and clears cache.
+      outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self).pointee = 260.0
+      rawStoreOptionalTag(
+        nativeBuf.advanced(by: obs.integratedOptOffset), 1,
+        unsafeBitCast(obs.integratedWrappedType, to: UnsafeRawPointer.self))
+      adjustClockBody(index, UnsafeRawPointer(nativeBuf), outBuf)
+      guard
+        let untouchedMax = outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self)
+          .pointee,
+        abs(untouchedMax - 260.0) < 0.001,
+        clockHostCutoutSizes[kind.rawValue] == nil
+      else { return -15 }
+
+      return 2
+    }
+    return open(viewType)
+  }
+
+  for (host, idx, kind) in [
+    (types.timerHost, UInt32(1), ClockActivityKind.timer),
+    (types.alarmHost, UInt32(2), ClockActivityKind.alarm),
+    (types.stopwatchHost, UInt32(3), ClockActivityKind.stopwatch),
+  ] {
+    let rc = verifyHost(host, index: idx, kind: kind)
+    if rc != 2 { return rc }
+  }
+  return 2
+}
+#endif
 MACISLAND_CLOCK_SWIFT
 
   cat > "$SCRATCH/spotlight.m" <<'MACISLAND_SPOTLIGHT_M'

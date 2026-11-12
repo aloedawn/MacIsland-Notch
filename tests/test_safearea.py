@@ -35,6 +35,8 @@ class SafeAreaSettingsTests(unittest.TestCase):
             result = subprocess.run([str(executable)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("safearea=ok", result.stdout)
+            self.assertIn("activity_expanded=430@1.0x", result.stdout)
+            self.assertIn("max_content_220=540", result.stdout)
             self.assertIn("restored_corners=nil", result.stdout)
 
             audit_log = Path(temp) / "scene-audit.jsonl"
@@ -48,6 +50,14 @@ class SafeAreaSettingsTests(unittest.TestCase):
                 and r.get("layoutMode") == "expanded"
                 and r.get("patched", {}).get("applied") is True
                 and (r.get("policy") or {}).get("shortHeight") == 0
+                for r in records
+            ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.chrono.WidgetRenderer-Activities"
+                and r.get("layoutMode") == "expanded"
+                and ((r.get("patched") or {}).get("activityMetrics") or {}).get("applied") is True
+                and ((r.get("patched") or {}).get("activityMetrics") or {}).get("expandedMaxWidth") == 430
+                and ((r.get("patched") or {}).get("activityMetrics") or {}).get("expandedScale") == 1
                 for r in records
             ))
             self.assertTrue(any(

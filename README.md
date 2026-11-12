@@ -2,6 +2,54 @@
 
 Enable Apple’s native Dynamic Island and adapt its background to a MacBook’s physical notch. This is the working native MenuBarAgent patch, including notch geometry, shared layout margins, outward-rounded shoulders, animated vector corners, and the one-pixel shrink-back correction. It does not add a separate island app or overlay.
 
+## Supported features
+
+### Compact Notch & Dual-Activity Mitosis
+
+Adapts Apple’s native `CenterHUD` container to the MacBook’s physical camera housing with outward-rounded vector shoulders, scaled-display subpixel height compensation, and native spring-driven mitosis when a second background activity splits into or merges back from its detached circular `noObstruction` bubble.
+
+<p align="center">
+  <img src="docs/images/compact-notch.png" width="620" alt="Compact Dynamic Notch wrapping a live activity around the MacBook camera cutout" />
+  <br />
+  <img src="docs/images/dual-activity-mitosis.png" width="620" alt="Dual-activity mitosis with primary notched island and detached circular secondary bubble" />
+</p>
+
+### Now Playing (`MediaRemoteUIService`)
+
+Re-aligns Apple’s native `NowPlayingUI` expanded platter around the notch without replacing controls or artwork views: album art sits in the left wing with a `12pt` clearance from the camera housing, track/artist metadata and the live audio waveform center vertically on the artwork, and the scrubber leading/trailing edges align with the artwork and waveform.
+
+<p align="center">
+  <img src="docs/images/music-now-playing.png" width="620" alt="Expanded Now Playing platter inside the MacBook Dynamic Notch" />
+</p>
+
+### Clock — Timer, Alarm & Stopwatch (`ClockAngel`)
+
+Widens `ClockAngel`’s `IntegratedViewGroup_V1` expanded hosts (`TimerHost`, `AlarmHost`, and `StopwatchHost`) from the stock `260pt` cap to `522pt` (`150pt` per wing around a `222×40pt` canonical cutout), placing dual `84×38pt` controls in the left wing and preserving a `120pt` centered-baseline right-wing budget so multi-hour `H:MM:SS` timers, snoozed alarms, and stopwatches fit cleanly.
+
+<p align="center">
+  <img src="docs/images/clock-timer.png" width="620" alt="Expanded Clock timer countdown with left-wing controls and unclipped H:MM:SS digits" />
+</p>
+
+### Live Activities & iPhone Continuity (`ActivityUIServices`)
+
+Rewrites `SystemApertureMetricsRequest` archives at the `FBSSceneSettings` boundary from `MenuBarAgent`’s floating-pill `374pt @ 0.80x` (`299.2pt` scaled) request to full notched wing width (`470pt` at crisp `1.0x` scale inside a `540pt` container ceiling), keeping `chronod` archive hashes consistent across compact, minimal, and expanded roles while restoring stock dimensions on external displays.
+
+<p align="center">
+  <img src="docs/images/live-activity.png" width="620" alt="Expanded iPhone Continuity Live Activity rendered at full notched wing width" />
+</p>
+
+### System HUDs & Hosted Notifications
+
+Preserves native requested widths (`309pt` for Volume and Brightness) and corrects hosted-obstruction geometry for system HUD banners and device notifications such as AirPods automatic switching.
+
+<p align="center">
+  <img src="docs/images/system-hud.png" width="620" alt="Native macOS Brightness HUD inside the Dynamic Notch" />
+</p>
+
+### Multi-Display Spotlight (`Campo` / `Siri AI`)
+
+Selects Apple’s hardware Dynamic Island path (`CampoDeviceSupportsCenterHUD() == true`) in-memory inside `Siri AI` so Spotlight grows out of the notch only on displays where `MenuBarAgent` configured a cutout, while opening detached as ordinary Spotlight on external monitors without a notch.
+
 ## Requirements
 
 - Apple Silicon MacBook with a notch.
@@ -86,7 +134,7 @@ The primary background and its detached circle publish their geometry through th
 
 During absorption, the filtered circle and its matching native background layers stop painting before they protrude into the main contour. The original detached background takes over when the circle separates. On the tested Mac with music in the right-hand slot, the sampled frames showed no outline protrusion or flicker when opening and closing either activity. The expanded panel also displayed a test track with a title and no artist below the physical notch.
 
-Expanded activity scenes (`elementView`) preserve side-wing clearance around the physical notch (`notchWidth + 164` floor — 384 points on a 220-point notch — with at least a 504-point maximum ceiling) while keeping Apple's wing-based `BaselineRow` / obstruction geometry intact; detached secondary minimal islands (`noObstruction`) remain unpatched. ClockAngel's expanded Timer, Alarm, and Stopwatch views resolve `BaselineRow` across `_VariadicView.Tree` wrappers and fall back to the physical notch width before frame-0 obstruction propagation settles. Hosted system banners such as the volume and brightness HUD keep the width they request themselves (309 points for volume). The expanded music panel uses Apple’s original artwork, text, waveform, timeline, and controls. As on iPhone, the artwork shares the timeline's leading edge and the waveform its trailing edge; the panel is sized so the artwork sits in the left wing with a 12-point clearance from the camera housing, and the title/artist metadata and waveform are centered vertically on the artwork below the cutout. The outgoing panel retains this layout when its native mode changes to compact during dismissal. The native compact island allocates a trailing music slot when music is the sole activity. With two activities, the second activity occupies its own slot.
+Expanded activity scenes (`elementView`) preserve side-wing clearance around the physical notch (`notchWidth + 164` floor — 384 points on a 220-point notch — with a `notchWidth + 320` maximum ceiling, 540 points on a 220-point notch) while keeping Apple's wing-based `BaselineRow` / obstruction geometry intact; detached secondary minimal islands (`noObstruction`) remain unpatched. To prevent `MenuBarAgent` from clipping wider expanded platters to its iPhone System Aperture `408pt` container cap (`Settings.hostedSceneMetrics.maximumContentWidth`), `island.dylib` registers `HostedSceneMetricsMaximumContentWidth` (`notchWidth + 320`) in `NSRegistrationDomain` purely in-memory while a notched display is active, triggering `SystemSettingsController`'s KVO reload without writing any persistent disk preferences and automatically restoring `408pt` in clamshell / external-only display configurations. General third-party and iPhone Continuity Live Activities (`ActivityUIServices` / `WidgetRenderer_Activities`) also have their `SystemApertureMetricsRequest` rewritten at the `FBSSceneSettings` boundary from `MenuBarAgent`'s floating-pill `374pt @ 0.80x` (`299.2pt` scaled) archive request to full notched wing width (`obstructionWidth + 248` — `470pt` at crisp `1.0x` scale around a `222×40pt` canonical cutout, preserving `104pt` usable wing capacity per side inside Jindo's `20pt` insets) with unified `chronod` archive hashes across compact, minimal, and expanded roles and full native restoration on external non-notched displays. ClockAngel's expanded Timer, Alarm, and Stopwatch `IntegratedViewGroup_V1` hosts read `IntegratedObstruction_V1` directly to widen their scene frame to 522 points (150 points per wing around a 222-point canonical cutout, preserving a 120-point right-wing `BaselineRow` budget for multi-hour `H:MM:SS` timers), resolve `BaselineRow` across `_VariadicView.Tree` wrappers, and propagate the host cutout size on frame 0 before geometry-driven obstruction state settles. Hosted system banners such as the volume and brightness HUD keep the width they request themselves (309 points for volume). The expanded music panel uses Apple’s original artwork, text, waveform, timeline, and controls. As on iPhone, the artwork shares the timeline's leading edge and the waveform its trailing edge; the panel is sized so the artwork sits in the left wing with a 12-point clearance from the camera housing, and the title/artist metadata and waveform are centered vertically on the artwork below the cutout. The outgoing panel retains this layout when its native mode changes to compact during dismissal. The native compact island allocates a trailing music slot when music is the sole activity. With two activities, the second activity occupies its own slot.
 
 The scene-layout accessors (margins, minimum size, obstruction) only appear on `FBSSceneSettings` once FrontBoardServices registers their settings extensions, which Apple does lazily for the first expanded or hosted scene. The patch registers the known extensions itself and re-verifies its hooks after every extension registration, so a late first expansion still receives the notch layout instead of the native pill width.
 
