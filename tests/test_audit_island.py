@@ -34,8 +34,8 @@ class AuditIslandTests(unittest.TestCase):
         starved = {
             "event": "scene_settings",
             "family": "elementView",
-            "client": "com.apple.Sharing.AirDropUI",
-            "elementKind": "airdrop",
+            "client": "com.apple.VoiceMemos",
+            "elementKind": "voicememos",
             "layoutMode": "expanded",
             "notch": {"w": 220.0, "h": 38.0},
             "viewport": {"w": 360.0, "h": 140.0},
@@ -100,6 +100,36 @@ class AuditIslandTests(unittest.TestCase):
         analyzed_la_fixed = audit_island.analyze_scene_record(la_fixed)
         self.assertEqual(analyzed_la_fixed["activityUsableWing"], 104.0)
         self.assertEqual(analyzed_la_fixed["flags"], ["OK"])
+
+    def test_analyze_scene_record_validates_airdrop_card_geometry(self):
+        broken_airdrop = {
+            "event": "scene_settings",
+            "family": "elementView",
+            "client": "com.apple.Sharing.AirDropUI",
+            "elementKind": "AirDropActivityAttributes",
+            "layoutMode": "expanded",
+            "notch": {"w": 220.0, "h": 38.0},
+            "viewport": {"w": 274.0, "h": 194.0},
+            "native": {"min": {"w": 222.0, "h": 38.0}, "max": {"w": 410.0, "h": 1169.0}},
+            "policy": {"extendsBelow": True, "intersects": True, "shortHeight": 0.0},
+            "patched": {
+                "min": {"w": 384.0, "h": 72.0},
+                "max": {"w": 540.0, "h": 1169.0},
+                "margins": {"top": 46.0, "leading": 25.0, "bottom": 25.0, "trailing": 25.0},
+                "canonicalObstructionRect": {"x": 26.0, "y": 0.0, "w": 222.0, "h": 40.0},
+                "publishedObstructionRect": {"x": 26.0, "y": 0.0, "w": 222.0, "h": 40.0},
+            },
+        }
+        analyzed_broken = audit_island.analyze_scene_record(broken_airdrop)
+        self.assertIn("AIRDROP_DEAD_WINGS", analyzed_broken["flags"])
+        self.assertIn("AIRDROP_NOTCH_CLIP", analyzed_broken["flags"])
+        self.assertNotIn("MIN_WING_STARVED", analyzed_broken["flags"])
+
+        fixed_airdrop = json.loads(json.dumps(broken_airdrop))
+        fixed_airdrop["patched"]["min"] = {"w": 274.0, "h": 64.0}
+        fixed_airdrop["patched"]["publishedObstructionRect"]["h"] = 56.0
+        analyzed_fixed = audit_island.analyze_scene_record(fixed_airdrop)
+        self.assertEqual(analyzed_fixed["flags"], ["OK"])
 
     def test_analyze_scene_record_flags_detached_minimal_and_compact_jitter(self):
         detached_minimal = {

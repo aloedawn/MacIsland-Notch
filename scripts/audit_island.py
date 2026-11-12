@@ -23,6 +23,9 @@ DEFAULT_NOTCH_CLEARANCE = 12.0
 # Minimum single-wing content capacity in Expanded B안 (standard 52pt artwork/icon;
 # wider dual-button providers such as ClockAngel negotiate their own 522pt width).
 TARGET_EXPANDED_WING_CONTENT = 52.0
+AIRDROP_CARD_WIDTH = 274.0
+AIRDROP_SHOULDER_SPAN = 54.0
+AIRDROP_OBSTRUCTION_CLEARANCE = 16.0
 
 STOCK_TARGETS: tuple[dict[str, str], ...] = (
     {
@@ -246,6 +249,14 @@ def _as_float(value: Any) -> float | None:
     return None
 
 
+def _is_airdrop_record(record: dict[str, Any]) -> bool:
+    for field in ("client", "elementKind", "persistence"):
+        raw = record.get(field)
+        if raw is not None and "airdrop" in str(raw).lower():
+            return True
+    return False
+
+
 def classify_scene_role(record: dict[str, Any]) -> str:
     if record.get("family") == "hosted":
         return "hosted_banner"
@@ -292,11 +303,14 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
     p_max = patched.get("max") or {}
     p_margins = patched.get("margins") or {}
     canon_obs = patched.get("canonicalObstructionRect") or {}
+    pub_obs = patched.get("publishedObstructionRect") or {}
+    is_airdrop = _is_airdrop_record(record)
 
     min_w = _as_float(p_min.get("w"))
     max_w = _as_float(p_max.get("w"))
     proposal_w = vp_w if (vp_w and vp_w > 0) else min_w
     obs_w = _as_float(canon_obs.get("w")) or (notch_w + 2.0 if notch_w else None)
+    pub_obs_h = _as_float(pub_obs.get("h"))
     lead = _as_float(p_margins.get("leading")) or 0.0
     trail = _as_float(p_margins.get("trailing")) or 0.0
     top = _as_float(p_margins.get("top")) or 0.0
@@ -344,7 +358,20 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
     ):
         flags.append("ACTIVITY_METRICS_STARVED")
     if (
-        family == "elementView"
+        is_airdrop
+        and family == "elementView"
+        and role == "expanded_platter"
+        and (mode == "expanded" or extends_below)
+        and short_h == 0
+    ):
+        airdrop_floor = max(AIRDROP_CARD_WIDTH, (notch_w or 0.0) + AIRDROP_SHOULDER_SPAN)
+        if min_w is not None and min_w > airdrop_floor + 16.0:
+            flags.append("AIRDROP_DEAD_WINGS")
+        if notch_h is not None and (pub_obs_h is None or pub_obs_h < notch_h + AIRDROP_OBSTRUCTION_CLEARANCE):
+            flags.append("AIRDROP_NOTCH_CLIP")
+    if (
+        not is_airdrop
+        and family == "elementView"
         and role == "expanded_platter"
         and (mode == "expanded" or extends_below)
         and short_h == 0
@@ -353,7 +380,8 @@ def analyze_scene_record(record: dict[str, Any]) -> dict[str, Any]:
     ):
         flags.append("MIN_WING_STARVED")
     if (
-        family == "elementView"
+        not is_airdrop
+        and family == "elementView"
         and role == "expanded_platter"
         and mode in {None, "expanded"}
         and extends_below

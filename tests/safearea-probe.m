@@ -633,6 +633,87 @@ int main(void) {
             return 1;
         }
 
+        // AirDropUI (com.apple.Sharing.AirDropUI / AirDropActivityAttributes) on 220x38 notch:
+        // snug 274pt card floor (no 384pt dead black wings), 540pt ceiling for horizontal progress,
+        // +16pt published obstruction clearance (56pt total -> content at 47pt, 9pt clear of 38pt notch),
+        // late identifier hook re-evaluation, compact return to 40pt, and external-display restoration.
+        NSData *airdropMargins = encodeJSON(@{
+            @"top": @12, @"leading": @25, @"bottom": @25, @"trailing": @25
+        });
+        NSValue *airdropMin = [NSValue valueWithSize:NSMakeSize(222, 38)];
+        NSValue *airdropMax = [NSValue valueWithSize:NSMakeSize(410, 1169)];
+        NSValue *airdropSpace = [NSValue valueWithSize:NSMakeSize(274, 194)];
+        NSValue *airdropObs = [NSValue valueWithRect:NSMakeRect(27, 0, 220, 38)];
+
+        NSObject<MacIslandTestSettings> *m16 = [mutableClass new];
+        [m16 setClientIdentifier:@"com.apple.Sharing.AirDropUI"];
+        [m16 setElementKindIdentifier:[@"\"AirDropActivityAttributes\"" dataUsingEncoding:NSUTF8StringEncoding]];
+        [m16 setIntegratedLayoutMode:@3];
+        [m16 setDisplayConfiguration:displayConfigWithID(303)];
+        [m16 setElementViewLayoutMargins:airdropMargins];
+        [m16 setElementViewMinimumSize:airdropMin];
+        [m16 setElementViewMaximumSize:airdropMax];
+        [m16 setIntegratedObstructionRectCoordinateSpace:airdropSpace];
+        [m16 setIntegratedObstructionRect:airdropObs];
+
+        NSSize adMin = [[m16 elementViewMinimumSize] sizeValue];
+        NSSize adMax = [[m16 elementViewMaximumSize] sizeValue];
+        NSRect adObs = [[m16 integratedObstructionRect] rectValue];
+        id<MacIslandTestCornerRadii> adCorners = [m16 integratedObstructionCornerRadii];
+        if (fabs(adMin.width - 274.0) > 0.001 || fabs(adMin.height - 64.0) > 0.001 ||
+            fabs(adMax.width - 540.0) > 0.001 ||
+            fabs(adObs.origin.x - 26.0) > 0.001 || fabs(adObs.size.width - 222.0) > 0.001 ||
+            fabs(adObs.size.height - 56.0) > 0.001 ||
+            !adCorners || fabs([adCorners topLeft]) > 0.001) {
+            fprintf(stderr, "unexpected AirDrop 220pt scene geometry: min=(%.1f,%.1f) max=(%.1f,%.1f) obs=(%.1f,%.1f,%.1f,%.1f)\n",
+                    adMin.width, adMin.height, adMax.width, adMax.height,
+                    adObs.origin.x, adObs.origin.y, adObs.size.width, adObs.size.height);
+            return 1;
+        }
+
+        // Late elementKindIdentifier / clientIdentifier assignment after geometry is already set:
+        NSObject<MacIslandTestSettings> *m17 = [mutableClass new];
+        [m17 setDisplayConfiguration:displayConfigWithID(303)];
+        [m17 setElementViewLayoutMargins:airdropMargins];
+        [m17 setElementViewMinimumSize:airdropMin];
+        [m17 setElementViewMaximumSize:airdropMax];
+        [m17 setIntegratedObstructionRectCoordinateSpace:airdropSpace];
+        [m17 setIntegratedObstructionRect:airdropObs];
+        if (fabs([[m17 elementViewMinimumSize] sizeValue].width - 384.0) > 0.001 ||
+            fabs([[m17 integratedObstructionRect] rectValue].size.height - 40.0) > 0.001) {
+            fprintf(stderr, "expected generic 384pt/40pt geometry before AirDrop identifier arrives\n");
+            return 1;
+        }
+        [m17 setElementKindIdentifier:[@"\"AirDropActivityAttributes\"" dataUsingEncoding:NSUTF8StringEncoding]];
+        if (fabs([[m17 elementViewMinimumSize] sizeValue].width - 274.0) > 0.001 ||
+            fabs([[m17 integratedObstructionRect] rectValue].size.height - 56.0) > 0.001) {
+            fprintf(stderr, "late setElementKindIdentifier: failed to switch scene to AirDrop card geometry\n");
+            return 1;
+        }
+
+        // Compact transition after mutableCopy returns obstruction height to canonical 40pt:
+        NSObject *frozen16 = [m16 copy];
+        NSObject<MacIslandTestSettings> *m18 = [frozen16 mutableCopy];
+        [m18 setIntegratedLayoutMode:@2];
+        [m18 setElementViewMaximumSize:[NSValue valueWithSize:NSMakeSize(127, 38)]];
+        [m18 setIntegratedObstructionRectCoordinateSpace:[NSValue valueWithSize:NSMakeSize(127, 38)]];
+        if (fabs([[m18 integratedObstructionRect] rectValue].size.height - 40.0) > 0.001) {
+            fprintf(stderr, "compact AirDrop wing failed to restore canonical 40pt obstruction height\n");
+            return 1;
+        }
+
+        // External display restoration after mutableCopy:
+        NSObject<MacIslandTestSettings> *m19 = [frozen16 mutableCopy];
+        [m19 setDisplayConfiguration:displayConfigWithID(202)];
+        if (![[m19 elementViewLayoutMargins] isEqualToData:airdropMargins] ||
+            !NSEqualSizes([[m19 elementViewMinimumSize] sizeValue], airdropMin.sizeValue) ||
+            !NSEqualSizes([[m19 elementViewMaximumSize] sizeValue], airdropMax.sizeValue) ||
+            !NSEqualRects([[m19 integratedObstructionRect] rectValue], airdropObs.rectValue) ||
+            [m19 integratedObstructionCornerRadii] != nil) {
+            fprintf(stderr, "AirDrop scene failed full native restoration on external display\n");
+            return 1;
+        }
+
         // Clamshell / external non-notched only -> passively wake suite KVO (408.0) without requiring a prior read,
         // strip registered key (nil), and keep unrelated registered keys intact.
         fakeScreens = @[external];

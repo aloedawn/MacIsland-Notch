@@ -17,6 +17,13 @@ static const CGFloat MacIslandNotchFlare = 6;
 static const CGFloat MacIslandShortContentClearance = 14;
 // Keep room for native controls even before the Clock UI provider is patched.
 static const CGFloat MacIslandShortPanelClearance = 6;
+// AirDropUI's ObstructionClearingWidthLayout sizes vertical share/failure cards to 274pt
+// (224pt content + 25pt horizontal margins), while LowersBelowObstructionLayout places
+// top icons/previews at CGRectGetMaxY(integratedObstructionRect) - 9pt (tucked for iPhone's
+// pill optical gap, which clips 7pt into a 38pt solid MacBook camera bezel).
+static const CGFloat MacIslandAirDropCardWidth = 274;
+static const CGFloat MacIslandAirDropShoulderSpan = 54;
+static const CGFloat MacIslandAirDropObstructionClearance = 16;
 // MenuBarAgent's CenterHUD clamps expanded hosted/element containers to 408pt
 // (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden.
 #define MacIslandHostedMaxContentWidthKey @"HostedSceneMetricsMaximumContentWidth"

@@ -71,6 +71,16 @@ class SafeAreaSettingsTests(unittest.TestCase):
                 and r.get("patched", {}).get("applied") is False
                 for r in records
             ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.Sharing.AirDropUI"
+                and r.get("elementKind") == "AirDropActivityAttributes"
+                and r.get("layoutMode") == "expanded"
+                and ((r.get("patched") or {}).get("min") or {}).get("w") == 274
+                and ((r.get("patched") or {}).get("max") or {}).get("w") == 540
+                and ((r.get("patched") or {}).get("canonicalObstructionRect") or {}).get("h") == 40
+                and ((r.get("patched") or {}).get("publishedObstructionRect") or {}).get("h") == 56
+                for r in records
+            ))
 
 
 if __name__ == "__main__":

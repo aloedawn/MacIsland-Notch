@@ -1093,6 +1093,13 @@ static const CGFloat MacIslandNotchFlare = 6;
 static const CGFloat MacIslandShortContentClearance = 14;
 // Keep room for native controls even before the Clock UI provider is patched.
 static const CGFloat MacIslandShortPanelClearance = 6;
+// AirDropUI's ObstructionClearingWidthLayout sizes vertical share/failure cards to 274pt
+// (224pt content + 25pt horizontal margins), while LowersBelowObstructionLayout places
+// top icons/previews at CGRectGetMaxY(integratedObstructionRect) - 9pt (tucked for iPhone's
+// pill optical gap, which clips 7pt into a 38pt solid MacBook camera bezel).
+static const CGFloat MacIslandAirDropCardWidth = 274;
+static const CGFloat MacIslandAirDropShoulderSpan = 54;
+static const CGFloat MacIslandAirDropObstructionClearance = 16;
 // MenuBarAgent's CenterHUD clamps expanded hosted/element containers to 408pt
 // (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden.
 #define MacIslandHostedMaxContentWidthKey @"HostedSceneMetricsMaximumContentWidth"
@@ -1550,6 +1557,8 @@ static void (*originalObstruction[2])(id, SEL, id);
 static void (*originalSpace[2])(id, SEL, id);
 static void (*originalCorners[2])(id, SEL, id);
 static void (*originalLocation[2])(id, SEL, id);
+static void (*originalClientIdentifier)(id, SEL, id);
+static void (*originalElementKindIdentifier)(id, SEL, id);
 static void (*originalActivityMetricsData)(id, SEL, id);
 static void (*originalActivityMetricsRequest)(id, SEL, id);
 static void (*originalFrame)(id, SEL, CGRect);
@@ -1753,6 +1762,34 @@ static BOOL isDetachedObstructionLocation(id raw) {
     if ([value isKindOfClass:NSDictionary.class]) return ((NSDictionary *)value)[@"noObstruction"] != nil;
     if ([value isKindOfClass:NSString.class]) return [(NSString *)value isEqualToString:@"noObstruction"];
     return NO;
+}
+static BOOL containsAirDropToken(id value) {
+    if (!value) return NO;
+    if ([value isKindOfClass:NSString.class]) {
+        return [(NSString *)value rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }
+    if ([value isKindOfClass:NSData.class]) {
+        NSString *text = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
+        if (text) {
+            return [text rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        }
+    }
+    if ([value isKindOfClass:NSDictionary.class]) {
+        for (id key in (NSDictionary *)value) {
+            if (containsAirDropToken(key) || containsAirDropToken(((NSDictionary *)value)[key])) return YES;
+        }
+    }
+    if ([value isKindOfClass:NSArray.class]) {
+        for (id item in (NSArray *)value) {
+            if (containsAirDropToken(item)) return YES;
+        }
+    }
+    return NO;
+}
+static BOOL isAirDropScene(id settings) {
+    return containsAirDropToken(existingObjectSetting(settings, @"clientIdentifier")) ||
+           containsAirDropToken(existingObjectSetting(settings, @"elementKindIdentifier")) ||
+           containsAirDropToken(existingObjectSetting(settings, @"persistenceIdentifier"));
 }
 
 // FrontBoardServices creates a fresh FBSMutableSceneSettings copy per update,
@@ -2436,6 +2473,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     NSScreen *targetScreen = displayKnown ? resolvedScreen : fallbackNotchedScreen();
     NSArray<NSScreen *> *candidates = displayKnown ? (resolvedScreen ? @[resolvedScreen] : @[]) : NSScreen.screens;
     BOOL physicalDisplay = MacIslandScreenHasNotch(targetScreen);
+    BOOL airDropScene = isAirDropScene(settings);
     NSRect rects[2] = {NSZeroRect, NSZeroRect};
     NSRect publishedRects[2] = {NSZeroRect, NSZeroRect};
     BOOL detached[2] = {NO, NO};
@@ -2532,6 +2570,25 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
                 if (isfinite(maximum.height)) {
                     maximum.height = MAX(maximum.height, MAX(minimum.height, activitySummary.patchedExpandedMaxH));
                 }
+            } else if (policy.extendsBelow && family == 0 && airDropScene) {
+                // AirDropUI's ObstructionClearingWidthLayout sizes vertical incoming share
+                // and failure cards to 274pt (224pt content + 25pt horizontal margins), so
+                // forcing the generic 384pt wing-activity floor leaves 55pt of empty black
+                // platter per side. Keep a snug 274pt floor (with >=27pt shoulders outside
+                // the notch) while preserving the 540pt ceiling for horizontal progress views.
+                CGFloat width = MAX(MacIslandAirDropCardWidth,
+                                    policy.notchWidth + MacIslandAirDropShoulderSpan);
+                CGFloat floor = MAX(minimum.width + extraX, MIN(width, policy.centeredDisplayWidth));
+                CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+                minimum.width = floor;
+                if (isfinite(maximum.width)) {
+                    maximum.width = MAX(maximum.width + extraX, MAX(minimum.width, ceiling));
+                }
+                CGFloat minExpandedH = rect.size.height + MacIslandAirDropObstructionClearance + 8.0;
+                minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
+                if (isfinite(maximum.height)) {
+                    maximum.height = MAX(maximum.height, minimum.height);
+                }
             } else {
                 minimum.width += extraX;
                 minimum.height = MAX(minimum.height + extraY, shortHeight);
@@ -2583,12 +2640,25 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
         NSRect rect = rects[family];
         NSRect published = detached[family] ? original : rect;
+        if (!detached[family] && family == 0 && airDropScene && snapshots[0].policy.extendsBelow) {
+            // AirDropUI's LowersBelowObstructionLayout places top icons and incoming
+            // previews at CGRectGetMaxY(integratedObstructionRect) - 9pt (tuned for
+            // iPhone's pill optical gap), which clips 7pt behind a solid 38pt MacBook
+            // camera housing. Extending the published expanded obstruction height by
+            // 16pt shifts AirDrop content cleanly below the physical notch while
+            // preserving native SwiftUI hit-testing on Decline/Accept controls.
+            published.size.height += MacIslandAirDropObstructionClearance;
+        }
         publishedRects[family] = published;
         void (*setRect)(id, SEL, id) = originalObstruction[family];
         BOOL corrected = !detached[family] && native.rect != nil && !NSEqualRects(published, original);
         if (setRect && (corrected || native.obstructionApplied)) {
             id value = corrected ? layoutPayload([NSValue valueWithRect:published], native.rect) : native.rect;
             setRect(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), value);
+            if (corrected) {
+                id stored = rawObjectSetting(settings, obstructionSetting(family, @"Rect"));
+                if (stored && stored != native.rect) layoutPayload(stored, native.rect);
+            }
         }
         native.obstructionApplied = corrected;
         void (*setter)(id, SEL, id) = originalCorners[family];
@@ -2664,6 +2734,18 @@ static void setFamilyCorners(id settings, SEL selector, id value, NSUInteger fam
 }
 static void setFamilyLocation(id settings, SEL selector, id value, NSUInteger family) {
     originalLocation[family](settings, selector, value);
+    if (!settingsHaveTrackedValues(settings)) return;
+    MacIslandSceneInsets *state = sceneState(settings);
+    refreshSceneInsets(settings, state);
+}
+static void setClientIdentifier(id settings, SEL selector, id value) {
+    originalClientIdentifier(settings, selector, value);
+    if (!settingsHaveTrackedValues(settings)) return;
+    MacIslandSceneInsets *state = sceneState(settings);
+    refreshSceneInsets(settings, state);
+}
+static void setElementKindIdentifier(id settings, SEL selector, id value) {
+    originalElementKindIdentifier(settings, selector, value);
     if (!settingsHaveTrackedValues(settings)) return;
     MacIslandSceneInsets *state = sceneState(settings);
     refreshSceneInsets(settings, state);
@@ -2795,6 +2877,8 @@ static BOOL installContentInsetsHooksLocked(void) {
     // optional or base FBSSceneSettings accessors: hook them when present without blocking readiness.
     replaceObjectSetter(cls, @"setIntegratedObstructionLocation:", (IMP)setLocationElement, &originalLocation[0]);
     replaceObjectSetter(cls, @"setHostedIntegratedObstructionLocation:", (IMP)setLocationHosted, &originalLocation[1]);
+    replaceObjectSetter(cls, @"setClientIdentifier:", (IMP)setClientIdentifier, &originalClientIdentifier);
+    replaceObjectSetter(cls, @"setElementKindIdentifier:", (IMP)setElementKindIdentifier, &originalElementKindIdentifier);
     replaceObjectSetter(cls, @"setMetrics:", (IMP)setActivityMetricsData, &originalActivityMetricsData);
     replaceObjectSetter(cls, @"setMetricsRequest:", (IMP)setActivityMetricsRequest, &originalActivityMetricsRequest);
     replaceObjectSetter(cls, @"setDisplayConfiguration:", (IMP)setDisplayConfiguration, &originalDisplayConfiguration);
