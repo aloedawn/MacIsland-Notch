@@ -53,7 +53,7 @@ Uses Apple’s hardware Dynamic Island path on displays with a notch while keepi
 ## Requirements
 
 - Apple Silicon MacBook with a notch
-- **macOS 27.3 beta, build `26C5035r`** (other builds are rejected)
+- **macOS 27.3 beta, build `26C5035r` or `26C5047e`** (other builds are rejected)
 - Xcode / Apple developer tools with arm64e Swift compiler and macOS 27.2 SDK or later
 - SIP disabled (`amfi_get_out_of_my_way=0x1` is **not** required)
 

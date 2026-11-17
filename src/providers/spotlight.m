@@ -18,7 +18,7 @@
 // inside Siri AI selects Apple's hardware path without changing global
 // MobileGestalt answers or hooking any method.
 //
-// On 26C5035r the cached fast path is:
+// On 26C5035r and 26C5047e the cached fast path is:
 //   adrp x8, sOnce@PAGE;  ldr x8, [x8, sOnce@PAGEOFF]; cmn x8, #1; b.ne slow
 //   adrp x8, sSupports@PAGE; ldrb w0, [x8, sSupports@PAGEOFF]; ret
 static atomic_int state;
@@ -68,7 +68,7 @@ int mi_spotlight_patch(void) {
 int mi_spotlight_enable(void) {
     char build[64] = {0};
     size_t size = sizeof(build);
-    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || strcmp(build, "26C5035r") ||
+    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || (strcmp(build, "26C5035r") && strcmp(build, "26C5047e")) ||
         ![NSBundle.mainBundle.executablePath isEqualToString:@"/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"])
         return -1;
     atomic_store(&state, mi_spotlight_patch());

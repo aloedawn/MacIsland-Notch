@@ -25,7 +25,7 @@ class SpotlightSourceParityTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "darwin" and platform.machine() == "arm64"
-                     and current_build() == "26C5035r", "requires macOS 27.3 beta 26C5035r")
+                     and current_build() in ("26C5035r", "26C5047e"), "requires macOS 27.3 beta 26C5035r or 26C5047e")
 class SpotlightSupportTests(unittest.TestCase):
     def test_patch_selects_the_hardware_cutout_path_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp:

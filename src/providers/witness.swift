@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 import SwiftUI
 
-let supportedOSBuild = "26C5035r"
+let supportedOSBuilds: Set<String> = ["26C5035r", "26C5047e"]
 
 @_silgen_name("mi_call_metadata_accessor") func callMetadataAccessor(
   _ rawFunction: UnsafeRawPointer, _ request: UInt
@@ -57,7 +57,7 @@ func rightBuild() -> Bool {
   var value = [CChar](repeating: 0, count: 64)
   var size = value.count
   return sysctlbyname("kern.osversion", &value, &size, nil, 0) == 0
-    && String(cString: value) == supportedOSBuild
+    && supportedOSBuilds.contains(String(cString: value))
 }
 
 func cutoutScreen(_ size: CGSize) -> NSScreen? {

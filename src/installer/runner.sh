@@ -30,9 +30,10 @@ trap 'exit 143' TERM
 
 if [[ "$MODE" != --uninstall ]]; then
   [[ "$(uname -m)" == arm64 ]] || { echo "Apple Silicon only" >&2; exit 1; }
-  [[ "$(sw_vers -buildVersion)" == 26C5035r ]] || {
-    echo "Supported build: macOS 27.3 beta 26C5035r only." >&2; exit 1;
-  }
+  case "$(sw_vers -buildVersion)" in
+    26C5035r|26C5047e) ;;
+    *) echo "Supported builds: macOS 27.3 beta 26C5035r and 26C5047e only." >&2; exit 1 ;;
+  esac
   xcode-select -p >/dev/null 2>&1 || {
     echo "Install Apple developer tools first (Xcode or: xcode-select --install)." >&2; exit 1;
   }
