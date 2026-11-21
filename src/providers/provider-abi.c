@@ -130,7 +130,6 @@ bool mi_is_optional_some(const void *enum_addr, const void *wrapped_metadata) {
     return get_tag(enum_addr, 1, wrapped_metadata) == 0;
 }
 
-#ifdef MACISLAND_TESTING
 extern const void *swift_getTypeByMangledNameInContext2(
     const char *typeNameStart, size_t typeNameLength,
     const void *context, const void *const *genericArgs);
@@ -140,6 +139,7 @@ const void *mi_get_type_by_mangled_name(const char *start, size_t len) {
     return swift_getTypeByMangledNameInContext2(start, len, NULL, NULL);
 }
 
+#ifdef MACISLAND_TESTING
 void mi_store_optional_tag(void *enum_addr, unsigned which_case, const void *wrapped_metadata) {
     if (!enum_addr || !wrapped_metadata) return;
     const uint8_t *vwt = auth_vwt(wrapped_metadata);
@@ -164,8 +164,9 @@ extern void mi_clock_body_3(void);
 extern void mi_clock_body_4(void);
 extern void mi_clock_body_5(void);
 extern void mi_clock_body_6(void);
+extern void mi_banner_body(void);
 
-static void (*const mi_witness_entries[7])(void) = {
+static void (*const mi_witness_entries[8])(void) = {
     mi_surface_body,
     mi_clock_body_1,
     mi_clock_body_2,
@@ -173,12 +174,13 @@ static void (*const mi_witness_entries[7])(void) = {
     mi_clock_body_4,
     mi_clock_body_5,
     mi_clock_body_6,
+    mi_banner_body,
 };
 
-__attribute__((visibility("hidden"))) uintptr_t mi_saved_bodies[7];
+__attribute__((visibility("hidden"))) uintptr_t mi_saved_bodies[8];
 
 uintptr_t mi_prepare_witness_body(uint32_t index, uintptr_t *slot, uint32_t discriminator) {
-    if (index >= 7) return 0;
+    if (index >= 8) return 0;
     void (*entry)(void) = mi_witness_entries[index];
 #if __has_feature(ptrauth_calls)
     uintptr_t context = ptrauth_blend_discriminator(slot, discriminator);

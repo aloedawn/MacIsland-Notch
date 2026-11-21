@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 MODE, SOURCE = sys.argv[1], Path(sys.argv[2])
 ROOT = Path.home() / 'Library/MacIsland'
@@ -16,9 +17,11 @@ STATE = BACKUP / 'state.plist'
 DOMAIN = f'gui/{os.getuid()}'
 MENU_SERVICE = f'{DOMAIN}/com.apple.MenuBarAgent'
 ALLOW_UNVERIFIED_ENV = 'MACISLAND_ALLOW_UNVERIFIED_BUILD'
+MENUBAR_GROUP_CONTAINER = Path.home() / 'Library/Group Containers/com.apple.MenuBar'
+MENUBAR_GROUP_DOMAIN = str(MENUBAR_GROUP_CONTAINER / 'Library/Preferences/com.apple.MenuBar')
 PREFERENCES = [
-    (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'ShowSoftwareNotch', False),
-    (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'EmulateCenterHUD', True),
+    (MENUBAR_GROUP_DOMAIN, 'ShowSoftwareNotch', False),
+    (MENUBAR_GROUP_DOMAIN, 'EmulateCenterHUD', True),
     ('com.apple.campo', 'SupportsIslandMitosis', True),
 ]
 FILES = {'island.dylib': ROOT / 'island.dylib', 'loader.py': ROOT / 'loader.py', 'agent.plist': AGENT}
@@ -26,13 +29,47 @@ MUSIC = ROOT / 'notch-music.dylib'
 FILES[MUSIC.name] = MUSIC
 AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error.log',
                                       'loader-state.json', 'loader-state.json.next')]
-# Login and periodic check: patch only service instances that are not yet patched.
+# Fallback interval when LaunchAgent watcher detects missed events.
 CHECK_INTERVAL = 30
+WATCHER_THROTTLE_INTERVAL = 10
 
 
 def allow_unverified_build(env=None):
     source = os.environ if env is None else env
     return source.get(ALLOW_UNVERIFIED_ENV, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def sip_filesystem_protected():
+    result = run('/usr/bin/csrutil', 'status', required=False)
+    if result.returncode != 0:
+        return False
+    text = result.stdout.decode('utf-8', 'replace')
+    if re.search(r'status:\s*disabled', text, re.IGNORECASE):
+        return False
+    if re.search(r'Filesystem Protections:\s*disabled', text, re.IGNORECASE):
+        return False
+    return bool(
+        re.search(r'Filesystem Protections:\s*enabled', text, re.IGNORECASE)
+        or re.search(r'status:\s*enabled', text, re.IGNORECASE)
+    )
+
+
+def group_container_accessible():
+    try:
+        if not MENUBAR_GROUP_CONTAINER.exists():
+            return True
+        return os.access(MENUBAR_GROUP_CONTAINER, os.R_OK | os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def active_preferences():
+    if not sip_filesystem_protected() or group_container_accessible():
+        return PREFERENCES
+    return [
+        ('com.apple.MenuBarAgent' if domain == PREFERENCES[0][0] else domain, key, value)
+        for domain, key, value in PREFERENCES
+    ]
 
 
 def run(*args, required=True):
@@ -102,7 +139,7 @@ def save_original():
     state = {'version': 1, 'files': {}, 'preferences': [],
              'auxiliary_existed': {p.name: p.exists() for p in AUXILIARY}}
     # Read every setting before creating or modifying installation state.
-    for domain, key, _ in PREFERENCES:
+    for domain, key, _ in active_preferences():
         state['preferences'].append({'domain': domain, 'key': key, **preference(domain, key)})
     BACKUP.mkdir(parents=True, mode=0o700)
     try:
@@ -201,7 +238,7 @@ def snapshot_current():
         if exists:
             copy_entry(path, folder / name)
     preferences = [
-        (domain, key, preference(domain, key)) for domain, key, _ in PREFERENCES
+        (domain, key, preference(domain, key)) for domain, key, _ in active_preferences()
     ]
     return snapshot, preferences
 
@@ -230,9 +267,10 @@ def restore_previous(previous, stopped_spotlight=False):
 def agent_definition():
     definition = {
         'Label': 'com.macisland.loader',
-        'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure'],
+        'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--watch'],
         'RunAtLoad': True,
-        'StartInterval': CHECK_INTERVAL,
+        'KeepAlive': True,
+        'ThrottleInterval': WATCHER_THROTTLE_INTERVAL,
         'ProcessType': 'Background',
         'StandardOutPath': str(ROOT / 'loader.log'),
         'StandardErrorPath': str(ROOT / 'loader-error.log'),
@@ -252,6 +290,13 @@ def reload_running_spotlight(*, stopped=False, ensure=True):
                 return
         run('/bin/launchctl', 'kickstart', '-k', service)
         if ensure:
+            for _ in range(20):
+                restarted = run('/bin/launchctl', 'print', service, required=False)
+                if restarted.returncode == 0 and re.search(
+                    rb'^\s*pid = [1-9]\d*\s*$', restarted.stdout, re.MULTILINE
+                ):
+                    break
+                time.sleep(0.15)
             run('/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure', '--wait')
     except (OSError, subprocess.CalledProcessError) as error:
         # The island is installed even if this optional consumer cannot reload.
@@ -271,7 +316,7 @@ def install():
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
         replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)
-        for domain, key, value in PREFERENCES:
+        for domain, key, value in active_preferences():
             write_preference(domain, key, {'present': True, 'value': value})
         # Apply synchronously first; the island must load. Provider layouts
         # are optional and only reported if they cannot be applied.

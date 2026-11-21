@@ -109,6 +109,9 @@ static inline MacIslandNativeMaskObserver *MacIslandObserverMergeInput(MacIsland
     return input;
 }
 
+// Presentation modifier helpers (mask-modifiers.m)
+__attribute__((visibility("hidden"))) MacIslandNativeMaskObserver *MacIslandModelMaskObserver(CALayer *layer);
+
 // Geometry & layer inspection helpers (mask-geometry.m)
 __attribute__((visibility("hidden"))) CGPathRef MacIslandNotchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY);
 __attribute__((visibility("hidden"))) BOOL MacIslandIsOpaqueBlack(CGColorRef color);

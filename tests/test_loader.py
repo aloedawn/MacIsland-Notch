@@ -223,6 +223,23 @@ class MusicProviderTests(unittest.TestCase):
             any("mi_set_allow_unverified_build" in " ".join(cmd) for cmd in self.last_lldb_commands)
         )
 
+    def test_lldb_expr_uses_casts_without_top_level_extern_or_module_import(self):
+        for build, env in ((loader.SUPPORTED_BUILDS[0], {loader.ALLOW_UNVERIFIED_ENV: ""}),
+                           ("99A999", {loader.ALLOW_UNVERIFIED_ENV: "1"})):
+            with patch.dict(os.environ, env, clear=False):
+                self.assertEqual(self.prepare(["1"], build=build, env=env), "123")
+            expr_args = [
+                arg for cmd in self.last_lldb_commands for arg in cmd
+                if arg.startswith("expr ")
+            ]
+            self.assertTrue(expr_args)
+            for expr in expr_args:
+                self.assertIn("(void *)dlopen(", expr)
+                self.assertIn("(void *)dlsym(", expr)
+                self.assertIn("(int)dlclose(", expr)
+                self.assertNotIn('extern "C"', expr)
+                self.assertNotIn("@import Darwin", expr)
+
     def test_redirected_music_library_is_rejected_before_contacting_the_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "other.dylib"
@@ -268,7 +285,7 @@ class StrategyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             library = Path(scratch) / "island.dylib"
             library.touch()
-            state = {"music": "77@t", "clock": "88@t", "spotlight": None}
+            state = {"music": "77@t", "clock": "88@t", "spotlight": None, "banner": None}
             with patch.object(loader, "LIBRARY", str(library)), \
                  patch.object(loader, "require_supported_build"), \
                  patch.object(loader, "amfi_globally_disabled", return_value=False), \
@@ -279,13 +296,14 @@ class StrategyTests(unittest.TestCase):
                  patch.object(loader, "music_pid", return_value="77"), \
                  patch.object(loader, "clock_pid", return_value="88"), \
                  patch.object(loader, "spotlight_pid", return_value=None), \
+                 patch.object(loader, "banner_pid", return_value=None), \
                  patch.object(loader, "process_identity", side_effect=lambda pid: pid and f"{pid}@t"), \
                  patch.object(loader, "prepare_music_safely") as prep_music, \
                  patch.object(loader, "prepare_background_safely", return_value=None) as prep_bg, \
                  patch.object(loader, "debugger_load", return_value=456):
                 loader.inject(state, only_unpatched_providers=True, launch_music=False)
             prep_music.assert_not_called()
-            self.assertEqual([call.args[2] for call in prep_bg.call_args_list], ["spotlight"])
+            self.assertEqual([call.args[2] for call in prep_bg.call_args_list], ["spotlight", "banner"])
             self.assertEqual(state["menubar"], "456@t")
             self.assertEqual(state["music"], "77@t")
             self.assertEqual(state["clock"], "88@t")
@@ -339,6 +357,7 @@ class StrategyTests(unittest.TestCase):
                  patch.object(loader, "menu_bar_agent_pid", return_value=123), \
                  patch.object(loader, "clock_pid", return_value=None), \
                  patch.object(loader, "spotlight_pid", return_value=None), \
+                 patch.object(loader, "banner_pid", return_value=None), \
                  patch.object(loader, "process_identity", side_effect=lambda pid: pid and f"{pid}@t"), \
                  patch.object(loader, "prepare_music", side_effect=music) as prepare, \
                  patch.object(loader, "debugger_load", return_value=456) as debugger, \
@@ -375,6 +394,7 @@ class EnsureTests(unittest.TestCase):
                      patch.object(loader, "music_pid", return_value="2"), \
                      patch.object(loader, "clock_pid", return_value=None), \
                      patch.object(loader, "spotlight_pid", return_value="3"), \
+                     patch.object(loader, "banner_pid", return_value=None), \
                      patch.object(loader, "process_identity",
                                   side_effect=lambda pid: {1: menubar, "2": music, "3": spotlight}.get(pid)), \
                      patch.object(loader, "find_lldb", return_value="/test/lldb"), \
@@ -461,6 +481,7 @@ class EnsureTests(unittest.TestCase):
                  patch.object(loader, "music_pid", return_value=None), \
                  patch.object(loader, "clock_pid", return_value=None), \
                  patch.object(loader, "spotlight_pid", return_value=None), \
+                 patch.object(loader, "banner_pid", return_value=None), \
                  patch("sys.stdout", new=io.StringIO()) as out:
                 loader.print_status(False)
             self.assertIn(f"OS build: {build} (supported)", out.getvalue())
@@ -473,6 +494,7 @@ class EnsureTests(unittest.TestCase):
              patch.object(loader, "music_pid", return_value=None), \
              patch.object(loader, "clock_pid", return_value=None), \
              patch.object(loader, "spotlight_pid", return_value=None), \
+             patch.object(loader, "banner_pid", return_value=None), \
              patch("sys.stdout", new=io.StringIO()) as out:
             loader.print_status(False)
         self.assertIn("OS build: 99A999 (unverified; allowed by MACISLAND_ALLOW_UNVERIFIED_BUILD)", out.getvalue())
@@ -592,11 +614,13 @@ class ManagerTests(unittest.TestCase):
             m.install()
         run.assert_called_once()
         agent = plistlib.loads(m.AGENT.read_bytes())
-        self.assertEqual(agent["ProgramArguments"][-1], "--ensure")
+        self.assertEqual(agent["ProgramArguments"][-1], "--watch")
         self.assertTrue(agent["RunAtLoad"])
-        self.assertEqual(agent["StartInterval"], m.CHECK_INTERVAL)
+        self.assertTrue(agent["KeepAlive"])
+        self.assertEqual(agent["ThrottleInterval"], m.WATCHER_THROTTLE_INTERVAL)
+        self.assertNotIn("StartInterval", agent)
         self.assertEqual((m.ROOT / "island.dylib").read_text(encoding="utf-8"), "new")
-        # The periodic job is loaded only after the synchronous patch succeeded.
+        # The watcher job is loaded only after the synchronous patch succeeded.
         self.assertEqual(self.calls[-2], ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)))
         self.assertEqual(self.calls[-1], ("/bin/launchctl", "print", f"{m.DOMAIN}/com.apple.campo"))
 
@@ -607,10 +631,11 @@ class ManagerTests(unittest.TestCase):
         with patch.object(m.subprocess, "run"), patch("sys.stdout", new=io.StringIO()):
             m.install()
         service = f"{m.DOMAIN}/com.apple.campo"
-        self.assertEqual(self.calls[-4:], [
+        self.assertEqual(self.calls[-5:], [
             ("/bin/launchctl", "bootstrap", m.DOMAIN, str(m.AGENT)),
             ("/bin/launchctl", "print", service),
             ("/bin/launchctl", "kickstart", "-k", service),
+            ("/bin/launchctl", "print", service),
             ("/usr/bin/python3", str(m.ROOT / "loader.py"), "--ensure", "--wait"),
         ])
 
@@ -707,6 +732,34 @@ class ManagerTests(unittest.TestCase):
                 {m.ALLOW_UNVERIFIED_ENV: "1"},
             )
 
+    def test_partial_sip_falls_back_to_menu_bar_agent_preferences(self):
+        m = self.manager
+        partial_sip = subprocess.CompletedProcess(
+            ["/usr/bin/csrutil", "status"], 0,
+            b"System Integrity Protection status: unknown (Custom Configuration).\n"
+            b"\tDebugging Restrictions: disabled\n"
+            b"\tFilesystem Protections: enabled\n",
+            b"",
+        )
+        with patch.object(m, "run", return_value=partial_sip), \
+             patch.object(m, "group_container_accessible", return_value=False):
+            prefs = m.active_preferences()
+        self.assertEqual(
+            prefs,
+            [
+                ("com.apple.MenuBarAgent", "ShowSoftwareNotch", False),
+                ("com.apple.MenuBarAgent", "EmulateCenterHUD", True),
+                ("com.apple.campo", "SupportsIslandMitosis", True),
+            ],
+        )
+        full_off = subprocess.CompletedProcess(
+            ["/usr/bin/csrutil", "status"], 0,
+            b"System Integrity Protection status: disabled.\n",
+            b"",
+        )
+        with patch.object(m, "run", return_value=full_off):
+            self.assertEqual(m.active_preferences(), m.PREFERENCES)
+
     def test_backup_and_restore_preserve_preexisting_symlinks(self):
         m = self.manager
         m.ROOT.mkdir(parents=True)
@@ -724,6 +777,135 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue((m.ROOT / "island.dylib").is_symlink())
         self.assertEqual(os.readlink(m.ROOT / "island.dylib"), str(external_target))
         self.assertEqual(external_target.stat().st_mode & 0o777, 0o600)
+
+
+class DiagnosticsAndWatcherTests(unittest.TestCase):
+    def test_parse_sip_status_variants(self):
+        disabled = loader.parse_sip_status("System Integrity Protection status: disabled.\n")
+        self.assertEqual(disabled["mode"], "disabled")
+        self.assertTrue(disabled["allows_debugging"])
+        self.assertFalse(disabled["filesystem_protected"])
+
+        partial = loader.parse_sip_status(
+            "System Integrity Protection status: unknown (Custom Configuration).\n"
+            "\tDebugging Restrictions: disabled\n"
+            "\tFilesystem Protections: enabled\n"
+        )
+        self.assertEqual(partial["mode"], "partial_debug")
+        self.assertTrue(partial["allows_debugging"])
+        self.assertTrue(partial["filesystem_protected"])
+
+        enabled = loader.parse_sip_status("System Integrity Protection status: enabled.\n")
+        self.assertEqual(enabled["mode"], "enabled")
+        self.assertFalse(enabled["allows_debugging"])
+        self.assertTrue(enabled["filesystem_protected"])
+
+    def test_probe_lldb_attach_outcomes(self):
+        class FakeTarget:
+            pid = 4242
+            def kill(self): pass
+            def wait(self, timeout=None): pass
+
+        with patch.object(loader.subprocess, "Popen", return_value=FakeTarget()), \
+             patch.object(loader.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Process 4242 detached\n", "")):
+            ok, detail = loader.probe_lldb_attach("/test/lldb")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "ok")
+
+        with patch.object(loader.subprocess, "Popen", return_value=FakeTarget()), \
+             patch.object(loader.subprocess, "run", side_effect=subprocess.TimeoutExpired(["lldb"], 15)):
+            ok, detail = loader.probe_lldb_attach("/test/lldb")
+        self.assertFalse(ok)
+        self.assertIn("DevToolsSecurity", detail)
+
+        with patch.object(loader.subprocess, "Popen", return_value=FakeTarget()), \
+             patch.object(loader.subprocess, "run", return_value=subprocess.CompletedProcess([], -4, "", "")):
+            ok, detail = loader.probe_lldb_attach("/test/lldb")
+        self.assertFalse(ok)
+        self.assertIn("signal 4", detail)
+
+    def test_check_install_env_partial_sip_guidance(self):
+        partial_sip = {"mode": "partial_debug", "allows_debugging": True, "filesystem_protected": True, "raw": ""}
+        with patch.object(loader, "parse_sip_status", return_value=partial_sip), \
+             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+             patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": False, "developer_group": False, "ready": False}), \
+             patch("sys.stderr", new=io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                loader.check_install_env()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("DevToolsSecurity -enable", err.getvalue())
+        self.assertIn("_developer", err.getvalue())
+
+        with patch.object(loader, "parse_sip_status", return_value=partial_sip), \
+             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+             patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": True, "developer_group": True, "ready": True}), \
+             patch.object(loader, "probe_lldb_attach", return_value=(True, "ok")):
+            loader.check_install_env()
+
+    def test_doctor_json_and_text_report(self):
+        fake_displays = [{"id": 1, "builtin": True, "width": 1800, "height": 1169, "scale": 2.0, "notch": [220, 38]}]
+        with patch("sys.argv", ["loader.py", "--doctor", "--json"]), \
+             patch.object(loader, "current_build", return_value=loader.SUPPORTED_BUILDS[-1]), \
+             patch.object(loader, "parse_sip_status", return_value={"mode": "disabled", "allows_debugging": True, "filesystem_protected": False, "raw": ""}), \
+             patch.object(loader, "amfi_globally_disabled", return_value=False), \
+             patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": True, "developer_group": True, "ready": True}), \
+             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+             patch.object(loader, "probe_lldb_attach", return_value=(True, "ok")), \
+             patch.object(loader, "detect_displays", return_value=fake_displays), \
+             patch.object(loader, "menu_bar_agent_pid", return_value=123), \
+             patch.object(loader, "music_pid", return_value=None), \
+             patch.object(loader, "clock_pid", return_value=None), \
+             patch.object(loader, "spotlight_pid", return_value=None), \
+             patch.object(loader, "banner_pid", return_value=None), \
+             patch.object(loader, "process_identity", side_effect=lambda pid: pid and f"{pid}@t"), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            loader.main()
+        payload = loader.json.loads(out.getvalue())
+        self.assertEqual(payload["os_build"], loader.SUPPORTED_BUILDS[-1])
+        self.assertEqual(payload["displays"], fake_displays)
+        self.assertEqual(payload["lldb_probe"], {"ok": True, "detail": "ok"})
+        self.assertIn("banner", payload["providers"])
+
+    def test_watch_parses_frontboard_events_and_debounces(self):
+        self.assertEqual(
+            loader.parse_connected_provider("Client process connected: [app<application.com.apple.ClockAngel.1(502)>:99]"),
+            "clock",
+        )
+        self.assertEqual(
+            loader.parse_connected_provider("Client process connected: [osservice<com.apple.controlcenter(502)>:1298]"),
+            "banner",
+        )
+        self.assertIsNone(
+            loader.parse_connected_provider("Client process connected: [app<application.com.example.App(502)>:55]")
+        )
+
+        read_fd, write_fd = os.pipe()
+        read_file = os.fdopen(read_fd, "r", encoding="utf-8")
+        write_file = os.fdopen(write_fd, "w", encoding="utf-8")
+        write_file.write("Client process connected: [app<application.com.apple.ClockAngel(502)>:77]\n")
+        write_file.write("Client process connected: [app<application.com.apple.MediaRemoteUIService(502)>:78]\n")
+        write_file.close()
+
+        class FakeStream:
+            def __init__(self, stdout):
+                self.stdout = stdout
+                self.terminated = False
+            def terminate(self):
+                self.terminated = True
+            def wait(self, timeout=None):
+                return 0
+
+        fake_stream = FakeStream(read_file)
+        try:
+            with patch.object(loader.subprocess, "Popen", return_value=fake_stream), \
+                 patch.object(loader, "ensure") as ensure_mock:
+                loader.watch(fallback_interval=0.05, debounce=0.05, max_cycles=1)
+        finally:
+            read_file.close()
+
+        # Startup ensure(wait=True) + single debounced ensure() for both lines
+        self.assertEqual(ensure_mock.call_count, 2)
+        self.assertTrue(fake_stream.terminated)
 
 
 if __name__ == "__main__":

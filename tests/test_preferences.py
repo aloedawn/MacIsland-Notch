@@ -55,6 +55,12 @@ class PreferenceTests(unittest.TestCase):
             "defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer(domain, "
             f"$.NSURL.fileURLWithPathIsDirectory($({json.dumps(str(self.campo))}), true));",
         )
+        source = replace_exact(
+            source,
+            "defaults = $.NSUserDefaults.alloc.initWithSuiteName('com.apple.MenuBarAgent');",
+            "defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer('com.apple.MenuBarAgent', "
+            f"$.NSURL.fileURLWithPathIsDirectory($({json.dumps(str(self.home))}), true));",
+        )
         self.assertNotIn(str(Path.home()), source)
         self.helper = root / "preferences.js"
         self.helper.write_text(source, encoding="utf-8")
@@ -136,6 +142,20 @@ class PreferenceTests(unittest.TestCase):
             self.invoke("com.apple.campo", "SupportsIslandMitosis"),
             {"present": True, "value": True},
         )
+
+    def test_menu_bar_agent_fallback_domain_roundtrip_and_unrelated_keys(self):
+        agent_plist = self.home / "Library/Preferences/com.apple.MenuBarAgent.plist"
+        agent_plist.parent.mkdir(parents=True, exist_ok=True)
+        agent_plist.write_bytes(plistlib.dumps({"UnrelatedAgentKey": "keep"}))
+        self.assertEqual(self.invoke("com.apple.MenuBarAgent", "EmulateCenterHUD"), {"present": False})
+        saved = {"present": True, "value": True}
+        self.assertEqual(self.invoke("com.apple.MenuBarAgent", "EmulateCenterHUD", saved), saved)
+        self.assertEqual(self.invoke("com.apple.MenuBarAgent", "EmulateCenterHUD"), saved)
+        self.assertEqual(
+            self.invoke("com.apple.MenuBarAgent", "EmulateCenterHUD", {"present": False}),
+            {"present": False},
+        )
+        self.assertEqual(plistlib.loads(agent_plist.read_bytes()), {"UnrelatedAgentKey": "keep"})
 
     def test_unrelated_domains_and_keys_are_refused(self):
         self.invoke(self.domain, "UnrelatedValue", required=False)

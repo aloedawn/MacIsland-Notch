@@ -38,9 +38,9 @@ Upgrades shrunken floating-pill Live Activities to full notched width (`470pt` a
   <img src="docs/images/live-activity.png" width="620" alt="Expanded iPhone Continuity Live Activity rendered at full notched wing width" />
 </p>
 
-### System HUDs, AirDrop & Hosted Notifications
+### System HUDs, Battery Banners, AirDrop & Hosted Notifications
 
-Preserves native widths for Volume/Brightness HUDs (`309pt`), fixes hosted AirPods notification geometry, and keeps `AirDropUI` incoming share cards snug (`274pt`) with top previews pushed below the camera cutout.
+Preserves native widths for Volume/Brightness HUDs (`309pt`), widens `ControlCenter` charging (`220pt`) and low-battery (`300pt`) banners to wrap cleanly around the camera housing, fixes hosted AirPods notification geometry, and keeps `AirDropUI` incoming share cards snug (`274pt`) with top previews pushed below the camera cutout.
 
 <p align="center">
   <img src="docs/images/system-hud.png" width="620" alt="Native macOS Brightness HUD inside the Dynamic Notch" />
@@ -48,14 +48,14 @@ Preserves native widths for Volume/Brightness HUDs (`309pt`), fixes hosted AirPo
 
 ### Multi-Display Spotlight (`Campo` / `Siri AI`)
 
-Uses Apple’s hardware Dynamic Island path on displays with a notch while keeping Spotlight detached and normal on external monitors.
+Uses Apple’s hardware Dynamic Island path on displays with a notch while keeping Spotlight detached and normal on external monitors. Top-edge clicks on the flat upper pixel row are forwarded seamlessly into the island window.
 
 ## Requirements
 
 - Apple Silicon MacBook with a notch
 - **macOS 27.3 beta, build `26C5035r` or `26C5047e`** (other builds are rejected by default; set `MACISLAND_ALLOW_UNVERIFIED_BUILD=1` to opt in on an unverified build)
 - Xcode / Apple developer tools with arm64e Swift compiler and macOS 27.2 SDK or later
-- SIP disabled (`amfi_get_out_of_my_way=0x1` is **not** required)
+- SIP debugging disabled (`csrutil enable --without debug` with `sudo DevToolsSecurity -enable` and `_developer` group membership, or `csrutil disable`; `amfi_get_out_of_my_way=0x1` is **not** required)
 
 ## Install
 
@@ -65,7 +65,7 @@ Run as your normal user (**without `sudo`**):
 curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/install.sh | bash
 ```
 
-The installer builds and signs the patch locally under `~/Library/MacIsland`, backs up existing MacIsland files and the three affected preferences, reloads `MenuBarAgent` (plus any running providers), and registers `com.macisland.loader` to keep everything active across logins and process restarts.
+The installer builds and signs the patch locally under `~/Library/MacIsland`, backs up existing MacIsland files and the three affected preferences (falling back cleanly under partial SIP when the MenuBar app group container is protected), reloads `MenuBarAgent` (plus any running providers), and registers an event-driven `com.macisland.loader` watcher (`--watch`) to re-patch newly launched providers immediately without restarting the menu bar.
 
 To test on an unverified macOS build (relying on runtime structural checks and the loader's 3-per-15-minute reapply cap):
 
@@ -75,9 +75,10 @@ curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/insta
 
 ## Usage & Removal
 
-Check loader status or manually reapply provider layouts:
+Run diagnostics or check loader status and manually reapply provider layouts:
 
 ```bash
+/usr/bin/python3 ~/Library/MacIsland/loader.py --doctor
 /usr/bin/python3 ~/Library/MacIsland/loader.py --status
 /usr/bin/python3 ~/Library/MacIsland/loader.py --providers-only
 ```

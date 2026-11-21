@@ -61,6 +61,7 @@ class ClockProviderTests(unittest.TestCase):
                     str(PROVIDERS / "music.swift"),
                     str(PROVIDERS / "music-layout.swift"),
                     str(PROVIDERS / "clock.swift"),
+                    str(PROVIDERS / "banner.swift"),
                     str(HERE / "clock-self-test.swift"),
                     str(abi_o), str(body_o),
                     "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup",

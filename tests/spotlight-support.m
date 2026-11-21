@@ -13,6 +13,7 @@ void mi_clock_body_3(void) {}
 void mi_clock_body_4(void) {}
 void mi_clock_body_5(void) {}
 void mi_clock_body_6(void) {}
+void mi_banner_body(void) {}
 
 int main(void) {
     if (!mi_is_supported_build()) { fprintf(stderr, "supported build rejected\n"); return 1; }

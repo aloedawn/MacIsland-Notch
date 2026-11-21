@@ -32,6 +32,9 @@ function run(args) {
     if (domain === menuBarDomain && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
         storedFile = $(menuBarDomain + '.plist');
         defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer('com.apple.MenuBar', container);
+    } else if (domain === 'com.apple.MenuBarAgent' && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
+        storedFile = container.path.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.stringByAppendingPathComponent('Preferences/com.apple.MenuBarAgent.plist');
+        defaults = $.NSUserDefaults.alloc.initWithSuiteName('com.apple.MenuBarAgent');
     } else if (domain === 'com.apple.campo' && key === 'SupportsIslandMitosis') {
         storedFile = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Preferences/com.apple.campo.plist');
         defaults = $.NSUserDefaults.alloc.initWithSuiteName(domain);
@@ -123,12 +126,14 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 LAUNCHCTL = "/bin/launchctl"
@@ -143,6 +148,7 @@ SUPPORTED_BUILD = SUPPORTED_BUILDS[0]
 MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
 CLOCK_EXE = "/System/Library/CoreServices/ClockAngel.app/Contents/MacOS/ClockAngel"
 SPOTLIGHT_EXE = "/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"
+CONTROLCENTER_EXE = "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
 # Readiness is read through a fresh debugger attachment. Wait progressively,
 # rather than attaching repeatedly while the provider's main queue is busy.
 PROVIDER_READY_DELAYS = (0.15, 0.35, 0.75, 1.5, 2.5)
@@ -151,6 +157,12 @@ MUSIC_READY_DELAYS = PROVIDER_READY_DELAYS
 # crash repeatedly must not turn into an endless restart loop.
 REAPPLY_LIMIT = 3
 REAPPLY_WINDOW = 15 * 60
+WATCH_LOG_PREDICATE = (
+    'process == "MenuBarAgent" AND subsystem == "com.apple.FrontBoard" '
+    'AND eventMessage CONTAINS "Client process connected"'
+)
+WATCH_FALLBACK_INTERVAL = 30.0
+WATCH_DEBOUNCE = 0.2
 
 
 @dataclass(frozen=True)
@@ -177,8 +189,18 @@ PROVIDERS = (
         "spotlight", SPOTLIGHT_EXE, "com.apple.campo", "spotlight_pid",
         stop_notice="Stopped patched Spotlight",
     ),
+    ProviderSpec(
+        "banner", CONTROLCENTER_EXE, "com.apple.controlcenter", "banner_pid",
+    ),
 )
 MANAGED_COMPONENTS = ("menubar", *(spec.name for spec in PROVIDERS))
+PROVIDER_LOG_TOKENS = (
+    ("MediaRemoteUIService", "music"),
+    ("ClockAngel", "clock"),
+    ("com.apple.campo", "spotlight"),
+    ("Siri AI", "spotlight"),
+    ("com.apple.controlcenter", "banner"),
+)
 
 
 def log(message, *, error=False):
@@ -253,6 +275,176 @@ def find_lldb(*, required=True):
         if required:
             raise RuntimeError("LLDB was not found in the selected developer tools")
         return None
+
+
+def parse_sip_status(raw_output=None):
+    # type: (Optional[str]) -> Dict[str, Any]
+    if raw_output is None:
+        try:
+            raw_output = subprocess.check_output(
+                ["/usr/bin/csrutil", "status"], text=True, stderr=subprocess.STDOUT
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raw_output = (error.output or "").strip() if hasattr(error, "output") else ""
+            if not raw_output:
+                return {
+                    "mode": "unknown",
+                    "allows_debugging": False,
+                    "filesystem_protected": True,
+                    "raw": "",
+                }
+    text = raw_output.strip()
+    if re.search(r"status:\s*disabled", text, re.IGNORECASE):
+        return {
+            "mode": "disabled",
+            "allows_debugging": True,
+            "filesystem_protected": False,
+            "raw": text,
+        }
+    if re.search(r"Debugging Restrictions:\s*disabled", text, re.IGNORECASE):
+        fs_disabled = bool(re.search(r"Filesystem Protections:\s*disabled", text, re.IGNORECASE))
+        return {
+            "mode": "partial_debug",
+            "allows_debugging": True,
+            "filesystem_protected": not fs_disabled,
+            "raw": text,
+        }
+    return {
+        "mode": "enabled",
+        "allows_debugging": False,
+        "filesystem_protected": True,
+        "raw": text,
+    }
+
+
+def sip_allows_debugging(raw_output=None):
+    # type: (Optional[str]) -> bool
+    return bool(parse_sip_status(raw_output)["allows_debugging"])
+
+
+def check_debug_access():
+    # type: () -> Dict[str, Any]
+    dev_enabled = False
+    in_group = False
+    dev_raw = ""
+    groups_raw = ""
+    try:
+        dev = subprocess.run(
+            ["/usr/sbin/DevToolsSecurity", "-status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        dev_raw = (dev.stdout or "").strip()
+        dev_enabled = "currently enabled" in dev_raw
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        grp = subprocess.run(["/usr/bin/id", "-Gn"], capture_output=True, text=True, timeout=5)
+        groups_raw = (grp.stdout or "").strip()
+        in_group = "_developer" in groups_raw.split()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        "dev_tools_enabled": dev_enabled,
+        "developer_group": in_group,
+        "ready": dev_enabled and in_group,
+        "dev_tools_status": dev_raw,
+    }
+
+
+def probe_lldb_attach(lldb, *, timeout=15):
+    # type: (str, int) -> Tuple[bool, str]
+    target = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        try:
+            with tempfile.TemporaryDirectory(prefix="macisland-lldb-probe-") as scratch:
+                probe = subprocess.run(
+                    [
+                        lldb, "--no-lldbinit", "--batch",
+                        "--attach-pid", str(target.pid),
+                        "-O", f"settings set symbols.clang-modules-cache-path {scratch}/modules",
+                        "--one-line", "process detach",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                "LLDB timed out attaching to a test process; approve the Developer Tools Access "
+                "prompt or enable password-free debugging (`sudo DevToolsSecurity -enable` and "
+                "`_developer` group membership).",
+            )
+        output = probe.stdout or ""
+        if probe.returncode == 0 and "detached" in output:
+            return (True, "ok")
+        if probe.returncode < 0:
+            return (
+                False,
+                f"LLDB terminated with signal {-probe.returncode}; update Xcode or Command Line "
+                "Tools to match macOS 27.",
+            )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        detail = lines[-1] if lines else f"lldb exited with status {probe.returncode}"
+        return (False, detail)
+    finally:
+        try:
+            target.kill()
+        except OSError:
+            pass
+        try:
+            target.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def detect_displays():
+    # type: () -> List[Dict[str, Any]]
+    if sys.platform != "darwin":
+        return []
+    script = """
+ObjC.import('AppKit');
+ObjC.import('CoreGraphics');
+var out = [];
+var screens = $.NSScreen.screens;
+for (var i = 0; i < screens.count; i++) {
+    var s = screens.objectAtIndex(i);
+    var num = ObjC.unwrap(s.deviceDescription.objectForKey('NSScreenNumber'));
+    var id = Number(num || 0);
+    var f = s.frame;
+    var top = Number(s.safeAreaInsets.top);
+    var notch = null;
+    if (top > 0 && s.respondsToSelector('auxiliaryTopLeftArea') && s.respondsToSelector('auxiliaryTopRightArea')) {
+        var l = s.auxiliaryTopLeftArea;
+        var r = s.auxiliaryTopRightArea;
+        var w = Number(r.origin.x) - (Number(l.origin.x) + Number(l.size.width));
+        if (w > 0) notch = [Math.round(w * 100) / 100, Math.round(top * 100) / 100];
+    }
+    out.push({
+        id: id,
+        builtin: Boolean($.CGDisplayIsBuiltin(id)),
+        width: Number(f.size.width),
+        height: Number(f.size.height),
+        scale: Number(s.backingScaleFactor),
+        notch: notch
+    });
+}
+JSON.stringify(out);
+"""
+    try:
+        res = subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        parsed = json.loads(res.stdout or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
 
 
 def process_identity(pid):
@@ -449,6 +641,10 @@ def spotlight_pid():
     return provider_pid(SPOTLIGHT_EXE)
 
 
+def banner_pid():
+    return provider_pid(CONTROLCENTER_EXE)
+
+
 def provider_pid_getter(spec):
     return globals()[spec.pid_getter_name]
 
@@ -532,29 +728,37 @@ def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch)
     allow_unverified = allow_unverified_build()
     # Encode the filesystem bytes, including spaces and quotes, as a C literal.
     path = '"' + ''.join(f'\\x{byte:02x}' for byte in os.fsencode(library)) + '"'
+    # Numeric Darwin dlopen flags (RTLD_NOW=0x2, RTLD_LOCAL=0x4, RTLD_NOLOAD=0x10)
+    # with explicit LLDB call-result casts avoid compiling @import Darwin against
+    # a cold Clang module cache and stay valid inside LLDB's wrapper function body.
     with tempfile.TemporaryDirectory(prefix=f"macisland-{name}-") as scratch:
         def invoke(symbol, load):
             check_pid(pid)
-            expr = f'void *h = dlopen({path}, RTLD_NOLOAD | RTLD_NOW); bool resident = h != 0; '
+            expr = f'void *h = (void *)dlopen({path}, 0x12); bool resident = h != 0; '
             if load:
-                expr += f'if (!h) h = dlopen({path}, RTLD_NOW | RTLD_LOCAL); '
+                expr += f'if (!h) h = (void *)dlopen({path}, 0x6); '
                 if allow_unverified:
                     expr += (
-                        'void (*allow_fn)(int) = h ? (void(*)(int))dlsym(h, "mi_set_allow_unverified_build") : 0; '
+                        'void (*allow_fn)(int) = h ? (void(*)(int))(void *)dlsym(h, "mi_set_allow_unverified_build") : 0; '
                         'if (allow_fn) allow_fn(1); '
                     )
-            expr += (f'int (*fn)(void) = h ? (int(*)(void))dlsym(h, "{symbol}") : 0; '
-                     'int rc = !h ? -101 : (fn ? fn() : -100); if (resident) dlclose(h); (int)rc')
+            expr += (f'int (*fn)(void) = h ? (int(*)(void))(void *)dlsym(h, "{symbol}") : 0; '
+                     'int rc = !h ? -101 : (fn ? fn() : -100); if (resident) (int)dlclose(h); (int)rc')
             result = subprocess.run(
                 [lldb, "--no-lldbinit", "--batch", "--attach-pid", pid,
                  "-O", f"settings set symbols.clang-modules-cache-path {scratch}/modules",
-                 "-o", "expr -l objc++ -- @import Darwin",
-                 "-o", "expr -a true -t 3000000 -l objc++ -- " + expr,
+                 "-o", "expr -a true -t 10000000 -l objc++ -- " + expr,
                  "-o", "process detach"], capture_output=True, text=True, timeout=40,
             )
             match = re.search(r"^\(int\) \$\d+ = (-?\d+)$", result.stdout, re.MULTILINE)
             if result.returncode or not match:
-                raise RuntimeError(f"Could not verify {symbol} in the {name} UI provider: {result.stderr.strip()}")
+                err_text = result.stderr.strip()
+                if not err_text:
+                    err_lines = [line.strip() for line in result.stdout.splitlines() if "error:" in line]
+                    err_text = "; ".join(err_lines) if err_lines else (
+                        result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+                    )
+                raise RuntimeError(f"Could not verify {symbol} in the {name} UI provider: {err_text}")
             return int(match.group(1))
 
         enable_symbol = f"mi_{name}_enable"
@@ -633,9 +837,11 @@ def inject(state, *, force_debugger=False, only_unpatched_providers=False, launc
     legacy = amfi_globally_disabled() and not force_debugger
     lldb = find_lldb(required=not legacy)
     if not legacy:
-        sip = subprocess.check_output(["/usr/bin/csrutil", "status"], text=True)
-        if "status: disabled" not in sip:
-            raise RuntimeError("This loader requires existing disabled SIP")
+        if not sip_allows_debugging():
+            raise RuntimeError(
+                "This loader requires SIP debugging disabled "
+                "(csrutil enable --without debug or csrutil disable)"
+            )
     pid = menu_bar_agent_pid()
     if pid and is_traced(pid):
         raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
@@ -785,10 +991,252 @@ def print_status(force_debugger):
             print(f"Automatic {name} reapplication paused after repeated attempts")
 
 
+def parse_connected_provider(line):
+    # type: (str) -> Optional[str]
+    for token, name in PROVIDER_LOG_TOKENS:
+        if token in line:
+            return name
+    return None
+
+
+def watch(*, fallback_interval=WATCH_FALLBACK_INTERVAL, debounce=WATCH_DEBOUNCE, max_cycles=None):
+    stop_requested = False
+    previous_handlers = {}
+
+    def handle_signal(signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[sig] = signal.signal(sig, handle_signal)
+        except ValueError:
+            pass
+
+    def start_stream():
+        try:
+            return subprocess.Popen(
+                ["/usr/bin/log", "stream", "--style", "compact", "--predicate", WATCH_LOG_PREDICATE],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except OSError:
+            return None
+
+    stream = None
+    try:
+        ensure(wait=True)
+        stream = start_stream()
+        cycles = 0
+        while not stop_requested and (max_cycles is None or cycles < max_cycles):
+            cycles += 1
+            if stream is None or stream.stdout is None:
+                time.sleep(fallback_interval)
+                ensure()
+                if not stop_requested:
+                    stream = start_stream()
+                continue
+            ready, _, _ = select.select([stream.stdout], [], [], fallback_interval)
+            if stop_requested:
+                break
+            if not ready:
+                ensure()
+                continue
+            line = stream.stdout.readline()
+            if not line:
+                try:
+                    stream.terminate()
+                    stream.wait(timeout=2)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                stream = None
+                time.sleep(min(1.0, fallback_interval))
+                ensure()
+                if not stop_requested:
+                    stream = start_stream()
+                continue
+            matched = parse_connected_provider(line) is not None
+            deadline = time.monotonic() + debounce
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                more, _, _ = select.select([stream.stdout], [], [], remaining)
+                if not more:
+                    break
+                extra = stream.stdout.readline()
+                if not extra:
+                    break
+                if parse_connected_provider(extra) is not None:
+                    matched = True
+            if matched:
+                ensure()
+    finally:
+        if stream is not None:
+            try:
+                stream.terminate()
+                stream.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    stream.kill()
+                except OSError:
+                    pass
+        for sig, handler in previous_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except ValueError:
+                pass
+
+
+def doctor_report(*, force_debugger=False, probe_lldb=True):
+    # type: (bool, bool) -> Dict[str, Any]
+    state = load_state()
+    now = time.time()
+    build = current_build()
+    sip = parse_sip_status()
+    globally_disabled = amfi_globally_disabled()
+    debug_access = check_debug_access() if sys.platform == "darwin" else {
+        "dev_tools_enabled": False,
+        "developer_group": False,
+        "ready": False,
+        "dev_tools_status": "",
+    }
+    lldb = find_lldb(required=False)
+    lldb_probe = None
+    if probe_lldb and lldb and sip["allows_debugging"]:
+        ok, detail = probe_lldb_attach(lldb)
+        lldb_probe = {"ok": ok, "detail": detail}
+    displays = detect_displays()
+    menubar = process_identity(menu_bar_agent_pid())
+    providers = {}
+    for spec in PROVIDERS:
+        try:
+            identity = process_identity(provider_pid_getter(spec)())
+        except Exception:
+            identity = None
+        providers[spec.name] = {
+            "identity": identity,
+            "matches_last_recorded": bool(identity) and identity == state.get(spec.name),
+        }
+    paused = []
+    for name in MANAGED_COMPONENTS:
+        recent = [t for t in state.get(f"{name}_attempts", [])
+                  if isinstance(t, (int, float)) and 0 <= now - t < REAPPLY_WINDOW]
+        if state.get(f"{name}_paused") and len(recent) >= REAPPLY_LIMIT:
+            paused.append(name)
+    return {
+        "os_build": build,
+        "build_supported": is_supported_build(build),
+        "allow_unverified_build": allow_unverified_build(),
+        "sip": sip,
+        "amfi_globally_disabled": globally_disabled,
+        "selected_loader": "legacy" if globally_disabled and not force_debugger else "debugger",
+        "debugger": lldb,
+        "debug_access": debug_access,
+        "lldb_probe": lldb_probe,
+        "displays": displays,
+        "menubar": {
+            "identity": menubar,
+            "matches_last_recorded": bool(menubar) and menubar == state.get("menubar"),
+        },
+        "providers": providers,
+        "paused_components": paused,
+    }
+
+
+def print_doctor(*, force_debugger=False, as_json=False, probe_lldb=True):
+    report = doctor_report(force_debugger=force_debugger, probe_lldb=probe_lldb)
+    if as_json:
+        print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+        return
+    if report["build_supported"]:
+        build_note = "supported"
+    elif report["allow_unverified_build"]:
+        build_note = f"unverified; allowed by {ALLOW_UNVERIFIED_ENV}"
+    else:
+        build_note = "unsupported"
+    sip = report["sip"]
+    access = report["debug_access"]
+    print(f"OS build: {report['os_build']} ({build_note})")
+    print(
+        f"SIP mode: {sip['mode']} (allows_debugging={sip['allows_debugging']}, "
+        f"filesystem_protected={sip['filesystem_protected']})"
+    )
+    print(
+        f"Debug access: DevToolsSecurity={access['dev_tools_enabled']}, "
+        f"_developer={access['developer_group']}"
+    )
+    print(f"Debugger: {report['debugger'] or 'not found'}")
+    if report["lldb_probe"] is not None:
+        probe = report["lldb_probe"]
+        print(f"LLDB attach probe: {'ok' if probe['ok'] else 'failed (' + probe['detail'] + ')'}")
+    else:
+        print("LLDB attach probe: skipped (debugging restricted or lldb unavailable)")
+    for d in report["displays"]:
+        notch = f"{d['notch'][0]:g}x{d['notch'][1]:g}pt" if d.get("notch") else "none"
+        kind = "built-in" if d.get("builtin") else "external"
+        print(
+            f"Display {d['id']} ({kind}): {d['width']:g}x{d['height']:g}@{d['scale']:g}x, notch={notch}"
+        )
+    mb = report["menubar"]
+    print(
+        f"MenuBarAgent: {mb['identity'] or 'not running'}; "
+        f"matches last recorded instance: {mb['matches_last_recorded']}"
+    )
+    for spec in PROVIDERS:
+        info = report["providers"][spec.name]
+        print(
+            f"{spec.name.capitalize()} UI provider: {info['identity'] or 'not running'}; "
+            f"matches last recorded instance: {info['matches_last_recorded']}"
+        )
+    for name in report["paused_components"]:
+        print(f"Automatic {name} reapplication paused after repeated attempts")
+
+
+def check_install_env():
+    sip = parse_sip_status()
+    if not sip["allows_debugging"]:
+        print(
+            "SIP debugging restriction must be disabled before installing "
+            "(recommended in Recovery: `csrutil enable --without debug`, or `csrutil disable`). "
+            "No protection settings were changed.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    try:
+        lldb = find_lldb(required=True)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
+    if sip["mode"] == "partial_debug":
+        access = check_debug_access()
+        if not access["ready"]:
+            cmds = []
+            if not access["dev_tools_enabled"]:
+                cmds.append("sudo DevToolsSecurity -enable")
+            if not access["developer_group"]:
+                cmds.append('sudo dseditgroup -o edit -a "$USER" -t user _developer')
+            print(
+                "Partial SIP requires password-free debugging for LLDB attach. Run:\n  "
+                + "\n  ".join(cmds),
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    ok, detail = probe_lldb_attach(lldb)
+    if not ok:
+        print(f"LLDB preflight attach probe failed: {detail}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--status", action="store_true")
+    group.add_argument("--doctor", action="store_true",
+                       help="Run read-only diagnostics for OS build, SIP, LLDB, displays, and providers")
+    group.add_argument("--check-install-env", action="store_true",
+                       help="Verify SIP debugging, developer rights, and LLDB attach capability before installing")
+    group.add_argument("--watch", action="store_true",
+                       help="Watch FrontBoard provider connections and reapply immediately")
     group.add_argument("--ensure", action="store_true",
                        help="Reapply only when MenuBarAgent or a patched UI provider has restarted")
     group.add_argument("--music-only", "--providers-only", dest="music_only", action="store_true",
@@ -825,8 +1273,17 @@ def main():
             file=sys.stderr,
         )
         raise SystemExit(1)
+    if args.check_install_env:
+        check_install_env()
+        return
+    if args.doctor:
+        print_doctor(force_debugger=args.debugger, as_json=args.json)
+        return
     if args.status:
         print_status(args.debugger)
+        return
+    if args.watch:
+        watch()
         return
     if args.ensure:
         ensure(wait=args.wait)
@@ -881,6 +1338,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 MODE, SOURCE = sys.argv[1], Path(sys.argv[2])
 ROOT = Path.home() / 'Library/MacIsland'
@@ -890,9 +1348,11 @@ STATE = BACKUP / 'state.plist'
 DOMAIN = f'gui/{os.getuid()}'
 MENU_SERVICE = f'{DOMAIN}/com.apple.MenuBarAgent'
 ALLOW_UNVERIFIED_ENV = 'MACISLAND_ALLOW_UNVERIFIED_BUILD'
+MENUBAR_GROUP_CONTAINER = Path.home() / 'Library/Group Containers/com.apple.MenuBar'
+MENUBAR_GROUP_DOMAIN = str(MENUBAR_GROUP_CONTAINER / 'Library/Preferences/com.apple.MenuBar')
 PREFERENCES = [
-    (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'ShowSoftwareNotch', False),
-    (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'EmulateCenterHUD', True),
+    (MENUBAR_GROUP_DOMAIN, 'ShowSoftwareNotch', False),
+    (MENUBAR_GROUP_DOMAIN, 'EmulateCenterHUD', True),
     ('com.apple.campo', 'SupportsIslandMitosis', True),
 ]
 FILES = {'island.dylib': ROOT / 'island.dylib', 'loader.py': ROOT / 'loader.py', 'agent.plist': AGENT}
@@ -900,13 +1360,47 @@ MUSIC = ROOT / 'notch-music.dylib'
 FILES[MUSIC.name] = MUSIC
 AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error.log',
                                       'loader-state.json', 'loader-state.json.next')]
-# Login and periodic check: patch only service instances that are not yet patched.
+# Fallback interval when LaunchAgent watcher detects missed events.
 CHECK_INTERVAL = 30
+WATCHER_THROTTLE_INTERVAL = 10
 
 
 def allow_unverified_build(env=None):
     source = os.environ if env is None else env
     return source.get(ALLOW_UNVERIFIED_ENV, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def sip_filesystem_protected():
+    result = run('/usr/bin/csrutil', 'status', required=False)
+    if result.returncode != 0:
+        return False
+    text = result.stdout.decode('utf-8', 'replace')
+    if re.search(r'status:\s*disabled', text, re.IGNORECASE):
+        return False
+    if re.search(r'Filesystem Protections:\s*disabled', text, re.IGNORECASE):
+        return False
+    return bool(
+        re.search(r'Filesystem Protections:\s*enabled', text, re.IGNORECASE)
+        or re.search(r'status:\s*enabled', text, re.IGNORECASE)
+    )
+
+
+def group_container_accessible():
+    try:
+        if not MENUBAR_GROUP_CONTAINER.exists():
+            return True
+        return os.access(MENUBAR_GROUP_CONTAINER, os.R_OK | os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def active_preferences():
+    if not sip_filesystem_protected() or group_container_accessible():
+        return PREFERENCES
+    return [
+        ('com.apple.MenuBarAgent' if domain == PREFERENCES[0][0] else domain, key, value)
+        for domain, key, value in PREFERENCES
+    ]
 
 
 def run(*args, required=True):
@@ -976,7 +1470,7 @@ def save_original():
     state = {'version': 1, 'files': {}, 'preferences': [],
              'auxiliary_existed': {p.name: p.exists() for p in AUXILIARY}}
     # Read every setting before creating or modifying installation state.
-    for domain, key, _ in PREFERENCES:
+    for domain, key, _ in active_preferences():
         state['preferences'].append({'domain': domain, 'key': key, **preference(domain, key)})
     BACKUP.mkdir(parents=True, mode=0o700)
     try:
@@ -1075,7 +1569,7 @@ def snapshot_current():
         if exists:
             copy_entry(path, folder / name)
     preferences = [
-        (domain, key, preference(domain, key)) for domain, key, _ in PREFERENCES
+        (domain, key, preference(domain, key)) for domain, key, _ in active_preferences()
     ]
     return snapshot, preferences
 
@@ -1104,9 +1598,10 @@ def restore_previous(previous, stopped_spotlight=False):
 def agent_definition():
     definition = {
         'Label': 'com.macisland.loader',
-        'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure'],
+        'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--watch'],
         'RunAtLoad': True,
-        'StartInterval': CHECK_INTERVAL,
+        'KeepAlive': True,
+        'ThrottleInterval': WATCHER_THROTTLE_INTERVAL,
         'ProcessType': 'Background',
         'StandardOutPath': str(ROOT / 'loader.log'),
         'StandardErrorPath': str(ROOT / 'loader-error.log'),
@@ -1126,6 +1621,13 @@ def reload_running_spotlight(*, stopped=False, ensure=True):
                 return
         run('/bin/launchctl', 'kickstart', '-k', service)
         if ensure:
+            for _ in range(20):
+                restarted = run('/bin/launchctl', 'print', service, required=False)
+                if restarted.returncode == 0 and re.search(
+                    rb'^\s*pid = [1-9]\d*\s*$', restarted.stdout, re.MULTILINE
+                ):
+                    break
+                time.sleep(0.15)
             run('/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure', '--wait')
     except (OSError, subprocess.CalledProcessError) as error:
         # The island is installed even if this optional consumer cannot reload.
@@ -1145,7 +1647,7 @@ def install():
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
         replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)
-        for domain, key, value in PREFERENCES:
+        for domain, key, value in active_preferences():
             write_preference(domain, key, {'present': True, 'value': value})
         # Apply synchronously first; the island must load. Provider layouts
         # are optional and only reported if they cannot be applied.
@@ -1202,12 +1704,7 @@ if [[ "$MODE" != --uninstall ]]; then
     echo "The macOS 27.2 SDK or later is required (selected SDK: ${SDK_VERSION:-none})." >&2; exit 1;
   }
   if [[ "$MODE" == install ]]; then
-    csrutil status | grep -q 'status: disabled' || {
-      echo "SIP must already be disabled; no protection settings were changed." >&2; exit 1;
-    }
-    /usr/bin/xcrun --find lldb >/dev/null 2>&1 || {
-      echo "The AMFI-compatible loader requires LLDB in the selected developer tools." >&2; exit 1;
-    }
+    /usr/bin/python3 "$SCRATCH/loader.py" --check-install-env
   fi
 
   /usr/bin/python3 -m py_compile "$SCRATCH/loader.py" "$SCRATCH/manager.py"
@@ -1553,6 +2050,9 @@ static inline MacIslandNativeMaskObserver *MacIslandObserverMergeInput(MacIsland
     return input;
 }
 
+// Presentation modifier helpers (mask-modifiers.m)
+__attribute__((visibility("hidden"))) MacIslandNativeMaskObserver *MacIslandModelMaskObserver(CALayer *layer);
+
 // Geometry & layer inspection helpers (mask-geometry.m)
 __attribute__((visibility("hidden"))) CGPathRef MacIslandNotchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY);
 __attribute__((visibility("hidden"))) BOOL MacIslandIsOpaqueBlack(CGColorRef color);
@@ -1671,219 +2171,6 @@ static void installNotchGeometry(void) {
     method_setImplementation(minimalMethod, (IMP)minimalFrame);
 }
 MACISLAND_NOTCH_M
-
-  cat > "$SCRATCH/short-host.m" <<'MACISLAND_SHORT_HOST_M'
-#import <AppKit/AppKit.h>
-#import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import "notch-layout.h"
-#include <stdlib.h>
-#include <stdatomic.h>
-#include <string.h>
-
-// The tagged FBS obstruction is already expressed in the new, below-notch
-// content viewport. Move the AppKit event owner and its presentation together.
-static char shortHostFrameKey, shortTranslationKey, shortClipKey, shortAuditKey;
-static void (*nativeHostSetFrame)(NSView *, SEL, NSRect);
-static void (*nativeHostLayout)(NSView *, SEL);
-static _Thread_local BOOL writingShortFrame;
-static atomic_bool shortHostAvailable;
-__attribute__((visibility("hidden"))) BOOL MacIslandShortHostAvailable(void) {
-    return atomic_load(&shortHostAvailable);
-}
-
-static id hostSetting(id object, NSString *name) {
-    SEL selector = NSSelectorFromString(name);
-    return [object respondsToSelector:selector] ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
-}
-static BOOL matchesShortViewport(id settings, CGFloat cutoutWidth, CGFloat cutoutHeight, NSSize nativeSize) {
-    for (NSString *prefix in @[@"", @"hosted"]) {
-        NSString *rectName = prefix.length ? @"hostedIntegratedObstructionRect" : @"integratedObstructionRect";
-        NSString *sizeName = prefix.length ? @"hostedMinimumSize" : @"elementViewMinimumSize";
-        id exclusion = hostSetting(settings, rectName);
-        id minimum = hostSetting(settings, sizeName);
-        if (![exclusion isKindOfClass:NSValue.class] || strcmp([exclusion objCType], @encode(NSRect)) ||
-            ![minimum isKindOfClass:NSValue.class] || strcmp([minimum objCType], @encode(NSSize))) continue;
-        NSRect rect = [exclusion rectValue];
-        NSSize size = [minimum sizeValue];
-        CGFloat inset = MacIslandShortViewportInset(cutoutHeight);
-        if (MacIslandIsShortObstructionSentinel(rect, cutoutHeight) &&
-            fabs(size.height - nativeSize.height) <= 1 && size.height > inset &&
-            nativeSize.width >= cutoutWidth) return YES;
-    }
-    return NO;
-}
-static NSRect positionedHostFrame(NSView *host, NSRect nativeFrame) {
-    NSView *parent = host.superview;
-    NSWindow *window = host.window;
-    NSScreen *screen = window.screen;
-    NSRect cutout = NSZeroRect;
-    if (!MacIslandScreenNotchCutout(screen, &cutout) || !parent.isFlipped ||
-        fabs(window.frame.size.height - screen.frame.size.height) > 1 ||
-        fabs(nativeFrame.size.height - parent.bounds.size.height) > 1 ||
-        fabs(nativeFrame.size.width - parent.bounds.size.width) > 1) return nativeFrame;
-    CGFloat width = cutout.size.width;
-    CGFloat height = cutout.size.height;
-    if (nativeFrame.size.width <= width || nativeFrame.size.height <= height) return nativeFrame;
-    Class hostingClass = NSClassFromString(@"NSSceneHostingView");
-    for (NSView *child in host.subviews) {
-        if (![child isKindOfClass:hostingClass]) continue;
-        id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
-        if (!matchesShortViewport(settings, width, height, nativeFrame.size)) continue;
-        CGFloat inset = MacIslandShortViewportInset(height);
-        nativeFrame.origin.y += inset;
-        nativeFrame.size.height -= inset;
-        break;
-    }
-    return nativeFrame;
-}
-// MenuBarCore gates updates to the backing layer, even when AppKit has moved
-// its event owner. Translate the existing remote scene by the remaining delta.
-static void allowShortHostOverdraw(CALayer *layer, NSHashTable<CALayer *> *unclipped, NSUInteger depth) {
-    if ([NSStringFromClass(layer.class) isEqualToString:@"SceneHosting._SceneLayerHost"]) {
-        if (layer.masksToBounds) {
-            [unclipped addObject:layer];
-            layer.masksToBounds = NO;
-        }
-    } else if (depth) {
-        for (CALayer *child in layer.sublayers) allowShortHostOverdraw(child, unclipped, depth - 1);
-    }
-}
-static void alignHostedPresentation(NSView *view) {
-    CALayer *layer = view.layer;
-    if (!layer || !layer.superlayer) return;
-    NSValue *nativeFrame = objc_getAssociatedObject(view, &shortHostFrameKey);
-    NSNumber *previous = objc_getAssociatedObject(layer, &shortTranslationKey);
-    NSHashTable<CALayer *> *unclipped = objc_getAssociatedObject(view, &shortClipKey);
-    if (!nativeFrame && !previous && !unclipped) return;
-    // The native baseline layout can draw the top of its digits above the
-    // remote surface. The moved short host reserves room for that overdraw.
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    if (nativeFrame) {
-        if (!unclipped) {
-            unclipped = [NSHashTable weakObjectsHashTable];
-            objc_setAssociatedObject(view, &shortClipKey, unclipped, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        allowShortHostOverdraw(layer, unclipped, 3);
-    } else {
-        for (CALayer *child in unclipped.allObjects) child.masksToBounds = YES;
-        objc_setAssociatedObject(view, &shortClipKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    [CATransaction commit];
-    CATransform3D transform = layer.sublayerTransform;
-    CATransform3D prior = CATransform3DMakeTranslation(0, previous.doubleValue, 0);
-    if (!CATransform3DEqualToTransform(transform, prior)) {
-        // Another native owner replaced this transform. Leave it in control.
-        objc_setAssociatedObject(layer, &shortTranslationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return;
-    }
-    CGFloat delta = nativeFrame ? NSMinY(view.frame) - CGRectGetMinY(layer.frame) : 0;
-    if (fabs(delta - previous.doubleValue) < 0.001) return;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.sublayerTransform = CATransform3DMakeTranslation(0, delta, 0);
-    [CATransaction commit];
-    objc_setAssociatedObject(layer, &shortTranslationKey, delta ? @(delta) : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-static NSRect resolvedRequestedHostFrame(NSView *view, NSRect requested) {
-    NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
-    if (!saved) return requested;
-    NSRect unshifted = saved.rectValue;
-    NSRect current = view.frame;
-    if (NSEqualRects(requested, current)) return unshifted;
-    // Preserve the unshifted vertical span when AppKit reads the already-moved
-    // view.frame and updates only horizontal position or width.
-    if (fabs(NSMinY(requested) - NSMinY(current)) < 0.5 &&
-        fabs(NSHeight(requested) - NSHeight(current)) < 0.5 &&
-        NSMinY(current) > NSMinY(unshifted) + 0.5) {
-        requested.origin.y = unshifted.origin.y;
-        requested.size.height = unshifted.size.height;
-    }
-    return requested;
-}
-static void emitShortHostAudit(NSString *auditPath, NSView *view, NSRect requested, NSRect positioned, BOOL adjusted) {
-    id client = NSNull.null;
-    id elementKind = NSNull.null;
-    Class hostingClass = NSClassFromString(@"NSSceneHostingView");
-    for (NSView *child in view.subviews) {
-        if (![child isKindOfClass:hostingClass]) continue;
-        id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
-        if (!settings) continue;
-        client = MacIslandAuditDataValue(hostSetting(settings, @"clientIdentifier"));
-        elementKind = MacIslandAuditDataValue(hostSetting(settings, @"elementKindIdentifier"));
-        break;
-    }
-    NSDictionary *record = @{
-        @"event": @"short_host",
-        @"client": client,
-        @"elementKind": elementKind,
-        @"adjusted": @(adjusted),
-        @"requestedFrame": MacIslandAuditRectDict(requested),
-        @"positionedFrame": MacIslandAuditRectDict(positioned),
-    };
-    NSString *signature = MacIslandAuditSerialize(record);
-    NSString *previous = objc_getAssociatedObject(view, &shortAuditKey);
-    if (!signature || [previous isEqualToString:signature]) return;
-    objc_setAssociatedObject(view, &shortAuditKey, signature, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    MacIslandAuditAppendRecord(auditPath, record);
-}
-static void setHostFrame(NSView *view, SEL selector, NSRect requested) {
-    if (writingShortFrame) { nativeHostSetFrame(view, selector, requested); return; }
-    BOOL hadPriorAdjustment = objc_getAssociatedObject(view, &shortHostFrameKey) != nil;
-    requested = resolvedRequestedHostFrame(view, requested);
-    NSRect frame = positionedHostFrame(view, requested);
-    BOOL adjusted = !NSEqualRects(frame, requested);
-    objc_setAssociatedObject(view, &shortHostFrameKey, adjusted ? [NSValue valueWithRect:requested] : nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    writingShortFrame = YES;
-    nativeHostSetFrame(view, selector, frame);
-    writingShortFrame = NO;
-    alignHostedPresentation(view);
-    if (adjusted || hadPriorAdjustment) {
-        NSString *auditPath = MacIslandAuditLogPath();
-        if (auditPath) emitShortHostAudit(auditPath, view, requested, frame, adjusted);
-    }
-}
-static void layoutHost(NSView *view, SEL selector) {
-    if (!writingShortFrame) {
-        NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
-        NSRect nativeFrame = saved ? saved.rectValue : view.frame;
-        if (!NSEqualRects(view.frame, positionedHostFrame(view, nativeFrame)))
-            setHostFrame(view, @selector(setFrame:), nativeFrame);
-    }
-    nativeHostLayout(view, selector);
-    alignHostedPresentation(view);
-}
-static void installShortHostLayout(NSUInteger attempt) {
-    Class cls = NSClassFromString(@"MenuBarCore.SceneHostDisplayItemContainerView");
-    if (!cls) {
-        int64_t delay = attempt < 100 ? 50 * NSEC_PER_MSEC : attempt < 300 ? 500 * NSEC_PER_MSEC : 5 * NSEC_PER_SEC;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
-            installShortHostLayout(attempt + 1);
-        });
-        return;
-    }
-    if (![cls isSubclassOfClass:NSView.class] || nativeHostSetFrame) return;
-    Method frame = class_getInstanceMethod(cls, @selector(setFrame:));
-    Method layout = class_getInstanceMethod(cls, @selector(layout));
-    Method expectedFrame = class_getInstanceMethod(NSView.class, @selector(setFrame:));
-    Method expectedLayout = class_getInstanceMethod(NSView.class, @selector(layout));
-    if (!frame || !layout || !expectedFrame || !expectedLayout) return;
-    if (strcmp(method_getTypeEncoding(frame), method_getTypeEncoding(expectedFrame)) != 0 ||
-        strcmp(method_getTypeEncoding(layout), method_getTypeEncoding(expectedLayout)) != 0) return;
-    nativeHostSetFrame = (void *)method_getImplementation(frame);
-    nativeHostLayout = (void *)method_getImplementation(layout);
-    class_replaceMethod(cls, @selector(setFrame:), (IMP)setHostFrame, method_getTypeEncoding(frame));
-    class_replaceMethod(cls, @selector(layout), (IMP)layoutHost, method_getTypeEncoding(layout));
-    atomic_store(&shortHostAvailable, true);
-}
-__attribute__((constructor)) static void installShortHost(void) {
-    if (MacIslandIsMenuBarAgent())
-        dispatch_async(dispatch_get_main_queue(), ^{ installShortHostLayout(0); });
-}
-MACISLAND_SHORT_HOST_M
 
   cat > "$SCRATCH/scene-audit.m" <<'MACISLAND_SCENE_AUDIT_M'
 #import "safearea-internal.h"
@@ -2596,33 +2883,51 @@ static BOOL isDetachedObstructionLocation(id raw) {
     if ([value isKindOfClass:NSString.class]) return [(NSString *)value isEqualToString:@"noObstruction"];
     return NO;
 }
-static BOOL containsAirDropToken(id value) {
+static BOOL containsToken(id value, NSString *token) {
     if (!value) return NO;
     if ([value isKindOfClass:NSString.class]) {
-        return [(NSString *)value rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        return [(NSString *)value rangeOfString:token options:NSCaseInsensitiveSearch].location != NSNotFound;
     }
     if ([value isKindOfClass:NSData.class]) {
         NSString *text = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
         if (text) {
-            return [text rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+            return [text rangeOfString:token options:NSCaseInsensitiveSearch].location != NSNotFound;
         }
     }
     if ([value isKindOfClass:NSDictionary.class]) {
         for (id key in (NSDictionary *)value) {
-            if (containsAirDropToken(key) || containsAirDropToken(((NSDictionary *)value)[key])) return YES;
+            if (containsToken(key, token) || containsToken(((NSDictionary *)value)[key], token)) return YES;
         }
     }
     if ([value isKindOfClass:NSArray.class]) {
         for (id item in (NSArray *)value) {
-            if (containsAirDropToken(item)) return YES;
+            if (containsToken(item, token)) return YES;
         }
     }
     return NO;
 }
 static BOOL isAirDropScene(id settings) {
-    return containsAirDropToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier")) ||
-           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier")) ||
-           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"));
+    return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"airdrop") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"), @"airdrop") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"), @"airdrop");
+}
+static BOOL isControlCenterScene(id settings) {
+    return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"controlcenter");
+}
+static CGFloat controlCenterBatteryBannerTargetWidth(NSSize nativeSize, MacIslandNotchAvoidance policy) {
+    if (!isfinite(nativeSize.width) || !isfinite(nativeSize.height)) return 0;
+    // Charging (220x50) keeps ~81pt side span; Low Battery (300x60) keeps ~121pt side span.
+    // Explicitly exclude 309pt Volume/Brightness HUDs and unrelated banners.
+    CGFloat sideSpan = 0;
+    if (nativeSize.width >= 180.0 && nativeSize.width <= 240.0 &&
+        nativeSize.height >= 44.0 && nativeSize.height <= 56.0) {
+        sideSpan = 162.0;
+    } else if (nativeSize.width >= 260.0 && nativeSize.width <= 305.0 &&
+               nativeSize.height >= 54.0 && nativeSize.height <= 66.0) {
+        sideSpan = 242.0;
+    }
+    if (sideSpan <= 0) return 0;
+    return MIN(policy.notchWidth + sideSpan, policy.centeredDisplayWidth);
 }
 
 // FrontBoardServices creates a fresh FBSMutableSceneSettings copy per update,
@@ -2940,6 +3245,17 @@ static MacIslandFamilyAuditSnapshot applyFamilyLayout(
                 minimum.width = floor;
                 if (isfinite(maximum.width)) {
                     maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                }
+            } else if (policy.extendsBelow && family == 1 && isControlCenterScene(settings)) {
+                CGFloat targetWidth = controlCenterBatteryBannerTargetWidth(native.minimum.sizeValue, policy);
+                if (targetWidth > 0) {
+                    minimum.width = MAX(minimum.width, targetWidth);
+                    CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+                    if (isfinite(maximum.width)) {
+                        maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                    }
+                } else if (isfinite(maximum.width)) {
+                    maximum.width = MAX(maximum.width + extraX, minimum.width);
                 }
             } else if (isfinite(maximum.width)) {
                 maximum.width = MAX(maximum.width + extraX, minimum.width);
@@ -3339,6 +3655,219 @@ __attribute__((constructor)) static void installNotchContentInsets(void) {
     });
 }
 MACISLAND_SAFEAREA_M
+
+  cat > "$SCRATCH/short-host.m" <<'MACISLAND_SHORT_HOST_M'
+#import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import "notch-layout.h"
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <string.h>
+
+// The tagged FBS obstruction is already expressed in the new, below-notch
+// content viewport. Move the AppKit event owner and its presentation together.
+static char shortHostFrameKey, shortTranslationKey, shortClipKey, shortAuditKey;
+static void (*nativeHostSetFrame)(NSView *, SEL, NSRect);
+static void (*nativeHostLayout)(NSView *, SEL);
+static _Thread_local BOOL writingShortFrame;
+static atomic_bool shortHostAvailable;
+__attribute__((visibility("hidden"))) BOOL MacIslandShortHostAvailable(void) {
+    return atomic_load(&shortHostAvailable);
+}
+
+static id hostSetting(id object, NSString *name) {
+    SEL selector = NSSelectorFromString(name);
+    return [object respondsToSelector:selector] ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
+}
+static BOOL matchesShortViewport(id settings, CGFloat cutoutWidth, CGFloat cutoutHeight, NSSize nativeSize) {
+    for (NSString *prefix in @[@"", @"hosted"]) {
+        NSString *rectName = prefix.length ? @"hostedIntegratedObstructionRect" : @"integratedObstructionRect";
+        NSString *sizeName = prefix.length ? @"hostedMinimumSize" : @"elementViewMinimumSize";
+        id exclusion = hostSetting(settings, rectName);
+        id minimum = hostSetting(settings, sizeName);
+        if (![exclusion isKindOfClass:NSValue.class] || strcmp([exclusion objCType], @encode(NSRect)) ||
+            ![minimum isKindOfClass:NSValue.class] || strcmp([minimum objCType], @encode(NSSize))) continue;
+        NSRect rect = [exclusion rectValue];
+        NSSize size = [minimum sizeValue];
+        CGFloat inset = MacIslandShortViewportInset(cutoutHeight);
+        if (MacIslandIsShortObstructionSentinel(rect, cutoutHeight) &&
+            fabs(size.height - nativeSize.height) <= 1 && size.height > inset &&
+            nativeSize.width >= cutoutWidth) return YES;
+    }
+    return NO;
+}
+static NSRect positionedHostFrame(NSView *host, NSRect nativeFrame) {
+    NSView *parent = host.superview;
+    NSWindow *window = host.window;
+    NSScreen *screen = window.screen;
+    NSRect cutout = NSZeroRect;
+    if (!MacIslandScreenNotchCutout(screen, &cutout) || !parent.isFlipped ||
+        fabs(window.frame.size.height - screen.frame.size.height) > 1 ||
+        fabs(nativeFrame.size.height - parent.bounds.size.height) > 1 ||
+        fabs(nativeFrame.size.width - parent.bounds.size.width) > 1) return nativeFrame;
+    CGFloat width = cutout.size.width;
+    CGFloat height = cutout.size.height;
+    if (nativeFrame.size.width <= width || nativeFrame.size.height <= height) return nativeFrame;
+    Class hostingClass = NSClassFromString(@"NSSceneHostingView");
+    for (NSView *child in host.subviews) {
+        if (![child isKindOfClass:hostingClass]) continue;
+        id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
+        if (!matchesShortViewport(settings, width, height, nativeFrame.size)) continue;
+        CGFloat inset = MacIslandShortViewportInset(height);
+        nativeFrame.origin.y += inset;
+        nativeFrame.size.height -= inset;
+        break;
+    }
+    return nativeFrame;
+}
+// MenuBarCore gates updates to the backing layer, even when AppKit has moved
+// its event owner. Translate the existing remote scene by the remaining delta.
+static void allowShortHostOverdraw(CALayer *layer, NSHashTable<CALayer *> *unclipped, NSUInteger depth) {
+    if ([NSStringFromClass(layer.class) isEqualToString:@"SceneHosting._SceneLayerHost"]) {
+        if (layer.masksToBounds) {
+            [unclipped addObject:layer];
+            layer.masksToBounds = NO;
+        }
+    } else if (depth) {
+        for (CALayer *child in layer.sublayers) allowShortHostOverdraw(child, unclipped, depth - 1);
+    }
+}
+static void alignHostedPresentation(NSView *view) {
+    CALayer *layer = view.layer;
+    if (!layer || !layer.superlayer) return;
+    NSValue *nativeFrame = objc_getAssociatedObject(view, &shortHostFrameKey);
+    NSNumber *previous = objc_getAssociatedObject(layer, &shortTranslationKey);
+    NSHashTable<CALayer *> *unclipped = objc_getAssociatedObject(view, &shortClipKey);
+    if (!nativeFrame && !previous && !unclipped) return;
+    // The native baseline layout can draw the top of its digits above the
+    // remote surface. The moved short host reserves room for that overdraw.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (nativeFrame) {
+        if (!unclipped) {
+            unclipped = [NSHashTable weakObjectsHashTable];
+            objc_setAssociatedObject(view, &shortClipKey, unclipped, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        allowShortHostOverdraw(layer, unclipped, 3);
+    } else {
+        for (CALayer *child in unclipped.allObjects) child.masksToBounds = YES;
+        objc_setAssociatedObject(view, &shortClipKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [CATransaction commit];
+    CATransform3D transform = layer.sublayerTransform;
+    CATransform3D prior = CATransform3DMakeTranslation(0, previous.doubleValue, 0);
+    if (!CATransform3DEqualToTransform(transform, prior)) {
+        // Another native owner replaced this transform. Leave it in control.
+        objc_setAssociatedObject(layer, &shortTranslationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    CGFloat delta = nativeFrame ? NSMinY(view.frame) - CGRectGetMinY(layer.frame) : 0;
+    if (fabs(delta - previous.doubleValue) < 0.001) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.sublayerTransform = CATransform3DMakeTranslation(0, delta, 0);
+    [CATransaction commit];
+    objc_setAssociatedObject(layer, &shortTranslationKey, delta ? @(delta) : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static NSRect resolvedRequestedHostFrame(NSView *view, NSRect requested) {
+    NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
+    if (!saved) return requested;
+    NSRect unshifted = saved.rectValue;
+    NSRect current = view.frame;
+    if (NSEqualRects(requested, current)) return unshifted;
+    // Preserve the unshifted vertical span when AppKit reads the already-moved
+    // view.frame and updates only horizontal position or width.
+    if (fabs(NSMinY(requested) - NSMinY(current)) < 0.5 &&
+        fabs(NSHeight(requested) - NSHeight(current)) < 0.5 &&
+        NSMinY(current) > NSMinY(unshifted) + 0.5) {
+        requested.origin.y = unshifted.origin.y;
+        requested.size.height = unshifted.size.height;
+    }
+    return requested;
+}
+static void emitShortHostAudit(NSString *auditPath, NSView *view, NSRect requested, NSRect positioned, BOOL adjusted) {
+    id client = NSNull.null;
+    id elementKind = NSNull.null;
+    Class hostingClass = NSClassFromString(@"NSSceneHostingView");
+    for (NSView *child in view.subviews) {
+        if (![child isKindOfClass:hostingClass]) continue;
+        id settings = hostSetting(hostSetting(child, @"scene"), @"settings");
+        if (!settings) continue;
+        client = MacIslandAuditDataValue(hostSetting(settings, @"clientIdentifier"));
+        elementKind = MacIslandAuditDataValue(hostSetting(settings, @"elementKindIdentifier"));
+        break;
+    }
+    NSDictionary *record = @{
+        @"event": @"short_host",
+        @"client": client,
+        @"elementKind": elementKind,
+        @"adjusted": @(adjusted),
+        @"requestedFrame": MacIslandAuditRectDict(requested),
+        @"positionedFrame": MacIslandAuditRectDict(positioned),
+    };
+    NSString *signature = MacIslandAuditSerialize(record);
+    NSString *previous = objc_getAssociatedObject(view, &shortAuditKey);
+    if (!signature || [previous isEqualToString:signature]) return;
+    objc_setAssociatedObject(view, &shortAuditKey, signature, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MacIslandAuditAppendRecord(auditPath, record);
+}
+static void setHostFrame(NSView *view, SEL selector, NSRect requested) {
+    if (writingShortFrame) { nativeHostSetFrame(view, selector, requested); return; }
+    BOOL hadPriorAdjustment = objc_getAssociatedObject(view, &shortHostFrameKey) != nil;
+    requested = resolvedRequestedHostFrame(view, requested);
+    NSRect frame = positionedHostFrame(view, requested);
+    BOOL adjusted = !NSEqualRects(frame, requested);
+    objc_setAssociatedObject(view, &shortHostFrameKey, adjusted ? [NSValue valueWithRect:requested] : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    writingShortFrame = YES;
+    nativeHostSetFrame(view, selector, frame);
+    writingShortFrame = NO;
+    alignHostedPresentation(view);
+    if (adjusted || hadPriorAdjustment) {
+        NSString *auditPath = MacIslandAuditLogPath();
+        if (auditPath) emitShortHostAudit(auditPath, view, requested, frame, adjusted);
+    }
+}
+static void layoutHost(NSView *view, SEL selector) {
+    if (!writingShortFrame) {
+        NSValue *saved = objc_getAssociatedObject(view, &shortHostFrameKey);
+        NSRect nativeFrame = saved ? saved.rectValue : view.frame;
+        if (!NSEqualRects(view.frame, positionedHostFrame(view, nativeFrame)))
+            setHostFrame(view, @selector(setFrame:), nativeFrame);
+    }
+    nativeHostLayout(view, selector);
+    alignHostedPresentation(view);
+}
+static void installShortHostLayout(NSUInteger attempt) {
+    Class cls = NSClassFromString(@"MenuBarCore.SceneHostDisplayItemContainerView");
+    if (!cls) {
+        int64_t delay = attempt < 100 ? 50 * NSEC_PER_MSEC : attempt < 300 ? 500 * NSEC_PER_MSEC : 5 * NSEC_PER_SEC;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
+            installShortHostLayout(attempt + 1);
+        });
+        return;
+    }
+    if (![cls isSubclassOfClass:NSView.class] || nativeHostSetFrame) return;
+    Method frame = class_getInstanceMethod(cls, @selector(setFrame:));
+    Method layout = class_getInstanceMethod(cls, @selector(layout));
+    Method expectedFrame = class_getInstanceMethod(NSView.class, @selector(setFrame:));
+    Method expectedLayout = class_getInstanceMethod(NSView.class, @selector(layout));
+    if (!frame || !layout || !expectedFrame || !expectedLayout) return;
+    if (strcmp(method_getTypeEncoding(frame), method_getTypeEncoding(expectedFrame)) != 0 ||
+        strcmp(method_getTypeEncoding(layout), method_getTypeEncoding(expectedLayout)) != 0) return;
+    nativeHostSetFrame = (void *)method_getImplementation(frame);
+    nativeHostLayout = (void *)method_getImplementation(layout);
+    class_replaceMethod(cls, @selector(setFrame:), (IMP)setHostFrame, method_getTypeEncoding(frame));
+    class_replaceMethod(cls, @selector(layout), (IMP)layoutHost, method_getTypeEncoding(layout));
+    atomic_store(&shortHostAvailable, true);
+}
+__attribute__((constructor)) static void installShortHost(void) {
+    if (MacIslandIsMenuBarAgent())
+        dispatch_async(dispatch_get_main_queue(), ^{ installShortHostLayout(0); });
+}
+MACISLAND_SHORT_HOST_M
 
   cat > "$SCRATCH/mask-geometry.m" <<'MACISLAND_MASK_GEOMETRY_M'
 #import "mask-internal.h"
@@ -4755,6 +5284,569 @@ static void installNativeNotchMask(void) {
 }
 MACISLAND_MASK_M
 
+  cat > "$SCRATCH/top-hit.m" <<'MACISLAND_TOP_HIT_M'
+#import "mask-internal.h"
+#import <dlfcn.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#include <math.h>
+#include <string.h>
+
+// Full-screen notched island windows sit behind MenuBarAgent's menu bar.
+// On macOS 27.3 beta 2 two things drop clicks on the flat top pixel row:
+//  1. Transparent/inverted island hit layers lose their WindowServer click shape,
+//     sending top-row clicks to the menu bar window below them.
+//  2. Mouse events whose locationInWindow.y == window.frame.size.height (top edge
+//     when the cursor is pushed to the top of the screen) are ignored by the
+//     island's view tree unless nudged 0.5 pt inside the window.
+
+static NSString *const MacIslandTopUnderlayName = @"MacIslandTopHitUnderlay";
+static NSString *const MacIslandTopStripName = @"MacIslandTopHitStrip";
+
+static char savedFiltersKey;
+
+typedef int (*MacIslandSLSMainConnectionFn)(void);
+typedef int (*MacIslandSLSFindWindowFn)(int, int, int, int, const CGPoint *, CGPoint *, uint32_t *, int *);
+
+static MacIslandSLSMainConnectionFn slsMainConnectionID;
+static MacIslandSLSFindWindowFn slsFindWindowByGeometry;
+
+static IMP origSetHitTestsAsOpaque;
+static IMP origSetFilters;
+static IMP origSendEvent;
+
+static BOOL topHitInitialized;
+static BOOL topHitScanQueued;
+static BOOL writingTopHitFilters;
+static BOOL forwardingTopHitEvent;
+static NSMutableArray<NSArray *> *coveredIslands;   // @[window, container, hitLayer]
+static NSMutableArray<NSArray *> *activeTopStrips;  // @[container, stripLayer]
+static NSMutableArray<NSArray *> *nextTopStrips;
+__weak static NSWindow *redirectTargetWindow;
+static NSTimer *topHitVerifyTimer;
+
+#ifdef MACISLAND_TESTING
+static NSArray<NSWindow *> *testOverrideWindows;
+static BOOL useTestInvertOverride;
+static BOOL testInvertOverrideValue;
+static NSUInteger topHitMissCount;
+static NSUInteger topHitRefreshCount;
+static CALayer *lastTestClampedLayer;
+static NSUInteger testRedirectCount;
+static CGPoint lastTestDeliveredPoint;
+#endif
+
+static BOOL invertColorsEnabled(void) {
+#ifdef MACISLAND_TESTING
+    if (useTestInvertOverride) return testInvertOverrideValue;
+#endif
+    return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldInvertColors;
+}
+
+static CALayer *islandRootLayer(NSWindow *window) {
+    NSView *superview = window.contentView.superview;
+    if (superview.layer) return superview.layer;
+    return window.contentView.layer;
+}
+
+static BOOL isWindowActiveForTopHit(NSWindow *window) {
+#ifdef MACISLAND_TESTING
+    if (testOverrideWindows && [testOverrideWindows containsObject:window]) return YES;
+#endif
+    return window.visible;
+}
+
+static BOOL isIslandWindow(NSWindow *window) {
+    if (![window isKindOfClass:NSWindow.class] || !isWindowActiveForTopHit(window)) return NO;
+#ifdef MACISLAND_TESTING
+    if (testOverrideWindows) return [testOverrideWindows containsObject:window];
+#endif
+    NSScreen *screen = window.screen;
+    CALayer *root = islandRootLayer(window);
+    if (!screen || !root || !MacIslandScreenHasNotch(screen)) return NO;
+    return fabs(window.frame.size.width - screen.frame.size.width) < 1 &&
+           fabs(window.frame.size.height - screen.frame.size.height) < 1 &&
+           fabs(root.bounds.size.width - screen.frame.size.width) < 1 &&
+           fabs(root.bounds.size.height - screen.frame.size.height) < 1;
+}
+
+static CGRect rectInWindowCoordinates(NSWindow *window, CALayer *root, CALayer *layer) {
+    if (!window || !root || !layer) return CGRectZero;
+    CGRect lr = [layer convertRect:layer.bounds toLayer:root];
+    if (root.isGeometryFlipped) {
+        CGFloat winH = window.frame.size.height;
+        return CGRectMake(lr.origin.x, winH - lr.origin.y - lr.size.height, lr.size.width, lr.size.height);
+    }
+    return lr;
+}
+
+static void resolvedTopSpanInRoot(CALayer *container, CALayer *root, BOOL *atTopOut,
+                                  CGFloat *flatWidthOut, CGFloat *centerXOut) {
+    CGRect lr = [container convertRect:container.bounds toLayer:root];
+    BOOL atTop = root.isGeometryFlipped
+        ? fabs(CGRectGetMinY(lr)) <= 0.5
+        : fabs(CGRectGetMaxY(lr) - root.bounds.size.height) <= 0.5;
+    MacIslandNativeMaskObserver *observer = MacIslandModelMaskObserver(container);
+    BOOL maskedByNotch = (observer != nil && observer.applied);
+    CGFloat flat = maskedByNotch
+        ? lr.size.width
+        : (lr.size.width - 2.0 * container.cornerRadius);
+    *atTopOut = atTop && flat >= 2.0;
+    *flatWidthOut = flat;
+    *centerXOut = CGRectGetMidX(lr);
+}
+
+static BOOL isHitTestOpaqueLayer(CALayer *layer) {
+    SEL sel = NSSelectorFromString(@"hitTestsAsOpaque");
+    return [layer respondsToSelector:sel] && ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel);
+}
+
+static BOOL isColorInvertFilter(id filter) {
+    for (NSString *key in @[@"type", @"name"]) {
+        SEL sel = NSSelectorFromString(key);
+        if (![filter respondsToSelector:sel]) continue;
+        id value = ((id (*)(id, SEL))objc_msgSend)(filter, sel);
+        if ([value isKindOfClass:NSString.class] && [value isEqualToString:@"colorInvertDisplayAware"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void setFiltersRaw(CALayer *layer, NSArray *filters) {
+    writingTopHitFilters = YES;
+    ((void (*)(id, SEL, NSArray *))origSetFilters)(layer, @selector(setFilters:), filters);
+    writingTopHitFilters = NO;
+}
+
+static void stripInvertFilterFromContainer(CALayer *container) {
+    NSArray *filters = container.filters;
+    if (!filters.count) return;
+    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:filters.count];
+    BOOL removed = NO;
+    for (id filter in filters) {
+        if (isColorInvertFilter(filter)) {
+            removed = YES;
+        } else {
+            [kept addObject:filter];
+        }
+    }
+    if (removed) {
+        objc_setAssociatedObject(container, &savedFiltersKey, filters, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        setFiltersRaw(container, kept.count ? kept : nil);
+    }
+}
+
+static void restoreInvertFilterOnContainer(CALayer *container) {
+    NSArray *saved = objc_getAssociatedObject(container, &savedFiltersKey);
+    if (!saved) return;
+    objc_setAssociatedObject(container, &savedFiltersKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    setFiltersRaw(container, saved);
+}
+
+static CALayer *existingTopUnderlay(CALayer *hitLayer) {
+    for (CALayer *child in MacIslandCopyLayerSublayers(hitLayer)) {
+        if ([child.name isEqualToString:MacIslandTopUnderlayName]) return child;
+    }
+    return nil;
+}
+
+static CALayer *existingTopStripForContainer(NSArray<NSArray *> *items, CALayer *container) {
+    for (NSArray *pair in items) {
+        if (pair[0] == container) return pair[1];
+    }
+    return nil;
+}
+
+static NSDictionary<NSString *, id> *disabledLayerActions(void) {
+    static NSDictionary<NSString *, id> *actions;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        actions = @{
+            @"bounds": NSNull.null,
+            @"position": NSNull.null,
+            @"frame": NSNull.null,
+            @"onOrderIn": NSNull.null,
+            @"onOrderOut": NSNull.null,
+        };
+    });
+    return actions;
+}
+
+static void ensureTopStripForContainer(NSWindow *window, CALayer *container) {
+    CALayer *root = islandRootLayer(window);
+    if (!root || existingTopStripForContainer(nextTopStrips, container)) return;
+    BOOL atTop = NO;
+    CGFloat flat = 0;
+    CGFloat midX = 0;
+    resolvedTopSpanInRoot(container, root, &atTop, &flat, &midX);
+    if (!atTop) return;
+
+    CALayer *strip = existingTopStripForContainer(activeTopStrips, container);
+    if (!strip) {
+        strip = [CALayer layer];
+        strip.name = MacIslandTopStripName;
+        strip.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        strip.actions = disabledLayerActions();
+    }
+    if (strip.superlayer != root) [root insertSublayer:strip atIndex:0];
+    CGFloat stripY = root.isGeometryFlipped ? 0.0 : (root.bounds.size.height - 1.0);
+    strip.frame = CGRectMake(midX - flat / 2.0, stripY, flat, 1.0);
+    [nextTopStrips addObject:@[container, strip]];
+}
+
+static BOOL isSolidContourFillLayer(CALayer *layer) {
+    return [layer.name hasPrefix:@"SimpleViewDisplayItem-"] &&
+           MacIslandIsOpaqueBlack(layer.backgroundColor) &&
+           !layer.contents &&
+           !MacIslandLayerHasSublayers(layer);
+}
+
+static void walkIslandHierarchy(NSWindow *window, CALayer *container, BOOL apply) {
+    NSArray<CALayer *> *children = MacIslandCopyLayerSublayers(container);
+    for (CALayer *child in children) {
+        if ([child.name isEqualToString:MacIslandTopUnderlayName] ||
+            [child.name isEqualToString:MacIslandTopStripName]) {
+            continue;
+        }
+        if (isSolidContourFillLayer(container)) continue;
+        MacIslandNativeMaskObserver *observer = MacIslandModelMaskObserver(container);
+        BOOL maskedByNotch = (observer != nil && observer.applied);
+        if (isHitTestOpaqueLayer(child) && container.masksToBounds &&
+            (container.cornerRadius > 0 || maskedByNotch)) {
+            CALayer *underlay = existingTopUnderlay(child);
+            if (apply) {
+                stripInvertFilterFromContainer(container);
+                if (!underlay) {
+                    underlay = [CALayer layer];
+                    underlay.name = MacIslandTopUnderlayName;
+                    underlay.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+                    underlay.frame = child.bounds;
+                    underlay.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+                    underlay.actions = disabledLayerActions();
+                    [child insertSublayer:underlay atIndex:0];
+                } else if (!CGRectEqualToRect(underlay.frame, child.bounds)) {
+                    underlay.frame = child.bounds;
+                }
+                ensureTopStripForContainer(window, container);
+                [coveredIslands addObject:@[window, container, child]];
+            } else {
+                [underlay removeFromSuperlayer];
+                restoreInvertFilterOnContainer(container);
+            }
+        }
+        walkIslandHierarchy(window, child, apply);
+    }
+}
+
+static void scanTopHitWindows(void) {
+    BOOL apply = !invertColorsEnabled();
+    NSMutableArray<NSArray *> *nextCovered = [NSMutableArray array];
+    NSMutableArray<NSArray *> *stripsNext = [NSMutableArray array];
+    coveredIslands = nextCovered;
+    nextTopStrips = stripsNext;
+
+#ifdef MACISLAND_TESTING
+    NSArray<NSWindow *> *windows = testOverrideWindows ?: NSApp.windows;
+#else
+    NSArray<NSWindow *> *windows = NSApp.windows;
+#endif
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (NSWindow *window in windows) {
+        if (!isIslandWindow(window)) continue;
+        CALayer *root = islandRootLayer(window);
+        if (root) walkIslandHierarchy(window, root, apply);
+    }
+    for (NSArray *pair in activeTopStrips) {
+        if (!existingTopStripForContainer(stripsNext, pair[0])) {
+            [(CALayer *)pair[1] removeFromSuperlayer];
+        }
+    }
+    activeTopStrips = stripsNext;
+    nextTopStrips = nil;
+    [CATransaction commit];
+}
+
+static void scheduleTopHitScan(void) {
+    if (topHitScanQueued) return;
+    topHitScanQueued = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        topHitScanQueued = NO;
+        scanTopHitWindows();
+    });
+}
+
+static void loadSkyLightSymbols(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *skyLight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
+        if (!skyLight) return;
+        slsMainConnectionID = (MacIslandSLSMainConnectionFn)dlsym(skyLight, "SLSMainConnectionID");
+        slsFindWindowByGeometry = (MacIslandSLSFindWindowFn)dlsym(skyLight, "SLSFindWindowByGeometry");
+    });
+}
+
+static int topRowReachable(NSWindow *window, CALayer *container, CALayer *hitLayer) {
+    loadSkyLightSymbols();
+    if (!slsMainConnectionID || !slsFindWindowByGeometry) return -1;
+    CALayer *root = islandRootLayer(window);
+    if (!root || !hitLayer.superlayer) return 2;
+    BOOL atTop = NO;
+    CGFloat flat = 0;
+    CGFloat midX = 0;
+    resolvedTopSpanInRoot(container, root, &atTop, &flat, &midX);
+    if (!atTop) return 2;
+
+    CGRect winRect = rectInWindowCoordinates(window, root, container);
+    if (winRect.size.width < winRect.size.height + 4) return 2;
+    NSRect screenRect = [window convertRectToScreen:NSRectFromCGRect(winRect)];
+    NSScreen *primary = NSScreen.screens.firstObject;
+    if (!primary) return -1;
+    CGFloat primaryMaxY = NSMaxY(primary.frame);
+    CGPoint query = CGPointMake(NSMidX(screenRect), primaryMaxY - NSMaxY(screenRect));
+    CGPoint outPoint = CGPointZero;
+    uint32_t ownerWindowID = 0;
+    int ownerConnection = 0;
+    if (slsFindWindowByGeometry(slsMainConnectionID(), 0, 1, 0, &query, &outPoint,
+                                &ownerWindowID, &ownerConnection) != 0) {
+        return -1;
+    }
+    return ownerWindowID == (uint32_t)window.windowNumber ? 1 : 0;
+}
+
+static void verifyTopRowHitShapes(void) {
+    if (!coveredIslands.count || invertColorsEnabled()) return;
+    NSArray<NSArray *> *snapshot = [coveredIslands copy];
+    for (NSArray *entry in snapshot) {
+        NSWindow *window = entry[0];
+        CALayer *container = entry[1];
+        CALayer *hitLayer = entry[2];
+        if (!isWindowActiveForTopHit(window) || !hitLayer.superlayer) continue;
+        if (topRowReachable(window, container, hitLayer) != 0) continue;
+#ifdef MACISLAND_TESTING
+        topHitMissCount++;
+        topHitRefreshCount++;
+#endif
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        NSArray *currentFilters = container.filters;
+        setFiltersRaw(container, @[]);
+        setFiltersRaw(container, currentFilters);
+        ((void (*)(id, SEL, BOOL))origSetHitTestsAsOpaque)(
+            hitLayer, NSSelectorFromString(@"setHitTestsAsOpaque:"), NO);
+        ((void (*)(id, SEL, BOOL))origSetHitTestsAsOpaque)(
+            hitLayer, NSSelectorFromString(@"setHitTestsAsOpaque:"), YES);
+        [CATransaction commit];
+    }
+}
+
+static CGPoint windowPointToScreen(NSWindow *window, CGPoint point) {
+    return [window convertRectToScreen:(NSRect){point, {0, 0}}].origin;
+}
+
+static NSWindow *islandWindowAtTopEdge(CGPoint screenPoint) {
+    for (NSArray *entry in coveredIslands) {
+        NSWindow *window = entry[0];
+        CALayer *container = entry[1];
+        CALayer *root = islandRootLayer(window);
+        if (!isWindowActiveForTopHit(window) || !root || !container.superlayer) continue;
+        BOOL atTop = NO;
+        CGFloat flat = 0;
+        CGFloat midX = 0;
+        resolvedTopSpanInRoot(container, root, &atTop, &flat, &midX);
+        if (!atTop) continue;
+
+        CGRect winRect = rectInWindowCoordinates(window, root, container);
+        NSRect screenRect = [window convertRectToScreen:NSRectFromCGRect(winRect)];
+        CGFloat inset = MacIslandModelMaskObserver(container).applied ? 0.0 : container.cornerRadius;
+        CGFloat leftEdge = NSMinX(screenRect) + inset;
+        CGFloat rightEdge = NSMaxX(screenRect) - inset;
+        if (fabs(screenPoint.y - NSMaxY(screenRect)) <= 1.0 &&
+            screenPoint.x >= leftEdge && screenPoint.x <= rightEdge) {
+            return window;
+        }
+    }
+    return nil;
+}
+
+static NSEvent *clampedMouseEvent(NSEvent *event, NSWindow *target, CGPoint point) {
+    NSEvent *moved = [NSEvent mouseEventWithType:event.type
+                                        location:point
+                                   modifierFlags:event.modifierFlags
+                                       timestamp:event.timestamp
+                                    windowNumber:target.windowNumber
+                                         context:nil
+                                     eventNumber:event.eventNumber
+                                      clickCount:event.clickCount
+                                        pressure:event.pressure];
+    return moved ?: event;
+}
+
+static BOOL isTrackedMouseEvent(NSEventType type) {
+    return (type >= NSEventTypeLeftMouseDown && type <= NSEventTypeMouseMoved) ||
+           type == NSEventTypeLeftMouseDragged ||
+           type == NSEventTypeRightMouseDragged;
+}
+
+static void hookedSetHitTestsAsOpaque(CALayer *layer, SEL selector, BOOL value) {
+    ((void (*)(id, SEL, BOOL))origSetHitTestsAsOpaque)(layer, selector, value);
+    if (value) scheduleTopHitScan();
+}
+
+static void hookedSetFilters(CALayer *layer, SEL selector, NSArray *filters) {
+    ((void (*)(id, SEL, NSArray *))origSetFilters)(layer, selector, filters);
+    if (!writingTopHitFilters && objc_getAssociatedObject(layer, &savedFiltersKey)) {
+        objc_setAssociatedObject(layer, &savedFiltersKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        scheduleTopHitScan();
+    }
+}
+
+static void hookedSendEvent(NSWindow *window, SEL selector, NSEvent *event) {
+    if (forwardingTopHitEvent) {
+        ((void (*)(id, SEL, NSEvent *))origSendEvent)(window, selector, event);
+        return;
+    }
+    NSEventType type = event.type;
+    NSWindow *target = window;
+    if (!invertColorsEnabled() && isTrackedMouseEvent(type)) {
+        BOOL targetingIsland = isIslandWindow(window);
+        BOOL isDown = (type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown);
+        BOOL isUp = (type == NSEventTypeLeftMouseUp || type == NSEventTypeRightMouseUp);
+        BOOL isDrag = (type == NSEventTypeLeftMouseDragged || type == NSEventTypeRightMouseDragged);
+        if (!targetingIsland && isDown) {
+            NSWindow *matched = islandWindowAtTopEdge(windowPointToScreen(window, event.locationInWindow));
+            redirectTargetWindow = matched;
+            if (matched) target = matched;
+        } else if (!targetingIsland && redirectTargetWindow && (isDrag || isUp)) {
+            target = redirectTargetWindow;
+            if (isUp) redirectTargetWindow = nil;
+        } else if (isDown || isUp) {
+            redirectTargetWindow = nil;
+        }
+
+        if (target != window || targetingIsland) {
+            CGPoint point = event.locationInWindow;
+            if (target != window) {
+                CGPoint screenPoint = windowPointToScreen(window, point);
+                point = CGPointMake(screenPoint.x - target.frame.origin.x,
+                                    screenPoint.y - target.frame.origin.y);
+#ifdef MACISLAND_TESTING
+                testRedirectCount++;
+#endif
+            }
+            CGFloat topLimit = target.frame.size.height - 0.5;
+            if (target != window || point.y > topLimit) {
+                if (point.y > topLimit) point.y = topLimit;
+                event = clampedMouseEvent(event, target, point);
+            }
+        }
+    }
+#ifdef MACISLAND_TESTING
+    if (isTrackedMouseEvent(type)) {
+        lastTestClampedLayer = islandRootLayer(target);
+        lastTestDeliveredPoint = event.locationInWindow;
+    }
+#endif
+    if (target != window) {
+        @try {
+            forwardingTopHitEvent = YES;
+            [target sendEvent:event];
+        } @finally {
+            forwardingTopHitEvent = NO;
+        }
+        return;
+    }
+    ((void (*)(id, SEL, NSEvent *))origSendEvent)(window, selector, event);
+}
+
+static BOOL verifyVoidOneArgMethod(Method method, char expectedArgType) {
+    if (!method || method_getNumberOfArguments(method) != 3) return NO;
+    char ret[16] = {0}, arg[16] = {0};
+    method_getReturnType(method, ret, sizeof(ret));
+    method_getArgumentType(method, 2, arg, sizeof(arg));
+    return ret[0] == 'v' && arg[0] == expectedArgType;
+}
+
+static void installTopHitHooks(void) {
+    if (topHitInitialized) return;
+    Method hitMethod = class_getInstanceMethod(CALayer.class, NSSelectorFromString(@"setHitTestsAsOpaque:"));
+    Method filterMethod = class_getInstanceMethod(CALayer.class, @selector(setFilters:));
+    Method sendEventMethod = class_getInstanceMethod(NSWindow.class, @selector(sendEvent:));
+    if (!hitMethod || !filterMethod || !sendEventMethod) return;
+    if (!(verifyVoidOneArgMethod(hitMethod, 'B') || verifyVoidOneArgMethod(hitMethod, 'c')) ||
+        !verifyVoidOneArgMethod(filterMethod, '@') ||
+        !verifyVoidOneArgMethod(sendEventMethod, '@')) {
+        return;
+    }
+    origSetHitTestsAsOpaque = method_getImplementation(hitMethod);
+    origSetFilters = method_getImplementation(filterMethod);
+    origSendEvent = method_getImplementation(sendEventMethod);
+    method_setImplementation(hitMethod, (IMP)hookedSetHitTestsAsOpaque);
+    method_setImplementation(filterMethod, (IMP)hookedSetFilters);
+    method_setImplementation(sendEventMethod, (IMP)hookedSendEvent);
+
+    [NSWorkspace.sharedWorkspace.notificationCenter
+        addObserverForName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(__unused NSNotification *note) {
+        scanTopHitWindows();
+    }];
+
+    topHitVerifyTimer = [NSTimer timerWithTimeInterval:0.5
+                                               repeats:YES
+                                                 block:^(__unused NSTimer *timer) {
+        verifyTopRowHitShapes();
+        scanTopHitWindows();
+    }];
+    topHitVerifyTimer.tolerance = 0.25;
+    [NSRunLoop.mainRunLoop addTimer:topHitVerifyTimer forMode:NSRunLoopCommonModes];
+    topHitInitialized = YES;
+}
+
+#ifdef MACISLAND_TESTING
+void MacIslandInstallTopHitHooksForTesting(void) {
+    installTopHitHooks();
+}
+
+void MacIslandSetTopHitTestWindows(NSArray<NSWindow *> *windows) {
+    testOverrideWindows = windows;
+}
+
+void MacIslandSetTopHitInvertColorsForTesting(BOOL enabled) {
+    useTestInvertOverride = YES;
+    testInvertOverrideValue = enabled;
+    scanTopHitWindows();
+}
+
+void MacIslandScanTopHitForTesting(void) {
+    scanTopHitWindows();
+}
+
+void MacIslandTopHitStatsForTesting(NSUInteger *coveredOut, NSUInteger *stripsOut,
+                                    NSUInteger *redirectsOut, CGPoint *lastPointOut) {
+    if (coveredOut) *coveredOut = coveredIslands.count;
+    if (stripsOut) *stripsOut = activeTopStrips.count;
+    if (redirectsOut) *redirectsOut = testRedirectCount;
+    if (lastPointOut) *lastPointOut = lastTestDeliveredPoint;
+    (void)topHitMissCount;
+    (void)topHitRefreshCount;
+    (void)lastTestClampedLayer;
+}
+#endif
+
+__attribute__((constructor))
+static void installTopEdgeHitSupport(void) {
+    if (!MacIslandIsMenuBarAgent()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        installTopHitHooks();
+        scanTopHitWindows();
+    });
+}
+MACISLAND_TOP_HIT_M
+
   cat > "$SCRATCH/provider-abi.c" <<'MACISLAND_PROVIDER_ABI_C'
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -4888,7 +5980,6 @@ bool mi_is_optional_some(const void *enum_addr, const void *wrapped_metadata) {
     return get_tag(enum_addr, 1, wrapped_metadata) == 0;
 }
 
-#ifdef MACISLAND_TESTING
 extern const void *swift_getTypeByMangledNameInContext2(
     const char *typeNameStart, size_t typeNameLength,
     const void *context, const void *const *genericArgs);
@@ -4898,6 +5989,7 @@ const void *mi_get_type_by_mangled_name(const char *start, size_t len) {
     return swift_getTypeByMangledNameInContext2(start, len, NULL, NULL);
 }
 
+#ifdef MACISLAND_TESTING
 void mi_store_optional_tag(void *enum_addr, unsigned which_case, const void *wrapped_metadata) {
     if (!enum_addr || !wrapped_metadata) return;
     const uint8_t *vwt = auth_vwt(wrapped_metadata);
@@ -4922,8 +6014,9 @@ extern void mi_clock_body_3(void);
 extern void mi_clock_body_4(void);
 extern void mi_clock_body_5(void);
 extern void mi_clock_body_6(void);
+extern void mi_banner_body(void);
 
-static void (*const mi_witness_entries[7])(void) = {
+static void (*const mi_witness_entries[8])(void) = {
     mi_surface_body,
     mi_clock_body_1,
     mi_clock_body_2,
@@ -4931,12 +6024,13 @@ static void (*const mi_witness_entries[7])(void) = {
     mi_clock_body_4,
     mi_clock_body_5,
     mi_clock_body_6,
+    mi_banner_body,
 };
 
-__attribute__((visibility("hidden"))) uintptr_t mi_saved_bodies[7];
+__attribute__((visibility("hidden"))) uintptr_t mi_saved_bodies[8];
 
 uintptr_t mi_prepare_witness_body(uint32_t index, uintptr_t *slot, uint32_t discriminator) {
-    if (index >= 7) return 0;
+    if (index >= 8) return 0;
     void (*entry)(void) = mi_witness_entries[index];
 #if __has_feature(ptrauth_calls)
     uintptr_t context = ptrauth_blend_discriminator(slot, discriminator);
@@ -5005,6 +6099,7 @@ MI_CLOCK_TRAMPOLINE _mi_clock_body_3, 3, 24
 MI_CLOCK_TRAMPOLINE _mi_clock_body_4, 4, 32
 MI_CLOCK_TRAMPOLINE _mi_clock_body_5, 5, 40
 MI_CLOCK_TRAMPOLINE _mi_clock_body_6, 6, 48
+MI_WITNESS_TRAMPOLINE _mi_banner_body, 56, _mi_banner_body_result
 MACISLAND_PROVIDER_BODY_S
 
   cat > "$SCRATCH/witness.swift" <<'MACISLAND_WITNESS_SWIFT'
@@ -6292,6 +7387,399 @@ func installAllClockPatches() -> Int32 {
 }
 MACISLAND_CLOCK_SWIFT
 
+  cat > "$SCRATCH/banner.swift" <<'MACISLAND_BANNER_SWIFT'
+import AppKit
+import Darwin
+import SwiftUI
+import os
+
+private let bannerContainerMangle = "14SystemBannerUI24CenterHUDBannerContainerV"
+private let bannerReadiness = OSAllocatedUnfairLock<Int32>(initialState: 0)
+
+@_silgen_name("mi_get_type_by_mangled_name")
+private func getTypeByMangledName(_ start: UnsafePointer<CChar>, _ len: Int) -> UnsafeRawPointer?
+
+private enum BatteryBannerStyle {
+  case charging
+  case warning
+
+  var stockWidthRange: ClosedRange<CGFloat> {
+    switch self {
+    case .charging: return 180.0...240.0
+    case .warning: return 260.0...305.0
+    }
+  }
+
+  var stockHeightRange: ClosedRange<CGFloat> {
+    switch self {
+    case .charging: return 44.0...56.0
+    case .warning: return 54.0...66.0
+    }
+  }
+
+  var sideSpan: CGFloat {
+    switch self {
+    case .charging: return 162.0
+    case .warning: return 242.0
+    }
+  }
+}
+
+private struct BannerPatchPlan {
+  let controllerOffset: Int
+  let wrappedControllerOffset: Int
+  let resolvedSizeOffset: Int?
+  let gestureFeatureEnabled: Bool?
+}
+
+private nonisolated(unsafe) var bannerPlan: BannerPatchPlan?
+private nonisolated(unsafe) var bannerSlot: (UnsafeMutablePointer<UInt>, UInt, UInt)?
+private nonisolated(unsafe) var bannerHandler:
+  ((UnsafeRawPointer, UnsafeMutableRawPointer) -> Void)?
+
+private func resolveBannerContainerType() -> (any View.Type)? {
+  let path = "/System/Library/PrivateFrameworks/SystemBannerUI.framework/SystemBannerUI"
+  guard dlopen(path, RTLD_LAZY) != nil else { return nil }
+  let bytes = Array(bannerContainerMangle.utf8CString)
+  let raw = bytes.withUnsafeBufferPointer { buf -> UnsafeRawPointer? in
+    guard let base = buf.baseAddress else { return nil }
+    return getTypeByMangledName(base, bannerContainerMangle.utf8.count)
+  }
+  guard let raw else { return nil }
+  return unsafeBitCast(raw, to: Any.Type.self) as? any View.Type
+}
+
+private func resolveGestureContainerGraphEnabled() -> Bool? {
+  guard
+    let uiCore = dlopen(
+      "/System/Library/PrivateFrameworks/SwiftUICore.framework/SwiftUICore", RTLD_LAZY),
+    let sym = dlsym(uiCore, "$s7SwiftUI28GestureContainerGraphFeatureV9isEnabledSbvgZ")
+  else { return nil }
+  let fn = unsafeBitCast(sym, to: (@convention(thin) () -> Bool).self)
+  return fn()
+}
+
+private func findEnvironmentCGSizeOffset(_ bodyType: Any.Type) -> Int? {
+  var current = bodyType
+  var base = 0
+  for _ in 0..<8 {
+    if let mod = fieldInfo(current, "modifier"),
+      String(reflecting: mod.1) == "SwiftUI._EnvironmentKeyWritingModifier<__C.CGSize>",
+      let val = fieldInfo(mod.1, "value"), val.1 == CGSize.self
+    {
+      return base + mod.0 + val.0
+    }
+    guard let next = fieldInfo(current, "content") else { break }
+    base += next.0
+    current = next.1
+  }
+  return nil
+}
+
+private func readPublishedContentValue(_ publishedValue: Any) -> Any? {
+  guard let storage = child(publishedValue, "storage") else { return nil }
+  if let direct = child(storage, "value") {
+    return direct
+  }
+  if let pub = child(storage, "publisher"),
+    let subject = child(pub, "subject"),
+    let current = child(subject, "currentValue")
+  {
+    return current
+  }
+  return nil
+}
+
+private func unwrapOptionalValue(_ value: Any) -> Any? {
+  let mirror = Mirror(reflecting: value)
+  guard mirror.displayStyle == .optional else { return value }
+  return mirror.children.first?.value
+}
+
+private func detectBatteryBannerStyle(fromController controller: AnyObject) -> BatteryBannerStyle? {
+  guard let published = child(controller, "_content"),
+    let rawOptional = readPublishedContentValue(published),
+    let content = unwrapOptionalValue(rawOptional)
+  else { return nil }
+  guard valueName(content).contains("LowBatterySystemBannerContent") else { return nil }
+  guard let style = child(content, "style") else { return nil }
+  let desc = String(describing: style)
+  if desc.contains("charging") { return .charging }
+  if desc.contains("warning") { return .warning }
+  return nil
+}
+
+private func activeMainDisplayNotch() -> (width: CGFloat, centeredDisplayWidth: CGFloat)? {
+  guard let main = NSScreen.main,
+    main.safeAreaInsets.top > 0,
+    let left = main.auxiliaryTopLeftArea,
+    let right = main.auxiliaryTopRightArea
+  else { return nil }
+  let width = right.minX - left.maxX
+  guard width > 0 else { return nil }
+  let mid = (left.maxX + right.minX) * 0.5
+  let centeredWidth = 2 * min(mid - main.frame.minX, main.frame.maxX - mid)
+  guard centeredWidth > 0 else { return nil }
+  return (width, centeredWidth)
+}
+
+private func readViewAsAny(_ ptr: UnsafeRawPointer, type: Any.Type) -> Any? {
+  guard let viewType = type as? any View.Type else { return nil }
+  func load<V: View>(_: V.Type) -> Any {
+    ptr.assumingMemoryBound(to: V.self).pointee
+  }
+  return load(viewType)
+}
+
+@discardableResult
+func widenMatchingFrameLayoutsInMemory(
+  _ ptr: UnsafeMutableRawPointer,
+  type: Any.Type,
+  stockWidth: ClosedRange<CGFloat>,
+  stockHeight: ClosedRange<CGFloat>,
+  targetWidth: CGFloat,
+  gestureFeatureEnabled: Bool?,
+  depth: Int = 0
+) -> Int {
+  guard depth < 24 else { return 0 }
+  let reflected = String(reflecting: type)
+
+  if reflected == "SwiftUI._FrameLayout" {
+    guard let wf = fieldInfo(type, "width"), wf.1 == CGFloat?.self,
+      let hf = fieldInfo(type, "height"), hf.1 == CGFloat?.self
+    else { return 0 }
+    let wPtr = ptr.advanced(by: wf.0).assumingMemoryBound(to: CGFloat?.self)
+    let hPtr = ptr.advanced(by: hf.0).assumingMemoryBound(to: CGFloat?.self)
+    guard let w = wPtr.pointee, let h = hPtr.pointee,
+      stockWidth.contains(w), stockHeight.contains(h), w < targetWidth
+    else { return 0 }
+    wPtr.pointee = targetWidth
+    return 1
+  }
+
+  if reflected == "SwiftUI.AnyView" {
+    guard let view = readViewAsAny(ptr, type: AnyView.self),
+      let storageObj = child(view, "storage") as AnyObject?,
+      let cls = object_getClass(storageObj),
+      let ivar = class_getInstanceVariable(cls, "view")
+    else { return 0 }
+    let ivarOffset = ivar_getOffset(ivar)
+    guard ivarOffset > 0, let innerVal = child(storageObj, "view") else { return 0 }
+    let innerPtr = Unmanaged.passUnretained(storageObj).toOpaque().advanced(by: ivarOffset)
+    return widenMatchingFrameLayoutsInMemory(
+      innerPtr, type: Swift.type(of: innerVal),
+      stockWidth: stockWidth, stockHeight: stockHeight,
+      targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+      depth: depth + 1)
+  }
+
+  if reflected.hasPrefix("SwiftUI.ModifiedContent<") {
+    var total = 0
+    if let cf = fieldInfo(type, "content") {
+      total += widenMatchingFrameLayoutsInMemory(
+        ptr.advanced(by: cf.0), type: cf.1,
+        stockWidth: stockWidth, stockHeight: stockHeight,
+        targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+        depth: depth + 1)
+    }
+    if let mf = fieldInfo(type, "modifier") {
+      total += widenMatchingFrameLayoutsInMemory(
+        ptr.advanced(by: mf.0), type: mf.1,
+        stockWidth: stockWidth, stockHeight: stockHeight,
+        targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+        depth: depth + 1)
+    }
+    return total
+  }
+
+  if reflected.hasPrefix("SwiftUI._VariadicView.Tree<") {
+    guard let cf = fieldInfo(type, "content") else { return 0 }
+    return widenMatchingFrameLayoutsInMemory(
+      ptr.advanced(by: cf.0), type: cf.1,
+      stockWidth: stockWidth, stockHeight: stockHeight,
+      targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+      depth: depth + 1)
+  }
+
+  if reflected.hasPrefix("SwiftUI.StaticIf<") {
+    guard let enabled = gestureFeatureEnabled else { return 0 }
+    let fieldName = enabled ? "trueBody" : "falseBody"
+    guard let bf = fieldInfo(type, fieldName) else { return 0 }
+    return widenMatchingFrameLayoutsInMemory(
+      ptr.advanced(by: bf.0), type: bf.1,
+      stockWidth: stockWidth, stockHeight: stockHeight,
+      targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+      depth: depth + 1)
+  }
+
+  if reflected.hasPrefix("Swift.Optional<") {
+    let wrappedType = genericTypeArguments(type, count: 1)[0]
+    guard isOptionalSome(ptr, wrappedType),
+      typeLayoutSize(wrappedType) <= typeLayoutSize(type)
+    else { return 0 }
+    return widenMatchingFrameLayoutsInMemory(
+      ptr, type: wrappedType,
+      stockWidth: stockWidth, stockHeight: stockHeight,
+      targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+      depth: depth + 1)
+  }
+
+  if reflected.hasPrefix("SwiftUI._ConditionalContent<") {
+    guard let val = readViewAsAny(ptr, type: type),
+      let storage = child(val, "storage"),
+      let active = Mirror(reflecting: storage).children.first
+    else { return 0 }
+    let args = genericTypeArguments(type, count: 2)
+    let activeType: Any.Type
+    if active.label == "trueContent" {
+      activeType = args[0]
+    } else if active.label == "falseContent" {
+      activeType = args[1]
+    } else {
+      return 0
+    }
+    guard typeLayoutSize(activeType) <= typeLayoutSize(type) else { return 0 }
+    return widenMatchingFrameLayoutsInMemory(
+      ptr, type: activeType,
+      stockWidth: stockWidth, stockHeight: stockHeight,
+      targetWidth: targetWidth, gestureFeatureEnabled: gestureFeatureEnabled,
+      depth: depth + 1)
+  }
+
+  return 0
+}
+
+private func prepareBannerHook<V: View>(_ viewType: V.Type) -> Int32 {
+  if bannerSlot != nil { return 1 }
+  guard let ctrlField = fieldInfo(viewType, "_controller"),
+    let wrappedField = fieldInfo(ctrlField.1, "wrappedValue"),
+    let req = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$s7SwiftUI4ViewP4body4BodyQzvgTq")
+  else { return -3 }
+
+  let plan = BannerPatchPlan(
+    controllerOffset: ctrlField.0,
+    wrappedControllerOffset: wrappedField.0,
+    resolvedSizeOffset: findEnvironmentCGSizeOffset(V.Body.self),
+    gestureFeatureEnabled: resolveGestureContainerGraphEnabled()
+  )
+  let slot = witnessTable(viewType) + 6
+  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return -4 }
+
+  bannerPlan = plan
+  bannerHandler = { selfPtr, resultPtr in
+    guard let p = bannerPlan, let notch = activeMainDisplayNotch() else { return }
+    let ctrlPtr = selfPtr.advanced(by: p.controllerOffset + p.wrappedControllerOffset)
+    guard let controllerObj = ctrlPtr.assumingMemoryBound(to: AnyObject?.self).pointee,
+      let style = detectBatteryBannerStyle(fromController: controllerObj)
+    else { return }
+
+    let targetWidth = min(notch.width + style.sideSpan, notch.centeredDisplayWidth)
+    let wRange = style.stockWidthRange
+    let hRange = style.stockHeightRange
+
+    if let sizeOff = p.resolvedSizeOffset,
+      sizeOff + MemoryLayout<CGSize>.size <= MemoryLayout<V.Body>.size
+    {
+      let sizePtr = resultPtr.advanced(by: sizeOff).assumingMemoryBound(to: CGSize.self)
+      var currentSize = sizePtr.pointee
+      if wRange.contains(currentSize.width), hRange.contains(currentSize.height),
+        currentSize.width < targetWidth
+      {
+        currentSize.width = targetWidth
+        sizePtr.pointee = currentSize
+      }
+    }
+
+    widenMatchingFrameLayoutsInMemory(
+      resultPtr, type: V.Body.self,
+      stockWidth: wRange, stockHeight: hRange,
+      targetWidth: targetWidth, gestureFeatureEnabled: p.gestureFeatureEnabled)
+  }
+
+  let discriminator = req.load(as: UInt32.self) >> 16
+  let replacement = prepareWitnessBody(7, slot, discriminator)
+  guard replacement != 0 else {
+    bannerHandler = nil
+    return -5
+  }
+  bannerSlot = (slot, slot.pointee, replacement)
+  slot.pointee = replacement
+  return 1
+}
+
+func installBannerPatches() -> Int32 {
+  guard let target = resolveBannerContainerType() else { return -2 }
+  func open<V: View>(_ t: V.Type) -> Int32 {
+    prepareBannerHook(t)
+  }
+  return open(target)
+}
+
+@_cdecl("mi_banner_enable") public func enableBanner() -> Int32 {
+  guard rightBuild(),
+    Bundle.main.executablePath
+      == "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+  else { return -1 }
+  DispatchQueue.main.async {
+    let result = installBannerPatches()
+    bannerReadiness.withLock { $0 = result }
+  }
+  return 0
+}
+
+@_cdecl("mi_banner_status") public func bannerStatus() -> Int32 {
+  bannerReadiness.withLock { $0 }
+}
+
+@_cdecl("mi_banner_body_result") public func adjustBannerBody(
+  _ native: UnsafeRawPointer, _ out: UnsafeMutableRawPointer
+) {
+  bannerHandler?(native, out)
+}
+
+#if MACISLAND_TESTING
+@_cdecl("mi_banner_self_test") public func runBannerSelfTest() -> Int32 {
+  let first = installBannerPatches()
+  let second = installBannerPatches()
+  guard first == 1, second == 1 else { return -1 }
+
+  @ViewBuilder func sampleBanner(charging: Bool, wrapped: Bool) -> some View {
+    if wrapped {
+      AnyView(Color.black.frame(width: charging ? 220 : 300, height: charging ? 50 : 60))
+    } else {
+      Color.black.frame(width: 309, height: 60)
+    }
+  }
+
+  func verifyFrame<V: View>(_ initial: V, style: BatteryBannerStyle, expectedWidth: CGFloat, expectedHits: Int) -> Bool {
+    var box = initial
+    let count = withUnsafeMutablePointer(to: &box) { ptr -> Int in
+      widenMatchingFrameLayoutsInMemory(
+        UnsafeMutableRawPointer(ptr),
+        type: V.self,
+        stockWidth: style.stockWidthRange,
+        stockHeight: style.stockHeightRange,
+        targetWidth: expectedWidth,
+        gestureFeatureEnabled: nil
+      )
+    }
+    return count == expectedHits
+  }
+
+  // Charging (220x50 -> 382) and low-battery warning (300x60 -> 462) inside AnyView + ConditionalContent
+  guard verifyFrame(sampleBanner(charging: true, wrapped: true), style: .charging, expectedWidth: 382, expectedHits: 1),
+    verifyFrame(sampleBanner(charging: false, wrapped: true), style: .warning, expectedWidth: 462, expectedHits: 1),
+    // Volume/Brightness HUD (309x60) must never be altered
+    verifyFrame(sampleBanner(charging: false, wrapped: false), style: .warning, expectedWidth: 462, expectedHits: 0)
+  else {
+    return -10
+  }
+
+  return 1
+}
+#endif
+MACISLAND_BANNER_SWIFT
+
   cat > "$SCRATCH/spotlight.m" <<'MACISLAND_SPOTLIGHT_M'
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
@@ -6365,7 +7853,7 @@ MACISLAND_SPOTLIGHT_M
     -o "$SCRATCH/island.dylib" \
     "$SCRATCH/island.c" "$SCRATCH/notch.m" "$SCRATCH/scene-audit.m" \
     "$SCRATCH/activity-metrics.m" "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" \
-    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" \
+    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" "$SCRATCH/top-hit.m" \
     -framework AppKit -framework QuartzCore -F/System/Library/PrivateFrameworks \
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
@@ -6378,7 +7866,8 @@ MACISLAND_SPOTLIGHT_M
     -c "$SCRATCH/provider-body.S" -o "$SCRATCH/provider-body.o"
   /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \
     -module-cache-path "$SCRATCH/swift-modules" -O -emit-library \
-    "$SCRATCH/witness.swift" "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" "$SCRATCH/clock.swift" \
+    "$SCRATCH/witness.swift" "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" \
+    "$SCRATCH/clock.swift" "$SCRATCH/banner.swift" \
     "$SCRATCH/provider-abi.o" "$SCRATCH/provider-body.o" "$SCRATCH/spotlight.o" \
     -Xlinker -undefined -Xlinker dynamic_lookup \
     -Xlinker -install_name -Xlinker @rpath/notch-music.dylib \
@@ -6386,6 +7875,7 @@ MACISLAND_SPOTLIGHT_M
   /usr/bin/codesign -f -s - "$SCRATCH/notch-music.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/notch-music.dylib"
   if [[ "$MODE" == --check ]]; then
+    /usr/bin/python3 "$SCRATCH/loader.py" --doctor
     echo "Loader syntax, native build, and signature checks passed. No installation or preference changes."
     exit 0
   fi

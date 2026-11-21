@@ -44,12 +44,7 @@ if [[ "$MODE" != --uninstall ]]; then
     echo "The macOS 27.2 SDK or later is required (selected SDK: ${SDK_VERSION:-none})." >&2; exit 1;
   }
   if [[ "$MODE" == install ]]; then
-    csrutil status | grep -q 'status: disabled' || {
-      echo "SIP must already be disabled; no protection settings were changed." >&2; exit 1;
-    }
-    /usr/bin/xcrun --find lldb >/dev/null 2>&1 || {
-      echo "The AMFI-compatible loader requires LLDB in the selected developer tools." >&2; exit 1;
-    }
+    /usr/bin/python3 "$SCRATCH/loader.py" --check-install-env
   fi
 
   /usr/bin/python3 -m py_compile "$SCRATCH/loader.py" "$SCRATCH/manager.py"
@@ -65,19 +60,21 @@ if [[ "$MODE" != --uninstall ]]; then
 
   # @EMBED src/island/notch.m notch.m MACISLAND_NOTCH_M
 
-  # @EMBED src/island/short-host.m short-host.m MACISLAND_SHORT_HOST_M
-
   # @EMBED src/island/scene-audit.m scene-audit.m MACISLAND_SCENE_AUDIT_M
 
   # @EMBED src/island/activity-metrics.m activity-metrics.m MACISLAND_ACTIVITY_METRICS_M
 
   # @EMBED src/island/safearea.m safearea.m MACISLAND_SAFEAREA_M
 
+  # @EMBED src/island/short-host.m short-host.m MACISLAND_SHORT_HOST_M
+
   # @EMBED src/island/mask-geometry.m mask-geometry.m MACISLAND_MASK_GEOMETRY_M
 
   # @EMBED src/island/mask-modifiers.m mask-modifiers.m MACISLAND_MASK_MODIFIERS_M
 
   # @EMBED src/island/mask.m mask.m MACISLAND_MASK_M
+
+  # @EMBED src/island/top-hit.m top-hit.m MACISLAND_TOP_HIT_M
 
   # @EMBED src/providers/provider-abi.c provider-abi.c MACISLAND_PROVIDER_ABI_C
 
@@ -91,6 +88,8 @@ if [[ "$MODE" != --uninstall ]]; then
 
   # @EMBED src/providers/clock.swift clock.swift MACISLAND_CLOCK_SWIFT
 
+  # @EMBED src/providers/banner.swift banner.swift MACISLAND_BANNER_SWIFT
+
   # @EMBED src/providers/spotlight.m spotlight.m MACISLAND_SPOTLIGHT_M
 
   echo "Building native notch patch from embedded source..."
@@ -99,7 +98,7 @@ if [[ "$MODE" != --uninstall ]]; then
     -o "$SCRATCH/island.dylib" \
     "$SCRATCH/island.c" "$SCRATCH/notch.m" "$SCRATCH/scene-audit.m" \
     "$SCRATCH/activity-metrics.m" "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" \
-    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" \
+    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" "$SCRATCH/top-hit.m" \
     -framework AppKit -framework QuartzCore -F/System/Library/PrivateFrameworks \
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
@@ -112,7 +111,8 @@ if [[ "$MODE" != --uninstall ]]; then
     -c "$SCRATCH/provider-body.S" -o "$SCRATCH/provider-body.o"
   /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \
     -module-cache-path "$SCRATCH/swift-modules" -O -emit-library \
-    "$SCRATCH/witness.swift" "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" "$SCRATCH/clock.swift" \
+    "$SCRATCH/witness.swift" "$SCRATCH/music.swift" "$SCRATCH/music-layout.swift" \
+    "$SCRATCH/clock.swift" "$SCRATCH/banner.swift" \
     "$SCRATCH/provider-abi.o" "$SCRATCH/provider-body.o" "$SCRATCH/spotlight.o" \
     -Xlinker -undefined -Xlinker dynamic_lookup \
     -Xlinker -install_name -Xlinker @rpath/notch-music.dylib \
@@ -120,6 +120,7 @@ if [[ "$MODE" != --uninstall ]]; then
   /usr/bin/codesign -f -s - "$SCRATCH/notch-music.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/notch-music.dylib"
   if [[ "$MODE" == --check ]]; then
+    /usr/bin/python3 "$SCRATCH/loader.py" --doctor
     echo "Loader syntax, native build, and signature checks passed. No installation or preference changes."
     exit 0
   fi

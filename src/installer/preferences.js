@@ -9,6 +9,9 @@ function run(args) {
     if (domain === menuBarDomain && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
         storedFile = $(menuBarDomain + '.plist');
         defaults = $.NSUserDefaults.alloc._initWithSuiteNameContainer('com.apple.MenuBar', container);
+    } else if (domain === 'com.apple.MenuBarAgent' && ['ShowSoftwareNotch', 'EmulateCenterHUD'].indexOf(key) !== -1) {
+        storedFile = container.path.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.stringByAppendingPathComponent('Preferences/com.apple.MenuBarAgent.plist');
+        defaults = $.NSUserDefaults.alloc.initWithSuiteName('com.apple.MenuBarAgent');
     } else if (domain === 'com.apple.campo' && key === 'SupportsIslandMitosis') {
         storedFile = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Preferences/com.apple.campo.plist');
         defaults = $.NSUserDefaults.alloc.initWithSuiteName(domain);

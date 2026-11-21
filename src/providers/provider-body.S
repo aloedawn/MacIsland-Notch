@@ -50,3 +50,4 @@ MI_CLOCK_TRAMPOLINE _mi_clock_body_3, 3, 24
 MI_CLOCK_TRAMPOLINE _mi_clock_body_4, 4, 32
 MI_CLOCK_TRAMPOLINE _mi_clock_body_5, 5, 40
 MI_CLOCK_TRAMPOLINE _mi_clock_body_6, 6, 48
+MI_WITNESS_TRAMPOLINE _mi_banner_body, 56, _mi_banner_body_result

@@ -702,6 +702,63 @@ int main(void) {
             return 1;
         }
 
+        // ControlCenter battery banners (hosted family=1):
+        // charging (220x50 -> 382pt) and low-battery warning (300x60 -> 462pt) widen on
+        // the 220pt notch, restore stock widths on external display, and leave 309x60
+        // Volume/Brightness HUD untouched.
+        NSData *ccMargins = encodeJSON(@{@"top": @44, @"leading": @16, @"bottom": @16, @"trailing": @16});
+        NSObject<MacIslandTestSettings> *ccCharge = [mutableClass new];
+        [ccCharge setClientIdentifier:@"com.apple.controlcenter"];
+        [ccCharge setDisplayConfiguration:displayConfigWithID(303)];
+        [ccCharge setHostedLayoutMargins:ccMargins];
+        [ccCharge setHostedMinimumSize:[NSValue valueWithSize:NSMakeSize(220, 50)]];
+        [ccCharge setHostedMaximumSize:[NSValue valueWithSize:NSMakeSize(220, 50)]];
+        [ccCharge setHostedIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(0, 0, 220, 38)]];
+        if (fabs([[ccCharge hostedMinimumSize] sizeValue].width - 382.0) > 0.001 ||
+            fabs([[ccCharge hostedMaximumSize] sizeValue].width - 540.0) > 0.001) {
+            fprintf(stderr, "expected ControlCenter charging banner 382..540 on 220pt notch, got %.1f..%.1f\n",
+                    [[ccCharge hostedMinimumSize] sizeValue].width,
+                    [[ccCharge hostedMaximumSize] sizeValue].width);
+            return 1;
+        }
+        NSObject<MacIslandTestSettings> *ccChargeExt = [[ccCharge copy] mutableCopy];
+        [ccChargeExt setDisplayConfiguration:displayConfigWithID(202)];
+        if (!NSEqualSizes([[ccChargeExt hostedMinimumSize] sizeValue], NSMakeSize(220, 50)) ||
+            !NSEqualSizes([[ccChargeExt hostedMaximumSize] sizeValue], NSMakeSize(220, 50))) {
+            fprintf(stderr, "ControlCenter charging banner did not restore 220x50 on external display\n");
+            return 1;
+        }
+
+        NSObject<MacIslandTestSettings> *ccWarn = [mutableClass new];
+        [ccWarn setClientIdentifier:@"com.apple.controlcenter"];
+        [ccWarn setDisplayConfiguration:displayConfigWithID(303)];
+        [ccWarn setHostedLayoutMargins:ccMargins];
+        [ccWarn setHostedMinimumSize:[NSValue valueWithSize:NSMakeSize(300, 60)]];
+        [ccWarn setHostedMaximumSize:[NSValue valueWithSize:NSMakeSize(300, 60)]];
+        [ccWarn setHostedIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(40, 0, 220, 38)]];
+        if (fabs([[ccWarn hostedMinimumSize] sizeValue].width - 462.0) > 0.001 ||
+            fabs([[ccWarn hostedMaximumSize] sizeValue].width - 540.0) > 0.001) {
+            fprintf(stderr, "expected ControlCenter warning banner 462..540 on 220pt notch, got %.1f..%.1f\n",
+                    [[ccWarn hostedMinimumSize] sizeValue].width,
+                    [[ccWarn hostedMaximumSize] sizeValue].width);
+            return 1;
+        }
+
+        NSObject<MacIslandTestSettings> *ccVolume = [mutableClass new];
+        [ccVolume setClientIdentifier:@"com.apple.controlcenter"];
+        [ccVolume setDisplayConfiguration:displayConfigWithID(303)];
+        [ccVolume setHostedLayoutMargins:ccMargins];
+        [ccVolume setHostedMinimumSize:[NSValue valueWithSize:NSMakeSize(309, 60)]];
+        [ccVolume setHostedMaximumSize:[NSValue valueWithSize:NSMakeSize(309, 60)]];
+        [ccVolume setHostedIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(44.5, 0, 220, 38)]];
+        if (fabs([[ccVolume hostedMinimumSize] sizeValue].width - 309.0) > 0.001 ||
+            fabs([[ccVolume hostedMaximumSize] sizeValue].width - 309.0) > 0.001) {
+            fprintf(stderr, "ControlCenter volume HUD 309x60 must stay 309pt, got %.1f..%.1f\n",
+                    [[ccVolume hostedMinimumSize] sizeValue].width,
+                    [[ccVolume hostedMaximumSize] sizeValue].width);
+            return 1;
+        }
+
         // External display restoration after mutableCopy:
         NSObject<MacIslandTestSettings> *m19 = [frozen16 mutableCopy];
         [m19 setDisplayConfiguration:displayConfigWithID(202)];

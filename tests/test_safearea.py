@@ -83,6 +83,24 @@ class SafeAreaSettingsTests(unittest.TestCase):
                 and ((r.get("patched") or {}).get("publishedObstructionRect") or {}).get("h") == 56
                 for r in records
             ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.controlcenter"
+                and (r.get("native") or {}).get("min") == {"w": 220, "h": 50}
+                and ((r.get("patched") or {}).get("min") or {}).get("w") == 382
+                for r in records
+            ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.controlcenter"
+                and (r.get("native") or {}).get("min") == {"w": 300, "h": 60}
+                and ((r.get("patched") or {}).get("min") or {}).get("w") == 462
+                for r in records
+            ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.controlcenter"
+                and (r.get("native") or {}).get("min") == {"w": 309, "h": 60}
+                and (r.get("patched") or {}).get("applied") is False
+                for r in records
+            ))
 
 
 if __name__ == "__main__":

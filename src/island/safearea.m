@@ -120,33 +120,51 @@ static BOOL isDetachedObstructionLocation(id raw) {
     if ([value isKindOfClass:NSString.class]) return [(NSString *)value isEqualToString:@"noObstruction"];
     return NO;
 }
-static BOOL containsAirDropToken(id value) {
+static BOOL containsToken(id value, NSString *token) {
     if (!value) return NO;
     if ([value isKindOfClass:NSString.class]) {
-        return [(NSString *)value rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        return [(NSString *)value rangeOfString:token options:NSCaseInsensitiveSearch].location != NSNotFound;
     }
     if ([value isKindOfClass:NSData.class]) {
         NSString *text = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
         if (text) {
-            return [text rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+            return [text rangeOfString:token options:NSCaseInsensitiveSearch].location != NSNotFound;
         }
     }
     if ([value isKindOfClass:NSDictionary.class]) {
         for (id key in (NSDictionary *)value) {
-            if (containsAirDropToken(key) || containsAirDropToken(((NSDictionary *)value)[key])) return YES;
+            if (containsToken(key, token) || containsToken(((NSDictionary *)value)[key], token)) return YES;
         }
     }
     if ([value isKindOfClass:NSArray.class]) {
         for (id item in (NSArray *)value) {
-            if (containsAirDropToken(item)) return YES;
+            if (containsToken(item, token)) return YES;
         }
     }
     return NO;
 }
 static BOOL isAirDropScene(id settings) {
-    return containsAirDropToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier")) ||
-           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier")) ||
-           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"));
+    return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"airdrop") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"), @"airdrop") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"), @"airdrop");
+}
+static BOOL isControlCenterScene(id settings) {
+    return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"controlcenter");
+}
+static CGFloat controlCenterBatteryBannerTargetWidth(NSSize nativeSize, MacIslandNotchAvoidance policy) {
+    if (!isfinite(nativeSize.width) || !isfinite(nativeSize.height)) return 0;
+    // Charging (220x50) keeps ~81pt side span; Low Battery (300x60) keeps ~121pt side span.
+    // Explicitly exclude 309pt Volume/Brightness HUDs and unrelated banners.
+    CGFloat sideSpan = 0;
+    if (nativeSize.width >= 180.0 && nativeSize.width <= 240.0 &&
+        nativeSize.height >= 44.0 && nativeSize.height <= 56.0) {
+        sideSpan = 162.0;
+    } else if (nativeSize.width >= 260.0 && nativeSize.width <= 305.0 &&
+               nativeSize.height >= 54.0 && nativeSize.height <= 66.0) {
+        sideSpan = 242.0;
+    }
+    if (sideSpan <= 0) return 0;
+    return MIN(policy.notchWidth + sideSpan, policy.centeredDisplayWidth);
 }
 
 // FrontBoardServices creates a fresh FBSMutableSceneSettings copy per update,
@@ -464,6 +482,17 @@ static MacIslandFamilyAuditSnapshot applyFamilyLayout(
                 minimum.width = floor;
                 if (isfinite(maximum.width)) {
                     maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                }
+            } else if (policy.extendsBelow && family == 1 && isControlCenterScene(settings)) {
+                CGFloat targetWidth = controlCenterBatteryBannerTargetWidth(native.minimum.sizeValue, policy);
+                if (targetWidth > 0) {
+                    minimum.width = MAX(minimum.width, targetWidth);
+                    CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+                    if (isfinite(maximum.width)) {
+                        maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+                    }
+                } else if (isfinite(maximum.width)) {
+                    maximum.width = MAX(maximum.width + extraX, minimum.width);
                 }
             } else if (isfinite(maximum.width)) {
                 maximum.width = MAX(maximum.width + extraX, minimum.width);
