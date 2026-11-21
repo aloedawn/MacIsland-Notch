@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check bundled installer sync
+        run: python3 scripts/build_installer.py --check
+      - name: Validate installer shell syntax
+        run: |
+          bash -n install.sh
+          shellcheck install.sh
+      - name: Run Python test suite
+        run: python3 -m unittest discover -s tests -v

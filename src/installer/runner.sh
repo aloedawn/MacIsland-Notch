@@ -30,10 +30,7 @@ trap 'exit 143' TERM
 
 if [[ "$MODE" != --uninstall ]]; then
   [[ "$(uname -m)" == arm64 ]] || { echo "Apple Silicon only" >&2; exit 1; }
-  case "$(sw_vers -buildVersion)" in
-    26C5035r|26C5047e) ;;
-    *) echo "Supported builds: macOS 27.3 beta 26C5035r and 26C5047e only." >&2; exit 1 ;;
-  esac
+  /usr/bin/python3 "$SCRATCH/loader.py" --check-build
   xcode-select -p >/dev/null 2>&1 || {
     echo "Install Apple developer tools first (Xcode or: xcode-select --install)." >&2; exit 1;
   }
@@ -56,8 +53,13 @@ if [[ "$MODE" != --uninstall ]]; then
   fi
 
   /usr/bin/python3 -m py_compile "$SCRATCH/loader.py" "$SCRATCH/manager.py"
+  /usr/bin/python3 "$SCRATCH/loader.py" --emit-builds-header > "$SCRATCH/supported-builds.h"
 
   # @EMBED src/island/notch-layout.h notch-layout.h MACISLAND_NOTCH_LAYOUT_H
+
+  # @EMBED src/island/safearea-internal.h safearea-internal.h MACISLAND_SAFEAREA_INTERNAL_H
+
+  # @EMBED src/island/mask-internal.h mask-internal.h MACISLAND_MASK_INTERNAL_H
 
   # @EMBED src/island/island.c island.c MACISLAND_ISLAND_C
 
@@ -65,7 +67,15 @@ if [[ "$MODE" != --uninstall ]]; then
 
   # @EMBED src/island/short-host.m short-host.m MACISLAND_SHORT_HOST_M
 
+  # @EMBED src/island/scene-audit.m scene-audit.m MACISLAND_SCENE_AUDIT_M
+
+  # @EMBED src/island/activity-metrics.m activity-metrics.m MACISLAND_ACTIVITY_METRICS_M
+
   # @EMBED src/island/safearea.m safearea.m MACISLAND_SAFEAREA_M
+
+  # @EMBED src/island/mask-geometry.m mask-geometry.m MACISLAND_MASK_GEOMETRY_M
+
+  # @EMBED src/island/mask-modifiers.m mask-modifiers.m MACISLAND_MASK_MODIFIERS_M
 
   # @EMBED src/island/mask.m mask.m MACISLAND_MASK_M
 
@@ -86,16 +96,18 @@ if [[ "$MODE" != --uninstall ]]; then
   echo "Building native notch patch from embedded source..."
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -dynamiclib -fobjc-arc -Wall -Wextra -Werror \
     -I"$SCRATCH" \
-    -o "$SCRATCH/island.dylib" "$SCRATCH/island.c" "$SCRATCH/notch.m" \
-    "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" "$SCRATCH/mask.m" \
+    -o "$SCRATCH/island.dylib" \
+    "$SCRATCH/island.c" "$SCRATCH/notch.m" "$SCRATCH/scene-audit.m" \
+    "$SCRATCH/activity-metrics.m" "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" \
+    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" \
     -framework AppKit -framework QuartzCore -F/System/Library/PrivateFrameworks \
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/island.dylib"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -fobjc-arc -Wall -Wextra -Werror \
-    -c "$SCRATCH/spotlight.m" -o "$SCRATCH/spotlight.o"
+    -I"$SCRATCH" -c "$SCRATCH/spotlight.m" -o "$SCRATCH/spotlight.o"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -Wall -Wextra -Werror \
-    -c "$SCRATCH/provider-abi.c" -o "$SCRATCH/provider-abi.o"
+    -I"$SCRATCH" -c "$SCRATCH/provider-abi.c" -o "$SCRATCH/provider-abi.o"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 \
     -c "$SCRATCH/provider-body.S" -o "$SCRATCH/provider-body.o"
   /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \

@@ -25,6 +25,8 @@ class SafeAreaSettingsTests(unittest.TestCase):
                     "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
                     "-DMACISLAND_TESTING",
                     "-I", str(ISLAND_DIR),
+                    str(ISLAND_DIR / "scene-audit.m"),
+                    str(ISLAND_DIR / "activity-metrics.m"),
                     str(ISLAND_DIR / "safearea.m"),
                     str(HERE / "safearea-probe.m"),
                     "-framework", "AppKit",

@@ -6,7 +6,7 @@ Enable Apple’s native Dynamic Island and adapt it to a MacBook’s physical no
 
 ### Compact Notch & Dual-Activity Mitosis
 
-Adapts Apple’s native `CenterHUD` around the physical camera housing with smooth spring transitions and a detached circular secondary bubble (`noObstruction`) when a second background activity is active.
+Adapts Apple’s native `CenterHUD` around the physical camera housing while preserving Apple’s liquid mitosis and absorption spring transitions when a second background activity splits out (`noObstruction`) or merges back in.
 
 <p align="center">
   <img src="docs/images/compact-notch.png" width="620" alt="Compact Dynamic Notch wrapping a live activity around the MacBook camera cutout" />
@@ -53,7 +53,7 @@ Uses Apple’s hardware Dynamic Island path on displays with a notch while keepi
 ## Requirements
 
 - Apple Silicon MacBook with a notch
-- **macOS 27.3 beta, build `26C5035r` or `26C5047e`** (other builds are rejected)
+- **macOS 27.3 beta, build `26C5035r` or `26C5047e`** (other builds are rejected by default; set `MACISLAND_ALLOW_UNVERIFIED_BUILD=1` to opt in on an unverified build)
 - Xcode / Apple developer tools with arm64e Swift compiler and macOS 27.2 SDK or later
 - SIP disabled (`amfi_get_out_of_my_way=0x1` is **not** required)
 
@@ -66,6 +66,12 @@ curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/insta
 ```
 
 The installer builds and signs the patch locally under `~/Library/MacIsland`, backs up existing MacIsland files and the three affected preferences, reloads `MenuBarAgent` (plus any running providers), and registers `com.macisland.loader` to keep everything active across logins and process restarts.
+
+To test on an unverified macOS build (relying on runtime structural checks and the loader's 3-per-15-minute reapply cap):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aloedawn/MacIsland-Notch/main/install.sh | MACISLAND_ALLOW_UNVERIFIED_BUILD=1 bash
+```
 
 ## Usage & Removal
 

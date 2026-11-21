@@ -15,6 +15,7 @@ BACKUP = ROOT / 'notch-backup'
 STATE = BACKUP / 'state.plist'
 DOMAIN = f'gui/{os.getuid()}'
 MENU_SERVICE = f'{DOMAIN}/com.apple.MenuBarAgent'
+ALLOW_UNVERIFIED_ENV = 'MACISLAND_ALLOW_UNVERIFIED_BUILD'
 PREFERENCES = [
     (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'ShowSoftwareNotch', False),
     (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'EmulateCenterHUD', True),
@@ -27,6 +28,11 @@ AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error
                                       'loader-state.json', 'loader-state.json.next')]
 # Login and periodic check: patch only service instances that are not yet patched.
 CHECK_INTERVAL = 30
+
+
+def allow_unverified_build(env=None):
+    source = os.environ if env is None else env
+    return source.get(ALLOW_UNVERIFIED_ENV, '').strip().lower() in ('1', 'true', 'yes')
 
 
 def run(*args, required=True):
@@ -124,13 +130,38 @@ def preferred_loader_script():
     return staged if staged.is_file() else (ROOT / 'loader.py')
 
 
-def stop_installed_music(state, *, required=True):
-    if MUSIC.name in state['files'] and MUSIC.is_file():
-        script = preferred_loader_script()
-        if script.is_file():
-            result = run('/usr/bin/python3', str(script), '--stop-music', required=required)
-            return result.returncode == 0 and b'Stopped patched Spotlight' in result.stdout.splitlines()
-    return False
+def _stop_installed_providers(*, required=True, check_state=None):
+    if check_state is not None and MUSIC.name not in check_state['files']:
+        return False
+    if not MUSIC.is_file():
+        return False
+    script = preferred_loader_script()
+    if not script.is_file():
+        return False
+    result = run('/usr/bin/python3', str(script), '--stop-providers', '--json', required=required)
+    if result.returncode != 0:
+        return False
+    stdout = result.stdout.decode('utf-8', 'replace').strip()
+    if stdout.startswith('{'):
+        try:
+            payload = json.loads(stdout)
+            stopped = payload.get('stopped', [])
+            if isinstance(stopped, list):
+                return 'spotlight' in stopped
+        except ValueError:
+            pass
+    return b'Stopped patched Spotlight' in result.stdout.splitlines()
+
+
+def _restore_files_and_preferences(file_entries, backup_dir, preferences):
+    for name, details in file_entries.items():
+        path = FILES[name]
+        if details['existed']:
+            replace_file(backup_dir / name, path, details['mode'])
+        else:
+            path.unlink(missing_ok=True)
+    for domain, key, saved in preferences:
+        write_preference(domain, key, saved)
 
 
 def restore_original(state, stopped_spotlight=False):
@@ -139,15 +170,9 @@ def restore_original(state, stopped_spotlight=False):
             raise RuntimeError(f'Missing backup: {BACKUP / name}; restoration stopped')
     # Stop the periodic check first, so it cannot reapply what is being removed.
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    stopped_spotlight = stop_installed_music(state, required=False) or stopped_spotlight
-    for name, details in state['files'].items():
-        path = FILES[name]
-        if details['existed']:
-            replace_file(BACKUP / name, path, details['mode'])
-        else:
-            path.unlink(missing_ok=True)
-    for saved in state['preferences']:
-        write_preference(saved['domain'], saved['key'], saved)
+    stopped_spotlight = _stop_installed_providers(required=False, check_state=state) or stopped_spotlight
+    preferences = [(saved['domain'], saved['key'], saved) for saved in state['preferences']]
+    _restore_files_and_preferences(state['files'], BACKUP, preferences)
     if state['files']['agent.plist']['existed']:
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
     else:
@@ -186,19 +211,8 @@ def restore_previous(previous, stopped_spotlight=False):
     snapshot, preferences = previous
     folder = SOURCE / 'previous'
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    if MUSIC.is_file():
-        script = preferred_loader_script()
-        if script.is_file():
-            result = run('/usr/bin/python3', str(script), '--stop-music', required=False)
-            stopped_spotlight |= result.returncode == 0 and b'Stopped patched Spotlight' in result.stdout.splitlines()
-    for name, details in snapshot.items():
-        path = FILES[name]
-        if details['existed']:
-            replace_file(folder / name, path, details['mode'])
-        else:
-            path.unlink(missing_ok=True)
-    for domain, key, saved in preferences:
-        write_preference(domain, key, saved)
+    stopped_spotlight = _stop_installed_providers(required=False) or stopped_spotlight
+    _restore_files_and_preferences(snapshot, folder, preferences)
     # Clear state recorded by the failed upgrade and synchronously restore the
     # previous loader before enabling its periodic LaunchAgent.
     (ROOT / 'loader-state.json').unlink(missing_ok=True)
@@ -214,7 +228,7 @@ def restore_previous(previous, stopped_spotlight=False):
 
 
 def agent_definition():
-    return {
+    definition = {
         'Label': 'com.macisland.loader',
         'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure'],
         'RunAtLoad': True,
@@ -223,6 +237,9 @@ def agent_definition():
         'StandardOutPath': str(ROOT / 'loader.log'),
         'StandardErrorPath': str(ROOT / 'loader-error.log'),
     }
+    if allow_unverified_build():
+        definition['EnvironmentVariables'] = {ALLOW_UNVERIFIED_ENV: '1'}
+    return definition
 
 
 def reload_running_spotlight(*, stopped=False, ensure=True):
@@ -250,7 +267,7 @@ def install():
     try:
         # Stop the previous periodic check before replacing what it loads.
         run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-        stopped_spotlight = stop_installed_music(state, required=False)
+        stopped_spotlight = _stop_installed_providers(required=False, check_state=state)
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
         replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)

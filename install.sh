@@ -117,6 +117,7 @@ cat > "$SCRATCH/loader.py" <<'MACISLAND_LOADER_PY'
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import json
 import os
@@ -127,14 +128,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional
 
 
 LAUNCHCTL = "/bin/launchctl"
 SERVICE = f"gui/{os.getuid()}/com.apple.MenuBarAgent"
 ENVIRONMENT_KEY = "DYLD_INSERT_LIBRARIES"
 LIBRARY = str(Path.home() / "Library/MacIsland/island.dylib")
-# macOS 27.3 beta 1 and beta 2. Every native hook resolves symbols and verifies
-# layouts at runtime; this list only gates builds that have been checked.
+ALLOW_UNVERIFIED_ENV = "MACISLAND_ALLOW_UNVERIFIED_BUILD"
+# Single source of truth for verified OS builds. Every native hook resolves
+# symbols and verifies layouts at runtime; this list gates checked builds.
 SUPPORTED_BUILDS = ("26C5035r", "26C5047e")
 SUPPORTED_BUILD = SUPPORTED_BUILDS[0]
 MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
@@ -148,7 +151,34 @@ MUSIC_READY_DELAYS = PROVIDER_READY_DELAYS
 # crash repeatedly must not turn into an endless restart loop.
 REAPPLY_LIMIT = 3
 REAPPLY_WINDOW = 15 * 60
-MANAGED_COMPONENTS = ("menubar", "music", "clock", "spotlight")
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    name: str
+    executable: str
+    bundle: str
+    pid_getter_name: str
+    launch_on_install: bool = False
+    restart_on_stop: bool = False
+    stop_notice: Optional[str] = None
+
+
+PROVIDERS = (
+    ProviderSpec(
+        "music", MUSIC_EXE, "com.apple.MediaRemoteUIService", "music_pid",
+        launch_on_install=True,
+    ),
+    ProviderSpec(
+        "clock", CLOCK_EXE, "com.apple.ClockAngel", "clock_pid",
+        restart_on_stop=True,
+    ),
+    ProviderSpec(
+        "spotlight", SPOTLIGHT_EXE, "com.apple.campo", "spotlight_pid",
+        stop_notice="Stopped patched Spotlight",
+    ),
+)
+MANAGED_COMPONENTS = ("menubar", *(spec.name for spec in PROVIDERS))
 
 
 def log(message, *, error=False):
@@ -179,12 +209,31 @@ def current_build():
     return subprocess.check_output(["/usr/bin/sw_vers", "-buildVersion"], text=True).strip()
 
 
+def allow_unverified_build(env=None):
+    source = os.environ if env is None else env
+    return source.get(ALLOW_UNVERIFIED_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def is_supported_build(build=None):
+    return (current_build() if build is None else build) in SUPPORTED_BUILDS
+
+
+def format_supported_builds_header():
+    builds = ", ".join(json.dumps(build) for build in SUPPORTED_BUILDS)
+    return f"#pragma once\n#define MACISLAND_SUPPORTED_BUILDS_LIST {builds}\n"
+
+
 def require_supported_build():
     build = current_build()
-    if build not in SUPPORTED_BUILDS:
-        raise RuntimeError(
-            f"Unsupported OS build {build} (supported: {', '.join(SUPPORTED_BUILDS)}); services left unchanged")
-    return build
+    if is_supported_build(build):
+        return build
+    if allow_unverified_build():
+        log(f"OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled",
+            error=True)
+        return build
+    raise RuntimeError(
+        f"Unsupported OS build {build} (supported: {', '.join(SUPPORTED_BUILDS)}); "
+        f"services left unchanged (set {ALLOW_UNVERIFIED_ENV}=1 to try an unverified build)")
 
 
 def require_trusted_library(library):
@@ -400,6 +449,10 @@ def spotlight_pid():
     return provider_pid(SPOTLIGHT_EXE)
 
 
+def provider_pid_getter(spec):
+    return globals()[spec.pid_getter_name]
+
+
 def available_provider_pid(pid, get_pid):
     if get_pid() != pid:
         raise RuntimeError("The UI provider restarted")
@@ -440,6 +493,20 @@ def stop_managed_music(library):
     return stop_managed_provider(library, music_pid)
 
 
+def stop_all_providers(library):
+    stopped = []
+    for spec in PROVIDERS:
+        get_pid = provider_pid_getter(spec)
+        was_stopped = (stop_managed_music(library) if spec.name == "music"
+                       else stop_managed_provider(library, get_pid))
+        if was_stopped:
+            stopped.append(spec.name)
+            if spec.restart_on_stop:
+                subprocess.run(["/usr/bin/open", "-gj", "-b", spec.bundle],
+                               check=False, timeout=15)
+    return stopped
+
+
 def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch):
     """Install an optional native layout and verify its witness hook."""
     if not library.is_file():
@@ -462,6 +529,7 @@ def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch)
     if not lldb:
         raise RuntimeError(f"LLDB is required for the native {name} layout")
 
+    allow_unverified = allow_unverified_build()
     # Encode the filesystem bytes, including spaces and quotes, as a C literal.
     path = '"' + ''.join(f'\\x{byte:02x}' for byte in os.fsencode(library)) + '"'
     with tempfile.TemporaryDirectory(prefix=f"macisland-{name}-") as scratch:
@@ -470,6 +538,11 @@ def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch)
             expr = f'void *h = dlopen({path}, RTLD_NOLOAD | RTLD_NOW); bool resident = h != 0; '
             if load:
                 expr += f'if (!h) h = dlopen({path}, RTLD_NOW | RTLD_LOCAL); '
+                if allow_unverified:
+                    expr += (
+                        'void (*allow_fn)(int) = h ? (void(*)(int))dlsym(h, "mi_set_allow_unverified_build") : 0; '
+                        'if (allow_fn) allow_fn(1); '
+                    )
             expr += (f'int (*fn)(void) = h ? (int(*)(void))dlsym(h, "{symbol}") : 0; '
                      'int rc = !h ? -101 : (fn ? fn() : -100); if (resident) dlclose(h); (int)rc')
             result = subprocess.run(
@@ -514,8 +587,10 @@ def prepare_music(library, lldb, *, launch=True):
 
 
 def background_providers():
-    return (("clock", clock_pid, "com.apple.ClockAngel"),
-            ("spotlight", spotlight_pid, "com.apple.campo"))
+    return tuple(
+        (spec.name, provider_pid_getter(spec), spec.bundle)
+        for spec in PROVIDERS if spec.name != "music"
+    )
 
 
 def prepare_background_safely(library, lldb, name, get_pid, bundle):
@@ -535,6 +610,14 @@ def prepare_music_safely(library, lldb, *, launch=True):
     except Exception as error:
         log(f"Native music layout skipped: {error}", error=True)
         return None
+
+
+def _prepare_spec_safely(spec, provider_lib, lldb, *, launch):
+    if spec.name == "music":
+        return prepare_music_safely(provider_lib, lldb, launch=launch)
+    return prepare_background_safely(
+        provider_lib, lldb, spec.name, provider_pid_getter(spec), spec.bundle
+    )
 
 
 def inject(state, *, force_debugger=False, only_unpatched_providers=False, launch_music=True):
@@ -558,20 +641,15 @@ def inject(state, *, force_debugger=False, only_unpatched_providers=False, launc
         raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
 
     provider_lib = library_path.with_name("notch-music.dylib")
-    current_music = process_identity(music_pid()) if only_unpatched_providers else None
-    if only_unpatched_providers and current_music and current_music == state.get("music"):
-        state["music"] = current_music
-    else:
-        music = prepare_music_safely(provider_lib, lldb, launch=launch_music)
-        state["music"] = process_identity(music)
-
-    for name, get_pid, bundle in background_providers():
+    for spec in PROVIDERS:
+        get_pid = provider_pid_getter(spec)
         current_id = process_identity(get_pid()) if only_unpatched_providers else None
-        if only_unpatched_providers and current_id and current_id == state.get(name):
-            state[name] = current_id
+        if only_unpatched_providers and current_id and current_id == state.get(spec.name):
+            state[spec.name] = current_id
         else:
-            patched = prepare_background_safely(provider_lib, lldb, name, get_pid, bundle)
-            state[name] = process_identity(patched)
+            launch = launch_music if spec.launch_on_install else False
+            patched = _prepare_spec_safely(spec, provider_lib, lldb, launch=launch)
+            state[spec.name] = process_identity(patched)
 
     if legacy:
         new_pid = legacy_main(library_path)
@@ -631,12 +709,21 @@ def ensure(*, wait=False):
 
 def ensure_locked(library_path, state):
     build = current_build()
-    if build not in SUPPORTED_BUILDS:
-        if state.get("unsupported_build") != build:
-            log(f"Unsupported OS build {build}; automatic patching paused", error=True)
-            state["unsupported_build"] = build
-        return
-    state.pop("unsupported_build", None)
+    if not is_supported_build(build):
+        if not allow_unverified_build():
+            if state.get("unsupported_build") != build:
+                log(f"Unsupported OS build {build}; automatic patching paused", error=True)
+                state["unsupported_build"] = build
+            return
+        state.pop("unsupported_build", None)
+        if state.get("unverified_build") != build:
+            log(f"OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled",
+                error=True)
+            state["unverified_build"] = build
+    else:
+        state.pop("unsupported_build", None)
+        state.pop("unverified_build", None)
+
     now = time.time()
     for component in MANAGED_COMPONENTS:
         prune_expired_attempts(state, component, now=now)
@@ -652,19 +739,18 @@ def ensure_locked(library_path, state):
     library = library_path.with_name("notch-music.dylib")
     if not library.is_file():
         return
-    for name, get_pid, bundle in (("music", music_pid, None), *background_providers()):
+    for spec in PROVIDERS:
         try:
-            identity = process_identity(get_pid())
+            identity = process_identity(provider_pid_getter(spec)())
         except Exception:
             continue
         # Optional providers start on demand; do not launch them here.
-        if not identity or identity == state.get(name) or not take_attempt(state, name, now=now):
+        if not identity or identity == state.get(spec.name) or not take_attempt(state, spec.name, now=now):
             continue
-        log(f"{name.capitalize()} UI provider {identity} is not patched; applying")
+        log(f"{spec.name.capitalize()} UI provider {identity} is not patched; applying")
         lldb = find_lldb(required=False)
-        pid = (prepare_music_safely(library, lldb, launch=False) if name == "music"
-               else prepare_background_safely(library, lldb, name, get_pid, bundle))
-        state[name] = process_identity(pid)
+        pid = _prepare_spec_safely(spec, library, lldb, launch=False)
+        state[spec.name] = process_identity(pid)
 
 
 def print_status(force_debugger):
@@ -672,20 +758,26 @@ def print_status(force_debugger):
     now = time.time()
     build = current_build()
     globally_disabled = amfi_globally_disabled()
-    print(f"OS build: {build} ({'supported' if build in SUPPORTED_BUILDS else 'unsupported'})")
+    if is_supported_build(build):
+        build_status = "supported"
+    elif allow_unverified_build():
+        build_status = f"unverified; allowed by {ALLOW_UNVERIFIED_ENV}"
+    else:
+        build_status = "unsupported"
+    print(f"OS build: {build} ({build_status})")
     print(f"AMFI-disable boot flag active: {globally_disabled}")
     print(f"Selected loader: {'legacy' if globally_disabled and not force_debugger else 'debugger'}")
     print(f"Debugger: {find_lldb(required=False) or 'not found'}")
     menubar = process_identity(menu_bar_agent_pid())
     print(f"MenuBarAgent: {menubar or 'not running'}; matches last recorded instance: "
           f"{bool(menubar) and menubar == state.get('menubar')}")
-    for name, get_pid, _ in (("music", music_pid, None), *background_providers()):
+    for spec in PROVIDERS:
         try:
-            identity = process_identity(get_pid())
+            identity = process_identity(provider_pid_getter(spec)())
         except Exception:
             identity = None
-        print(f"{name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
-              f"{bool(identity) and identity == state.get(name)}")
+        print(f"{spec.name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
+              f"{bool(identity) and identity == state.get(spec.name)}")
     for name in MANAGED_COMPONENTS:
         recent = [t for t in state.get(f"{name}_attempts", [])
                   if isinstance(t, (int, float)) and 0 <= now - t < REAPPLY_WINDOW]
@@ -703,11 +795,36 @@ def main():
                        help="Reapply the native music layout without restarting MenuBarAgent")
     group.add_argument("--stop-music", "--stop-providers", dest="stop_music", action="store_true",
                        help="Detach the installed native provider layouts")
+    group.add_argument("--check-build", action="store_true",
+                       help="Verify the current OS build is supported or explicitly allowed")
+    group.add_argument("--emit-builds-header", action="store_true",
+                       help="Print a C preprocessor header defining MACISLAND_SUPPORTED_BUILDS_LIST")
     parser.add_argument("--wait", action="store_true",
                         help="Wait for loader.lock when used with --ensure")
     parser.add_argument("--debugger", action="store_true",
                         help="Force the process-scoped debugger loader")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON output where supported")
     args = parser.parse_args()
+    if args.emit_builds_header:
+        sys.stdout.write(format_supported_builds_header())
+        return
+    if args.check_build:
+        build = current_build()
+        if is_supported_build(build):
+            return
+        if allow_unverified_build():
+            print(
+                f"Warning: OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled.",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"Supported builds: {', '.join(SUPPORTED_BUILDS)} (current: {build}). "
+            f"Set {ALLOW_UNVERIFIED_ENV}=1 to try an unverified build.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     if args.status:
         print_status(args.debugger)
         return
@@ -721,22 +838,26 @@ def main():
         try:
             if args.stop_music:
                 library = library_path.with_name("notch-music.dylib")
-                stop_managed_music(library)
-                if stop_managed_provider(library, clock_pid):
-                    subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.ClockAngel"],
-                                   check=False, timeout=15)
-                if stop_managed_provider(library, spotlight_pid):
-                    print("Stopped patched Spotlight", flush=True)
-                for name in ("music", "clock", "spotlight"):
-                    state.pop(name, None)
+                stopped = stop_all_providers(library)
+                for spec in PROVIDERS:
+                    state.pop(spec.name, None)
+                if args.json:
+                    print(json.dumps({"stopped": stopped}), flush=True)
+                else:
+                    for spec in PROVIDERS:
+                        if spec.stop_notice and spec.name in stopped:
+                            print(spec.stop_notice, flush=True)
             elif args.music_only:
                 provider_lib = library_path.with_name("notch-music.dylib")
                 lldb = find_lldb()
-                pid = prepare_music(provider_lib, lldb)
-                state["music"] = process_identity(pid)
-                for name, get_pid, bundle in background_providers():
-                    patched = prepare_background_safely(provider_lib, lldb, name, get_pid, bundle)
-                    state[name] = process_identity(patched)
+                for spec in PROVIDERS:
+                    if spec.name == "music":
+                        pid = prepare_music(provider_lib, lldb)
+                    else:
+                        pid = prepare_background_safely(
+                            provider_lib, lldb, spec.name, provider_pid_getter(spec), spec.bundle
+                        )
+                    state[spec.name] = process_identity(pid)
             else:
                 inject(state, force_debugger=args.debugger)
                 for name in MANAGED_COMPONENTS:
@@ -768,6 +889,7 @@ BACKUP = ROOT / 'notch-backup'
 STATE = BACKUP / 'state.plist'
 DOMAIN = f'gui/{os.getuid()}'
 MENU_SERVICE = f'{DOMAIN}/com.apple.MenuBarAgent'
+ALLOW_UNVERIFIED_ENV = 'MACISLAND_ALLOW_UNVERIFIED_BUILD'
 PREFERENCES = [
     (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'ShowSoftwareNotch', False),
     (str(Path.home() / 'Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar'), 'EmulateCenterHUD', True),
@@ -780,6 +902,11 @@ AUXILIARY = [ROOT / name for name in ('loader.lock', 'loader.log', 'loader-error
                                       'loader-state.json', 'loader-state.json.next')]
 # Login and periodic check: patch only service instances that are not yet patched.
 CHECK_INTERVAL = 30
+
+
+def allow_unverified_build(env=None):
+    source = os.environ if env is None else env
+    return source.get(ALLOW_UNVERIFIED_ENV, '').strip().lower() in ('1', 'true', 'yes')
 
 
 def run(*args, required=True):
@@ -877,13 +1004,38 @@ def preferred_loader_script():
     return staged if staged.is_file() else (ROOT / 'loader.py')
 
 
-def stop_installed_music(state, *, required=True):
-    if MUSIC.name in state['files'] and MUSIC.is_file():
-        script = preferred_loader_script()
-        if script.is_file():
-            result = run('/usr/bin/python3', str(script), '--stop-music', required=required)
-            return result.returncode == 0 and b'Stopped patched Spotlight' in result.stdout.splitlines()
-    return False
+def _stop_installed_providers(*, required=True, check_state=None):
+    if check_state is not None and MUSIC.name not in check_state['files']:
+        return False
+    if not MUSIC.is_file():
+        return False
+    script = preferred_loader_script()
+    if not script.is_file():
+        return False
+    result = run('/usr/bin/python3', str(script), '--stop-providers', '--json', required=required)
+    if result.returncode != 0:
+        return False
+    stdout = result.stdout.decode('utf-8', 'replace').strip()
+    if stdout.startswith('{'):
+        try:
+            payload = json.loads(stdout)
+            stopped = payload.get('stopped', [])
+            if isinstance(stopped, list):
+                return 'spotlight' in stopped
+        except ValueError:
+            pass
+    return b'Stopped patched Spotlight' in result.stdout.splitlines()
+
+
+def _restore_files_and_preferences(file_entries, backup_dir, preferences):
+    for name, details in file_entries.items():
+        path = FILES[name]
+        if details['existed']:
+            replace_file(backup_dir / name, path, details['mode'])
+        else:
+            path.unlink(missing_ok=True)
+    for domain, key, saved in preferences:
+        write_preference(domain, key, saved)
 
 
 def restore_original(state, stopped_spotlight=False):
@@ -892,15 +1044,9 @@ def restore_original(state, stopped_spotlight=False):
             raise RuntimeError(f'Missing backup: {BACKUP / name}; restoration stopped')
     # Stop the periodic check first, so it cannot reapply what is being removed.
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    stopped_spotlight = stop_installed_music(state, required=False) or stopped_spotlight
-    for name, details in state['files'].items():
-        path = FILES[name]
-        if details['existed']:
-            replace_file(BACKUP / name, path, details['mode'])
-        else:
-            path.unlink(missing_ok=True)
-    for saved in state['preferences']:
-        write_preference(saved['domain'], saved['key'], saved)
+    stopped_spotlight = _stop_installed_providers(required=False, check_state=state) or stopped_spotlight
+    preferences = [(saved['domain'], saved['key'], saved) for saved in state['preferences']]
+    _restore_files_and_preferences(state['files'], BACKUP, preferences)
     if state['files']['agent.plist']['existed']:
         run('/bin/launchctl', 'bootstrap', DOMAIN, str(AGENT))
     else:
@@ -939,19 +1085,8 @@ def restore_previous(previous, stopped_spotlight=False):
     snapshot, preferences = previous
     folder = SOURCE / 'previous'
     run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-    if MUSIC.is_file():
-        script = preferred_loader_script()
-        if script.is_file():
-            result = run('/usr/bin/python3', str(script), '--stop-music', required=False)
-            stopped_spotlight |= result.returncode == 0 and b'Stopped patched Spotlight' in result.stdout.splitlines()
-    for name, details in snapshot.items():
-        path = FILES[name]
-        if details['existed']:
-            replace_file(folder / name, path, details['mode'])
-        else:
-            path.unlink(missing_ok=True)
-    for domain, key, saved in preferences:
-        write_preference(domain, key, saved)
+    stopped_spotlight = _stop_installed_providers(required=False) or stopped_spotlight
+    _restore_files_and_preferences(snapshot, folder, preferences)
     # Clear state recorded by the failed upgrade and synchronously restore the
     # previous loader before enabling its periodic LaunchAgent.
     (ROOT / 'loader-state.json').unlink(missing_ok=True)
@@ -967,7 +1102,7 @@ def restore_previous(previous, stopped_spotlight=False):
 
 
 def agent_definition():
-    return {
+    definition = {
         'Label': 'com.macisland.loader',
         'ProgramArguments': ['/usr/bin/python3', str(ROOT / 'loader.py'), '--ensure'],
         'RunAtLoad': True,
@@ -976,6 +1111,9 @@ def agent_definition():
         'StandardOutPath': str(ROOT / 'loader.log'),
         'StandardErrorPath': str(ROOT / 'loader-error.log'),
     }
+    if allow_unverified_build():
+        definition['EnvironmentVariables'] = {ALLOW_UNVERIFIED_ENV: '1'}
+    return definition
 
 
 def reload_running_spotlight(*, stopped=False, ensure=True):
@@ -1003,7 +1141,7 @@ def install():
     try:
         # Stop the previous periodic check before replacing what it loads.
         run('/bin/launchctl', 'bootout', DOMAIN, str(AGENT), required=False)
-        stopped_spotlight = stop_installed_music(state, required=False)
+        stopped_spotlight = _stop_installed_providers(required=False, check_state=state)
         replace_file(SOURCE / 'island.dylib', ROOT / 'island.dylib', 0o755)
         replace_file(SOURCE / 'loader.py', ROOT / 'loader.py', 0o644)
         replace_file(SOURCE / MUSIC.name, MUSIC, 0o755)
@@ -1050,10 +1188,7 @@ MACISLAND_MANAGER
 
 if [[ "$MODE" != --uninstall ]]; then
   [[ "$(uname -m)" == arm64 ]] || { echo "Apple Silicon only" >&2; exit 1; }
-  case "$(sw_vers -buildVersion)" in
-    26C5035r|26C5047e) ;;
-    *) echo "Supported builds: macOS 27.3 beta 26C5035r and 26C5047e only." >&2; exit 1 ;;
-  esac
+  /usr/bin/python3 "$SCRATCH/loader.py" --check-build
   xcode-select -p >/dev/null 2>&1 || {
     echo "Install Apple developer tools first (Xcode or: xcode-select --install)." >&2; exit 1;
   }
@@ -1076,17 +1211,13 @@ if [[ "$MODE" != --uninstall ]]; then
   fi
 
   /usr/bin/python3 -m py_compile "$SCRATCH/loader.py" "$SCRATCH/manager.py"
+  /usr/bin/python3 "$SCRATCH/loader.py" --emit-builds-header > "$SCRATCH/supported-builds.h"
 
   cat > "$SCRATCH/notch-layout.h" <<'MACISLAND_NOTCH_LAYOUT_H'
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdbool.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 __attribute__((visibility("hidden"))) bool MacIslandIsMenuBarAgent(void);
 __attribute__((visibility("hidden"))) BOOL MacIslandShortHostAvailable(void);
@@ -1154,92 +1285,306 @@ static inline BOOL MacIslandIsShortObstructionSentinel(NSRect rect, CGFloat cuto
            fabs(NSMaxY(rect) + MacIslandShortViewportInset(cutoutHeight)) <= 0.01;
 }
 
-static inline NSString *MacIslandAuditLogPath(void) {
-#ifdef MACISLAND_TESTING
-    const char *override = getenv("MACISLAND_AUDIT_LOG");
-    if (override && override[0] != '\0') return @(override);
-#endif
-    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/MacIsland"];
-    NSString *flag = [dir stringByAppendingPathComponent:@"scene-audit.enabled"];
-    if (access(flag.fileSystemRepresentation, F_OK) != 0) return nil;
-    return [dir stringByAppendingPathComponent:@"scene-audit.jsonl"];
-}
-
-static inline id MacIslandAuditNumber(CGFloat value) {
-    if (isnan(value)) return @"nan";
-    if (!isfinite(value)) return value > 0 ? @"inf" : @"-inf";
-    return @(round(value * 1000.0) / 1000.0);
-}
-
-static inline id MacIslandAuditSizeDict(NSSize size) {
-    return @{@"w": MacIslandAuditNumber(size.width), @"h": MacIslandAuditNumber(size.height)};
-}
-
-static inline id MacIslandAuditRectDict(NSRect rect) {
-    return @{
-        @"x": MacIslandAuditNumber(rect.origin.x),
-        @"y": MacIslandAuditNumber(rect.origin.y),
-        @"w": MacIslandAuditNumber(rect.size.width),
-        @"h": MacIslandAuditNumber(rect.size.height),
-    };
-}
-
-static inline id MacIslandAuditDataValue(id raw) {
-    if (!raw) return NSNull.null;
-    if ([raw isKindOfClass:NSString.class]) return raw;
-    if ([raw isKindOfClass:NSNumber.class]) {
-        if (CFGetTypeID((__bridge CFTypeRef)raw) == CFBooleanGetTypeID()) return raw;
-        return MacIslandAuditNumber([raw doubleValue]);
-    }
-    if ([raw isKindOfClass:NSData.class]) {
-        NSData *data = (NSData *)raw;
-        id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:NULL];
-        if (json && ([json isKindOfClass:NSString.class] || [json isKindOfClass:NSNumber.class] ||
-                     [NSJSONSerialization isValidJSONObject:json])) {
-            return json;
-        }
-        NSString *utf8 = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        return utf8 ?: [data base64EncodedStringWithOptions:0];
-    }
-    return [raw description] ?: NSNull.null;
-}
-
-static inline NSString *MacIslandAuditSerialize(NSDictionary *record) {
-    if (!record || ![NSJSONSerialization isValidJSONObject:record]) return nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
-    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
-}
-
-static inline void MacIslandAuditAppendRecord(NSString *logPath, NSDictionary *record) {
-    if (!logPath || !record) return;
-    NSMutableDictionary *stamped = [record mutableCopy];
-    stamped[@"ts"] = MacIslandAuditNumber([NSDate.date timeIntervalSince1970]);
-    if (![NSJSONSerialization isValidJSONObject:stamped]) return;
-    NSData *json = [NSJSONSerialization dataWithJSONObject:stamped options:NSJSONWritingSortedKeys error:NULL];
-    if (!json) return;
-    NSMutableData *line = [json mutableCopy];
-    [line appendBytes:"\n" length:1];
-    int fd = open(logPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return;
-    struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size < 8 * 1024 * 1024) {
-        const uint8_t *bytes = line.bytes;
-        size_t remaining = line.length;
-        while (remaining > 0) {
-            ssize_t written = write(fd, bytes, remaining);
-            if (written > 0) {
-                bytes += written;
-                remaining -= (size_t)written;
-            } else if (written < 0 && errno == EINTR) {
-                continue;
-            } else {
-                break;
-            }
-        }
-    }
-    close(fd);
-}
+__attribute__((visibility("hidden"))) NSString *MacIslandAuditLogPath(void);
+__attribute__((visibility("hidden"))) id MacIslandAuditNumber(CGFloat value);
+__attribute__((visibility("hidden"))) id MacIslandAuditSizeDict(NSSize size);
+__attribute__((visibility("hidden"))) id MacIslandAuditRectDict(NSRect rect);
+__attribute__((visibility("hidden"))) id MacIslandAuditDataValue(id raw);
+__attribute__((visibility("hidden"))) NSString *MacIslandAuditSerialize(NSDictionary *record);
+__attribute__((visibility("hidden"))) void MacIslandAuditAppendRecord(NSString *logPath, NSDictionary *record);
 MACISLAND_NOTCH_LAYOUT_H
+
+  cat > "$SCRATCH/safearea-internal.h" <<'MACISLAND_SAFEAREA_INTERNAL_H'
+#import "notch-layout.h"
+
+typedef struct {
+    BOOL present;
+    BOOL patched;
+    CGSize nativeObstruction;
+    CGFloat nativeExpandedMinW;
+    CGFloat nativeExpandedMaxW;
+    CGFloat nativeExpandedScale;
+    CGFloat nativeExpandedCornerRadius;
+    CGSize patchedObstruction;
+    CGFloat patchedExpandedMinW;
+    CGFloat patchedExpandedMaxW;
+    CGFloat patchedExpandedMinH;
+    CGFloat patchedExpandedMaxH;
+    CGFloat patchedExpandedScale;
+    CGFloat patchedExpandedCornerRadius;
+} MacIslandActivityMetricsSummary;
+
+@protocol MacIslandSizeDimensionRequest <NSObject, NSCopying>
+- (instancetype)initWithMinimum:(double)minimum maximum:(double)maximum type:(NSInteger)type;
+- (double)minimum;
+- (double)maximum;
+- (NSInteger)type;
+@end
+
+@protocol MacIslandActivityEdgeInsets <NSObject, NSCopying>
+- (double)leading;
+- (double)trailing;
+- (void)setLeading:(double)value;
+- (void)setTrailing:(double)value;
+@end
+
+@protocol MacIslandActivityItemMetricsRequest <NSObject, NSCopying>
+- (id<MacIslandSizeDimensionRequest>)widthRequest;
+- (void)setWidthRequest:(id<MacIslandSizeDimensionRequest>)value;
+- (id<MacIslandSizeDimensionRequest>)heightRequest;
+- (void)setHeightRequest:(id<MacIslandSizeDimensionRequest>)value;
+- (id<MacIslandActivityEdgeInsets>)edgeInsets;
+- (void)setEdgeInsets:(id<MacIslandActivityEdgeInsets>)value;
+- (double)cornerRadius;
+- (void)setCornerRadius:(double)value;
+- (double)scaleFactor;
+- (void)setScaleFactor:(double)value;
+@end
+
+@protocol MacIslandSystemApertureMetricsRequest <NSObject, NSCopying>
+- (CGSize)obstructionSize;
+- (void)setObstructionSize:(CGSize)value;
+- (double)obstructionTopMargin;
+- (void)setObstructionTopMargin:(double)value;
+- (id<MacIslandActivityItemMetricsRequest>)expandedMetricsRequest;
+- (void)setExpandedMetricsRequest:(id<MacIslandActivityItemMetricsRequest>)value;
+@end
+
+@protocol MacIslandActivityMetricsRequest <NSObject, NSCopying>
+- (id<MacIslandSystemApertureMetricsRequest>)systemApertureMetrics;
+- (void)setSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
+- (id<MacIslandSystemApertureMetricsRequest>)limitedWidthSystemApertureMetrics;
+- (void)setLimitedWidthSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
+@end
+
+@interface MacIslandNativeLayout : NSObject
+@property(nonatomic, strong) NSData *margins;
+@property(nonatomic, strong) NSValue *minimum;
+@property(nonatomic, strong) NSValue *maximum;
+@property(nonatomic) BOOL applied;
+@end
+
+@interface MacIslandNativeObstruction : NSObject
+@property(nonatomic, strong) NSValue *rect;
+@property(nonatomic, strong) NSValue *space;
+@property(nonatomic, strong) id nativeCorners;
+@property(nonatomic, strong) id rectangularCorners;
+@property(nonatomic) BOOL cornersApplied;
+@property(nonatomic) BOOL obstructionApplied;
+@end
+
+@interface MacIslandSceneInsets : NSObject
+@property(nonatomic, strong) NSArray<MacIslandNativeLayout *> *layouts;
+@property(nonatomic, strong) NSArray<MacIslandNativeObstruction *> *obstructions;
+@property(nonatomic, strong) NSMutableArray<NSString *> *auditSignatures;
+@property(nonatomic, strong) NSData *nativeActivityMetricsData;
+@property(nonatomic, strong) NSData *cachedActivityMetricsSource;
+@property(nonatomic, strong) NSData *cachedPatchedActivityMetricsData;
+@property(nonatomic) NSRect cachedActivityMetricsCutout;
+@property(nonatomic) CGFloat cachedActivityMetricsDisplayWidth;
+@property(nonatomic) MacIslandActivityMetricsSummary cachedActivitySummary;
+@property(nonatomic) BOOL activityMetricsDataApplied;
+@property(nonatomic, strong) id nativeActivityMetricsRequest;
+@property(nonatomic) BOOL activityMetricsRequestApplied;
+@property(nonatomic) CGRect frame;
+@property(nonatomic) BOOL updating;
+@end
+
+typedef struct {
+    BOOL physical;
+    BOOL intersects;
+    BOOL extendsBelow;
+    CGFloat top;
+    CGFloat leading;
+    CGFloat trailing;
+    CGFloat notchWidth;
+    CGFloat notchHeight;
+    CGFloat centeredDisplayWidth;
+} MacIslandNotchAvoidance;
+
+typedef struct {
+    BOOL hasData;
+    NSUInteger obstructionFamily;
+    NSSize viewport;
+    MacIslandNotchAvoidance policy;
+    CGFloat shortHeight;
+    BOOL applies;
+    NSData *patchedMargins;
+    NSValue *patchedMin;
+    NSValue *patchedMax;
+} MacIslandFamilyAuditSnapshot;
+
+__attribute__((visibility("hidden"))) id MacIslandLayoutPayload(id value, id original);
+__attribute__((visibility("hidden"))) id MacIslandRawObjectSetting(id settings, NSString *name);
+__attribute__((visibility("hidden"))) id MacIslandExistingObjectSetting(id settings, NSString *name);
+__attribute__((visibility("hidden"))) NSString *MacIslandObstructionSetting(NSUInteger family, NSString *suffix);
+__attribute__((visibility("hidden"))) NSDictionary *MacIslandDecodedMargins(NSData *data);
+
+__attribute__((visibility("hidden"))) MacIslandActivityMetricsSummary MacIslandRefreshActivityMetrics(
+    id settings,
+    MacIslandSceneInsets *state,
+    NSScreen *targetScreen,
+    BOOL physicalDisplay,
+    void (*originalActivityMetricsData)(id, SEL, id),
+    void (*originalActivityMetricsRequest)(id, SEL, id));
+
+__attribute__((visibility("hidden"))) void MacIslandEmitSceneAudit(
+    NSString *auditPath,
+    id settings,
+    MacIslandSceneInsets *state,
+    NSScreen *targetScreen,
+    BOOL displayKnown,
+    BOOL physicalDisplay,
+    const NSRect rects[2],
+    const NSRect publishedRects[2],
+    const MacIslandFamilyAuditSnapshot snapshots[2],
+    MacIslandActivityMetricsSummary activitySummary);
+MACISLAND_SAFEAREA_INTERNAL_H
+
+  cat > "$SCRATCH/mask-internal.h" <<'MACISLAND_MASK_INTERNAL_H'
+#import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import "notch-layout.h"
+#include <os/lock.h>
+
+// Strict leaf lock guarding in-memory observer state only. Never hold across
+// Core Animation, AppKit, KVO registration, or @synchronized calls.
+__attribute__((visibility("hidden"))) extern os_unfair_lock MacIslandMaskStateLock;
+__attribute__((visibility("hidden"))) extern _Thread_local const void *MacIslandActiveModelWriteObserver;
+
+__attribute__((visibility("hidden"))) extern char MacIslandMaskObserverKey;
+__attribute__((visibility("hidden"))) extern char MacIslandSceneOriginObserverKey;
+__attribute__((visibility("hidden"))) extern char MacIslandMergeVisibilityKey;
+__attribute__((visibility("hidden"))) extern char MacIslandParentGeometryKey;
+__attribute__((visibility("hidden"))) extern char MacIslandSceneLayersKey;
+
+__attribute__((visibility("hidden"))) extern void (*MacIslandOriginalSetHidden)(id, SEL, BOOL);
+__attribute__((visibility("hidden"))) extern void (*MacIslandOriginalSetCornerRadius)(id, SEL, CGFloat);
+__attribute__((visibility("hidden"))) extern void (*MacIslandBaseSetBounds)(id, SEL, CGRect);
+__attribute__((visibility("hidden"))) extern void (*MacIslandBaseSetPosition)(id, SEL, CGPoint);
+
+// AppKit screen information is captured on the main thread. Native layer
+// updates may arrive on MenuBarAgent's background animation thread.
+@interface MacIslandScreenGeometry : NSObject
+@property(atomic, copy) NSArray<NSDictionary *> *layouts;
++ (instancetype)shared;
+@end
+
+typedef struct {
+    CGFloat pixelInset;
+    CGFloat horizontalFlare;
+    CGFloat bottomExtension;
+    CGFloat topExtension;
+} MacIslandPaintExtensions;
+
+@interface MacIslandNativeMaskObserver : NSObject {
+  @package
+    __weak MacIslandNativeMaskObserver *_mergeInput;
+    __weak MacIslandNativeMaskObserver *_contourPeer;
+
+    __weak CALayer *_desiredObservedParent;
+    __weak CALayer *_registeredObservedParent;
+    BOOL _reconcilingParentKVO;
+
+    __weak CALayer *_desiredMergeScene;
+    __weak CALayer *_registeredMergeScene;
+    BOOL _reconcilingMergeSceneKVO;
+
+    __weak CALayer *_desiredHeldUnion;
+    __weak CALayer *_registeredHeldUnion;
+    id _desiredHeldBlur;
+    id _registeredHeldBlur;
+    BOOL _reconcilingHeldKVO;
+
+    CAShapeLayer *_shapeMask;
+    MacIslandPaintExtensions _extensions;
+    NSArray *_modifierBindings;
+    NSArray *_nativeMaskGroups;
+    id _nativeMaskSize;
+
+    BOOL _refreshing;
+    BOOL _refreshDirty;
+    BOOL _maskRefreshing;
+    BOOL _maskDirty;
+    BOOL _syncingGeometry;
+    BOOL _geometryDirty;
+}
+@property(nonatomic, weak) CALayer *source;
+@property(nonatomic, strong) NSArray<NSString *> *keys;
+@property(atomic) CGFloat nativeRadius;
+@property(atomic) BOOL nativeHidden;
+@property(atomic) BOOL applied;
+@property(atomic) CGRect nativeBounds;
+@property(atomic) CGPoint nativePosition;
+- (instancetype)initWithLayer:(CALayer *)layer;
+- (CAShapeLayer *)shapeMask;
+- (CAShapeLayer *)ensureShapeMask;
+- (void)refresh;
+- (void)refreshMask;
+- (void)reconcileObservedParent:(CALayer *)parent;
+- (void)reconcileMergeScene:(CALayer *)scene;
+- (void)reconcileHeldVisibilityKVO;
+- (void)endVisibilityHold:(BOOL)applyHide;
+- (void)updateVisibilityHold;
+- (BOOL)holdVisibilityInUnion:(CALayer *)group blur:(id)blur;
+@end
+
+static inline MacIslandPaintExtensions MacIslandObserverPaintExtensions(MacIslandNativeMaskObserver *observer) {
+    MacIslandPaintExtensions ext = {0, 0, 0, 0};
+    if (!observer) return ext;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    ext = observer->_extensions;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    return ext;
+}
+
+static inline void MacIslandSetObserverPaintExtensions(MacIslandNativeMaskObserver *observer, MacIslandPaintExtensions ext) {
+    if (!observer) return;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    observer->_extensions = ext;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+}
+
+static inline MacIslandNativeMaskObserver *MacIslandObserverMergeInput(MacIslandNativeMaskObserver *observer) {
+    if (!observer) return nil;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    MacIslandNativeMaskObserver *input = observer->_mergeInput;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    return input;
+}
+
+// Geometry & layer inspection helpers (mask-geometry.m)
+__attribute__((visibility("hidden"))) CGPathRef MacIslandNotchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY);
+__attribute__((visibility("hidden"))) BOOL MacIslandIsOpaqueBlack(CGColorRef color);
+__attribute__((visibility("hidden"))) void MacIslandUpdateScreenGeometry(void);
+__attribute__((visibility("hidden"))) NSDictionary *MacIslandScreenLayoutForLayer(CALayer *layer);
+__attribute__((visibility("hidden"))) CGRect MacIslandNativeBodyFrame(MacIslandNativeMaskObserver *observer);
+__attribute__((visibility("hidden"))) BOOL MacIslandIsNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *observer);
+__attribute__((visibility("hidden"))) CGFloat MacIslandNativeSceneEdgeCompensation(CALayer *layer);
+__attribute__((visibility("hidden"))) NSArray<CALayer *> *MacIslandCopyLayerSublayers(CALayer *layer);
+__attribute__((visibility("hidden"))) BOOL MacIslandLayerHasSublayers(CALayer *layer);
+__attribute__((visibility("hidden"))) NSArray *MacIslandCopyLayerModifiers(CALayer *layer);
+__attribute__((visibility("hidden"))) NSArray<NSString *> *MacIslandCopyLayerAnimationKeys(CALayer *layer);
+__attribute__((visibility("hidden"))) BOOL MacIslandHasMergeFilters(CALayer *layer);
+__attribute__((visibility("hidden"))) BOOL MacIslandIsNativeUnionFill(CALayer *layer);
+__attribute__((visibility("hidden"))) BOOL MacIslandIsSecondaryMergeInput(CALayer *layer);
+__attribute__((visibility("hidden"))) id MacIslandActiveMergeBlur(CALayer *group);
+__attribute__((visibility("hidden"))) void MacIslandPresentationLayerGeometry(
+    CALayer *layer, CGPoint *originOut, CGSize *sizeOut,
+    CGPoint *positionOut, CGPoint *anchorOut, CATransform3D *transformOut);
+__attribute__((visibility("hidden"))) CGSize MacIslandPaintSize(MacIslandNativeMaskObserver *observer, CGSize size);
+__attribute__((visibility("hidden"))) CGPoint MacIslandPaintPosition(MacIslandNativeMaskObserver *observer, CGPoint point);
+__attribute__((visibility("hidden"))) CAAnimation *MacIslandAnimationWithoutPillCorners(CAAnimation *animation);
+__attribute__((visibility("hidden"))) void MacIslandObserveNativeAnimations(CALayer *layer);
+
+// Presentation modifier & group flush hooks (mask-modifiers.m)
+__attribute__((visibility("hidden"))) id MacIslandNativeModifierObject(id object, NSString *name);
+__attribute__((visibility("hidden"))) BOOL MacIslandNativeModifierEnabled(id modifier);
+__attribute__((visibility("hidden"))) MacIslandNativeMaskObserver *MacIslandModelMaskObserver(CALayer *layer);
+__attribute__((visibility("hidden"))) void MacIslandSynchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
+__attribute__((visibility("hidden"))) void MacIslandRemoveNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
+__attribute__((visibility("hidden"))) void MacIslandInstallNativeCornerModifierHooks(void);
+MACISLAND_MASK_INTERNAL_H
 
   cat > "$SCRATCH/island.c" <<'MACISLAND_ISLAND_C'
 #include <libproc.h>
@@ -1540,421 +1885,230 @@ __attribute__((constructor)) static void installShortHost(void) {
 }
 MACISLAND_SHORT_HOST_M
 
-  cat > "$SCRATCH/safearea.m" <<'MACISLAND_SAFEAREA_M'
-#import <AppKit/AppKit.h>
-#import <dlfcn.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import "notch-layout.h"
-#include <os/log.h>
-#include <pthread.h>
+  cat > "$SCRATCH/scene-audit.m" <<'MACISLAND_SCENE_AUDIT_M'
+#import "safearea-internal.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
-#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-// One physical exclusion policy at the shared FBS scene-settings boundary.
-// Both ElementRegistry and MenuBarClient receive it, regardless of provider.
-static char sceneInsetsKey, originalLayoutPayloadKey;
-static void (*originalMargins[2])(id, SEL, id);
-static void (*originalMinimum[2])(id, SEL, id);
-static void (*originalMaximum[2])(id, SEL, id);
-static void (*originalObstruction[2])(id, SEL, id);
-static void (*originalSpace[2])(id, SEL, id);
-static void (*originalCorners[2])(id, SEL, id);
-static void (*originalLocation[2])(id, SEL, id);
-static void (*originalClientIdentifier)(id, SEL, id);
-static void (*originalElementKindIdentifier)(id, SEL, id);
-static void (*originalActivityMetricsData)(id, SEL, id);
-static void (*originalActivityMetricsRequest)(id, SEL, id);
-static void (*originalFrame)(id, SEL, CGRect);
-static void (*originalDisplayConfiguration)(id, SEL, id);
+NSString *MacIslandAuditLogPath(void) {
+#ifdef MACISLAND_TESTING
+    const char *override = getenv("MACISLAND_AUDIT_LOG");
+    if (override && override[0] != '\0') return @(override);
+#endif
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/MacIsland"];
+    NSString *flag = [dir stringByAppendingPathComponent:@"scene-audit.enabled"];
+    if (access(flag.fileSystemRepresentation, F_OK) != 0) return nil;
+    return [dir stringByAppendingPathComponent:@"scene-audit.jsonl"];
+}
 
-typedef struct {
-    BOOL present;
-    BOOL patched;
-    CGSize nativeObstruction;
-    CGFloat nativeExpandedMinW;
-    CGFloat nativeExpandedMaxW;
-    CGFloat nativeExpandedScale;
-    CGFloat nativeExpandedCornerRadius;
-    CGSize patchedObstruction;
-    CGFloat patchedExpandedMinW;
-    CGFloat patchedExpandedMaxW;
-    CGFloat patchedExpandedMinH;
-    CGFloat patchedExpandedMaxH;
-    CGFloat patchedExpandedScale;
-    CGFloat patchedExpandedCornerRadius;
-} MacIslandActivityMetricsSummary;
+id MacIslandAuditNumber(CGFloat value) {
+    if (isnan(value)) return @"nan";
+    if (!isfinite(value)) return value > 0 ? @"inf" : @"-inf";
+    return @(round(value * 1000.0) / 1000.0);
+}
 
-@protocol MacIslandSizeDimensionRequest <NSObject, NSCopying>
-- (instancetype)initWithMinimum:(double)minimum maximum:(double)maximum type:(NSInteger)type;
-- (double)minimum;
-- (double)maximum;
-- (NSInteger)type;
-@end
+id MacIslandAuditSizeDict(NSSize size) {
+    return @{@"w": MacIslandAuditNumber(size.width), @"h": MacIslandAuditNumber(size.height)};
+}
 
-@protocol MacIslandActivityEdgeInsets <NSObject, NSCopying>
-- (double)leading;
-- (double)trailing;
-- (void)setLeading:(double)value;
-- (void)setTrailing:(double)value;
-@end
+id MacIslandAuditRectDict(NSRect rect) {
+    return @{
+        @"x": MacIslandAuditNumber(rect.origin.x),
+        @"y": MacIslandAuditNumber(rect.origin.y),
+        @"w": MacIslandAuditNumber(rect.size.width),
+        @"h": MacIslandAuditNumber(rect.size.height),
+    };
+}
 
-@protocol MacIslandActivityItemMetricsRequest <NSObject, NSCopying>
-- (id<MacIslandSizeDimensionRequest>)widthRequest;
-- (void)setWidthRequest:(id<MacIslandSizeDimensionRequest>)value;
-- (id<MacIslandSizeDimensionRequest>)heightRequest;
-- (void)setHeightRequest:(id<MacIslandSizeDimensionRequest>)value;
-- (id<MacIslandActivityEdgeInsets>)edgeInsets;
-- (void)setEdgeInsets:(id<MacIslandActivityEdgeInsets>)value;
-- (double)cornerRadius;
-- (void)setCornerRadius:(double)value;
-- (double)scaleFactor;
-- (void)setScaleFactor:(double)value;
-@end
-
-@protocol MacIslandSystemApertureMetricsRequest <NSObject, NSCopying>
-- (CGSize)obstructionSize;
-- (void)setObstructionSize:(CGSize)value;
-- (double)obstructionTopMargin;
-- (void)setObstructionTopMargin:(double)value;
-- (id<MacIslandActivityItemMetricsRequest>)expandedMetricsRequest;
-- (void)setExpandedMetricsRequest:(id<MacIslandActivityItemMetricsRequest>)value;
-@end
-
-@protocol MacIslandActivityMetricsRequest <NSObject, NSCopying>
-- (id<MacIslandSystemApertureMetricsRequest>)systemApertureMetrics;
-- (void)setSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
-- (id<MacIslandSystemApertureMetricsRequest>)limitedWidthSystemApertureMetrics;
-- (void)setLimitedWidthSystemApertureMetrics:(id<MacIslandSystemApertureMetricsRequest>)value;
-@end
-
-@interface MacIslandNativeLayout : NSObject
-@property(nonatomic, strong) NSData *margins;
-@property(nonatomic, strong) NSValue *minimum;
-@property(nonatomic, strong) NSValue *maximum;
-@property(nonatomic) BOOL applied;
-@end
-@implementation MacIslandNativeLayout
-@end
-
-@interface MacIslandNativeObstruction : NSObject
-@property(nonatomic, strong) NSValue *rect;
-@property(nonatomic, strong) NSValue *space;
-@property(nonatomic, strong) id nativeCorners;
-@property(nonatomic, strong) id rectangularCorners;
-@property(nonatomic) BOOL cornersApplied;
-@property(nonatomic) BOOL obstructionApplied;
-@end
-@implementation MacIslandNativeObstruction
-@end
-
-@interface MacIslandSceneInsets : NSObject
-@property(nonatomic, strong) NSArray<MacIslandNativeLayout *> *layouts;
-@property(nonatomic, strong) NSArray<MacIslandNativeObstruction *> *obstructions;
-@property(nonatomic, strong) NSMutableArray<NSString *> *auditSignatures;
-@property(nonatomic, strong) NSData *nativeActivityMetricsData;
-@property(nonatomic, strong) NSData *cachedActivityMetricsSource;
-@property(nonatomic, strong) NSData *cachedPatchedActivityMetricsData;
-@property(nonatomic) NSRect cachedActivityMetricsCutout;
-@property(nonatomic) CGFloat cachedActivityMetricsDisplayWidth;
-@property(nonatomic) MacIslandActivityMetricsSummary cachedActivitySummary;
-@property(nonatomic) BOOL activityMetricsDataApplied;
-@property(nonatomic, strong) id nativeActivityMetricsRequest;
-@property(nonatomic) BOOL activityMetricsRequestApplied;
-@property(nonatomic) CGRect frame;
-@property(nonatomic) BOOL updating;
-@end
-@implementation MacIslandSceneInsets
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _layouts = @[[MacIslandNativeLayout new], [MacIslandNativeLayout new]];
-        _obstructions = @[[MacIslandNativeObstruction new], [MacIslandNativeObstruction new]];
-        _auditSignatures = [@[@"", @""] mutableCopy];
+id MacIslandAuditDataValue(id raw) {
+    if (!raw) return NSNull.null;
+    if ([raw isKindOfClass:NSString.class]) return raw;
+    if ([raw isKindOfClass:NSNumber.class]) {
+        if (CFGetTypeID((__bridge CFTypeRef)raw) == CFBooleanGetTypeID()) return raw;
+        return MacIslandAuditNumber([raw doubleValue]);
     }
-    return self;
-}
-@end
-
-@protocol MacIslandCornerFactory
-- (instancetype)initWithCornerRadius:(CGFloat)radius;
-@end
-
-typedef struct {
-    BOOL physical;
-    BOOL intersects;
-    BOOL extendsBelow;
-    CGFloat top;
-    CGFloat leading;
-    CGFloat trailing;
-    CGFloat notchWidth;
-    CGFloat notchHeight;
-    CGFloat centeredDisplayWidth;
-} MacIslandNotchAvoidance;
-
-static BOOL isPatchedPayload(id value) {
-    return value != nil && objc_getAssociatedObject(value, &originalLayoutPayloadKey) != nil;
-}
-static id nativePayload(id value) {
-    if (!value) return nil;
-    id saved = objc_getAssociatedObject(value, &originalLayoutPayloadKey);
-    if (!saved) return value;
-    return saved == NSNull.null ? nil : saved;
-}
-static id layoutPayload(id value, id original) {
-    id unpatched = nativePayload(original);
-    if (value && value != unpatched) {
-        objc_setAssociatedObject(value, &originalLayoutPayloadKey, unpatched ?: NSNull.null,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    return value;
-}
-static BOOL isSizeValue(id value) {
-    return [value isKindOfClass:NSValue.class] && !strcmp([value objCType], @encode(NSSize));
-}
-static BOOL isRectValue(id value) {
-    return [value isKindOfClass:NSValue.class] && !strcmp([value objCType], @encode(NSRect));
-}
-static id rawObjectSetting(id settings, NSString *name) {
-    SEL selector = NSSelectorFromString(name);
-    if (![settings respondsToSelector:selector]) return nil;
-    Method method = class_getInstanceMethod([settings class], selector);
-    if (!method || method_getTypeEncoding(method)[0] != '@') return nil;
-    id (*getter)(id, SEL) = (void *)method_getImplementation(method);
-    return getter(settings, selector);
-}
-static id existingObjectSetting(id settings, NSString *name) {
-    return nativePayload(rawObjectSetting(settings, name));
-}
-static CGRect existingFrame(id settings) {
-    SEL selector = NSSelectorFromString(@"frame");
-    if (![settings respondsToSelector:selector]) return CGRectZero;
-    Method method = class_getInstanceMethod([settings class], selector);
-    if (!method) return CGRectZero;
-    const char *type = method_getTypeEncoding(method);
-    if (type[0] == '{' && strstr(type, "CGRect")) {
-        CGRect (*getter)(id, SEL) = (void *)method_getImplementation(method);
-        return getter(settings, selector);
-    }
-    id value = existingObjectSetting(settings, @"frame");
-    return isRectValue(value) ? [value rectValue] : CGRectZero;
-}
-static NSString *familySetting(NSUInteger family, NSString *suffix) {
-    return [(family ? @"hosted" : @"elementView") stringByAppendingString:suffix];
-}
-static NSString *familySetter(NSUInteger family, NSString *suffix) {
-    return [[(family ? @"setHosted" : @"setElementView") stringByAppendingString:suffix] stringByAppendingString:@":"];
-}
-static NSString *obstructionSetting(NSUInteger family, NSString *suffix) {
-    return [(family ? @"hostedIntegratedObstruction" : @"integratedObstruction") stringByAppendingString:suffix];
-}
-static NSString *obstructionSetter(NSUInteger family, NSString *suffix) {
-    return [[(family ? @"setHostedIntegratedObstruction" : @"setIntegratedObstruction") stringByAppendingString:suffix] stringByAppendingString:@":"];
-}
-static BOOL isDetachedObstructionLocation(id raw) {
-    if (!raw) return NO;
-    id value = raw;
     if ([raw isKindOfClass:NSData.class]) {
-        value = [NSJSONSerialization JSONObjectWithData:(NSData *)raw
-                                                options:NSJSONReadingFragmentsAllowed
-                                                  error:NULL];
-        if (!value) {
-            NSString *text = [[NSString alloc] initWithData:(NSData *)raw encoding:NSUTF8StringEncoding];
-            return text != nil && [text containsString:@"noObstruction"];
+        NSData *data = (NSData *)raw;
+        id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:NULL];
+        if (json && ([json isKindOfClass:NSString.class] || [json isKindOfClass:NSNumber.class] ||
+                     [NSJSONSerialization isValidJSONObject:json])) {
+            return json;
         }
+        NSString *utf8 = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        return utf8 ?: [data base64EncodedStringWithOptions:0];
     }
-    if ([value isKindOfClass:NSDictionary.class]) return ((NSDictionary *)value)[@"noObstruction"] != nil;
-    if ([value isKindOfClass:NSString.class]) return [(NSString *)value isEqualToString:@"noObstruction"];
-    return NO;
-}
-static BOOL containsAirDropToken(id value) {
-    if (!value) return NO;
-    if ([value isKindOfClass:NSString.class]) {
-        return [(NSString *)value rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
-    }
-    if ([value isKindOfClass:NSData.class]) {
-        NSString *text = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
-        if (text) {
-            return [text rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
-        }
-    }
-    if ([value isKindOfClass:NSDictionary.class]) {
-        for (id key in (NSDictionary *)value) {
-            if (containsAirDropToken(key) || containsAirDropToken(((NSDictionary *)value)[key])) return YES;
-        }
-    }
-    if ([value isKindOfClass:NSArray.class]) {
-        for (id item in (NSArray *)value) {
-            if (containsAirDropToken(item)) return YES;
-        }
-    }
-    return NO;
-}
-static BOOL isAirDropScene(id settings) {
-    return containsAirDropToken(existingObjectSetting(settings, @"clientIdentifier")) ||
-           containsAirDropToken(existingObjectSetting(settings, @"elementKindIdentifier")) ||
-           containsAirDropToken(existingObjectSetting(settings, @"persistenceIdentifier"));
+    return [raw description] ?: NSNull.null;
 }
 
-// FrontBoardServices creates a fresh FBSMutableSceneSettings copy per update,
-// clearing settings-level associated state while preserving payload objects.
-// Recover both the original unpatched values and whether patched values are
-// currently active inside this settings copy.
-static MacIslandSceneInsets *sceneState(id settings) {
-    MacIslandSceneInsets *state = objc_getAssociatedObject(settings, &sceneInsetsKey);
-    if (!state) {
-        state = [MacIslandSceneInsets new];
-        objc_setAssociatedObject(settings, &sceneInsetsKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        for (NSUInteger family = 0; family < state.layouts.count; family++) {
-            MacIslandNativeLayout *native = state.layouts[family];
-            id rawMargins = rawObjectSetting(settings, familySetting(family, @"LayoutMargins"));
-            id rawMinimum = rawObjectSetting(settings, familySetting(family, @"MinimumSize"));
-            id rawMaximum = rawObjectSetting(settings, familySetting(family, @"MaximumSize"));
-            native.applied = isPatchedPayload(rawMargins) || isPatchedPayload(rawMinimum) || isPatchedPayload(rawMaximum);
-            id margins = nativePayload(rawMargins);
-            id minimum = nativePayload(rawMinimum);
-            id maximum = nativePayload(rawMaximum);
-            native.margins = [margins isKindOfClass:NSData.class] ? margins : nil;
-            native.minimum = isSizeValue(minimum) ? minimum : nil;
-            native.maximum = isSizeValue(maximum) ? maximum : nil;
-        }
-        for (NSUInteger family = 0; family < state.obstructions.count; family++) {
-            MacIslandNativeObstruction *native = state.obstructions[family];
-            id rawRect = rawObjectSetting(settings, obstructionSetting(family, @"Rect"));
-            id rawSpace = rawObjectSetting(settings, obstructionSetting(family, @"RectCoordinateSpace"));
-            id rawCorners = rawObjectSetting(settings, obstructionSetting(family, @"CornerRadii"));
-            native.obstructionApplied = isPatchedPayload(rawRect);
-            native.cornersApplied = isPatchedPayload(rawCorners);
-            if (native.cornersApplied) native.rectangularCorners = rawCorners;
-            id rect = nativePayload(rawRect);
-            id space = nativePayload(rawSpace);
-            native.rect = isRectValue(rect) ? rect : nil;
-            native.space = isSizeValue(space) ? space : nil;
-            native.nativeCorners = nativePayload(rawCorners);
-        }
-        id rawMetricsData = rawObjectSetting(settings, @"metrics");
-        state.activityMetricsDataApplied = isPatchedPayload(rawMetricsData);
-        id metricsData = nativePayload(rawMetricsData);
-        state.nativeActivityMetricsData = [metricsData isKindOfClass:NSData.class] ? metricsData : nil;
-
-        id rawMetricsReq = rawObjectSetting(settings, @"metricsRequest");
-        state.activityMetricsRequestApplied = isPatchedPayload(rawMetricsReq);
-        state.nativeActivityMetricsRequest = nativePayload(rawMetricsReq);
-        state.frame = existingFrame(settings);
-    }
-    return state;
-}
-static BOOL settingsHaveTrackedValues(id settings) {
-    if (objc_getAssociatedObject(settings, &sceneInsetsKey)) return YES;
-    for (NSUInteger family = 0; family < 2; family++) {
-        if (rawObjectSetting(settings, familySetting(family, @"LayoutMargins")) ||
-            rawObjectSetting(settings, obstructionSetting(family, @"Rect")) ||
-            rawObjectSetting(settings, obstructionSetting(family, @"CornerRadii")))
-            return YES;
-    }
-    if (rawObjectSetting(settings, @"metrics") || rawObjectSetting(settings, @"metricsRequest"))
-        return YES;
-    return NO;
+NSString *MacIslandAuditSerialize(NSDictionary *record) {
+    if (!record || ![NSJSONSerialization isValidJSONObject:record]) return nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
 }
 
-static NSScreen *sceneDisplayScreen(id settings, BOOL *known) {
-    id identity = existingObjectSetting(settings, @"displayIdentity");
-    if (!identity) identity = existingObjectSetting(existingObjectSetting(settings, @"displayConfiguration"), @"identity");
-    uint32_t displayID = 0;
-    SEL displaySelector = NSSelectorFromString(@"displayID");
-    if ([identity respondsToSelector:displaySelector]) {
-        Method method = class_getInstanceMethod([identity class], displaySelector);
-        if (method && method_getTypeEncoding(method)[0] == 'I') {
-            uint32_t (*getter)(id, SEL) = (void *)method_getImplementation(method);
-            displayID = getter(identity, displaySelector);
-        }
-    }
-    if (!displayID) {
-        SEL selector = NSSelectorFromString(@"controlCenterItemDisplayID");
-        if ([settings respondsToSelector:selector]) {
-            Method method = class_getInstanceMethod([settings class], selector);
-            if (method && method_getTypeEncoding(method)[0] == 'I') {
-                uint32_t (*getter)(id, SEL) = (void *)method_getImplementation(method);
-                displayID = getter(settings, selector);
+void MacIslandAuditAppendRecord(NSString *logPath, NSDictionary *record) {
+    if (!logPath || !record) return;
+    NSMutableDictionary *stamped = [record mutableCopy];
+    stamped[@"ts"] = MacIslandAuditNumber([NSDate.date timeIntervalSince1970]);
+    if (![NSJSONSerialization isValidJSONObject:stamped]) return;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:stamped options:NSJSONWritingSortedKeys error:NULL];
+    if (!json) return;
+    NSMutableData *line = [json mutableCopy];
+    [line appendBytes:"\n" length:1];
+    int fd = open(logPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size < 8 * 1024 * 1024) {
+        const uint8_t *bytes = line.bytes;
+        size_t remaining = line.length;
+        while (remaining > 0) {
+            ssize_t written = write(fd, bytes, remaining);
+            if (written > 0) {
+                bytes += written;
+                remaining -= (size_t)written;
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
             }
         }
     }
-    *known = displayID != 0;
-    for (NSScreen *screen in NSScreen.screens)
-        if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) return screen;
-    return nil;
-}
-static NSScreen *fallbackNotchedScreen(void) {
-    for (NSScreen *screen in NSScreen.screens)
-        if (MacIslandScreenHasNotch(screen)) return screen;
-    return nil;
-}
-static NSRect canonicalObstruction(NSRect native, NSScreen *screen) {
-    NSRect cutout = NSZeroRect;
-    if (!MacIslandScreenNotchCutout(screen, &cutout) || NSIsEmptyRect(native) || !isfinite(native.origin.x) ||
-        !isfinite(native.origin.y) || !isfinite(native.size.width) || !isfinite(native.size.height)) return native;
-    CGFloat width = cutout.size.width;
-    // Correct the common obstruction itself, including legacy pill metrics.
-    // Preserve its scene-local horizontal anchor and existing vertical origin.
-    return NSMakeRect(NSMidX(native) - (width + 2) / 2, native.origin.y,
-                      width + 2, cutout.size.height + 2);
+    close(fd);
 }
 
-static MacIslandNotchAvoidance notchAvoidance(NSRect obstruction, NSSize viewport, NSArray<NSScreen *> *candidates) {
-    MacIslandNotchAvoidance policy = {0};
-    if (!isfinite(obstruction.origin.x) || !isfinite(obstruction.origin.y) ||
-        !isfinite(obstruction.size.width) || !isfinite(obstruction.size.height) ||
-        obstruction.size.width <= 0 || obstruction.size.height <= 0) return policy;
-    if (!isfinite(viewport.width) || !isfinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0) return policy;
-    for (NSScreen *screen in candidates) {
-        NSRect cutout = NSZeroRect;
-        if (!MacIslandScreenNotchCutout(screen, &cutout)) continue;
-        CGFloat width = cutout.size.width;
-        CGFloat height = cutout.size.height;
-        // Match the physical obstruction itself, not a provider's width,
-        // centering, scene height, identity, or display name.
-        if (fabs(obstruction.size.width - width) > 4 || fabs(obstruction.size.height - height) > 4 ||
-            fabs(obstruction.origin.y) > 3) continue;
-        policy.physical = YES;
-        policy.notchWidth = width;
-        policy.notchHeight = height;
-        policy.centeredDisplayWidth = MacIslandCenteredDisplayWidth(screen, cutout);
-        NSRect physical = NSInsetRect(obstruction, (obstruction.size.width - width) / 2,
-                                                  (obstruction.size.height - height) / 2);
-        NSRect area = NSMakeRect(0, 0, viewport.width, viewport.height);
-        policy.intersects = NSIntersectsRect(physical, area);
-        policy.extendsBelow = policy.intersects && viewport.height > NSMaxY(obstruction) + 1;
-        CGFloat outside = MacIslandNotchFlare + 6;
-        policy.leading = outside;
-        policy.trailing = outside;
-        // Compact side regions reserve a gap against the exclusion as well
-        // as the outside curve. A full-width scene gets the same policy.
-        if (NSMinX(physical) >= NSMaxX(area)) policy.trailing = 6;
-        if (NSMaxX(physical) <= NSMinX(area)) policy.leading = 6;
-        if (policy.extendsBelow) policy.top = ceil(MAX(height, NSMaxY(obstruction))) + 6;
-        return policy;
+static NSString *auditLayoutModeName(id rawMode) {
+    if (![rawMode isKindOfClass:NSNumber.class]) return nil;
+    switch ([rawMode integerValue]) {
+        case 0: return @"none";
+        case 1: return @"minimal";
+        case 2: return @"compact";
+        case 3: return @"expanded";
+        default: return [NSString stringWithFormat:@"mode_%ld", (long)[rawMode integerValue]];
     }
-    return policy;
 }
-static NSDictionary *decodedMargins(NSData *data) {
-    if (![data isKindOfClass:NSData.class]) return nil;
-    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
-    if (![decoded isKindOfClass:NSDictionary.class]) return nil;
-    for (NSString *key in @[@"top", @"leading", @"bottom", @"trailing"])
-        if (![decoded[key] isKindOfClass:NSNumber.class] || !isfinite([decoded[key] doubleValue])) return nil;
-    return decoded;
+
+static id auditMarginsDict(NSDictionary *decoded) {
+    if (!decoded) return NSNull.null;
+    return @{
+        @"top": MacIslandAuditDataValue(decoded[@"top"]),
+        @"leading": MacIslandAuditDataValue(decoded[@"leading"]),
+        @"bottom": MacIslandAuditDataValue(decoded[@"bottom"]),
+        @"trailing": MacIslandAuditDataValue(decoded[@"trailing"]),
+    };
 }
-static NSData *safeMargins(NSData *native, NSDictionary *decoded, MacIslandNotchAvoidance policy) {
-    if (!policy.physical || !decoded) return native;
-    NSMutableDictionary *margins = [decoded mutableCopy];
-    margins[@"top"] = @(MAX([decoded[@"top"] doubleValue], policy.top));
-    margins[@"leading"] = @(MAX([decoded[@"leading"] doubleValue], policy.leading));
-    margins[@"trailing"] = @(MAX([decoded[@"trailing"] doubleValue], policy.trailing));
-    if ([margins isEqualToDictionary:decoded]) return native;
-    NSData *raw = [NSJSONSerialization dataWithJSONObject:margins options:NSJSONWritingSortedKeys error:NULL];
-    NSData *data = raw ? [NSData dataWithData:raw] : nil;
-    return layoutPayload(data ?: native, native);
+
+void MacIslandEmitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInsets *state,
+                             NSScreen *targetScreen, BOOL displayKnown, BOOL physicalDisplay,
+                             const NSRect rects[2], const NSRect publishedRects[2],
+                             const MacIslandFamilyAuditSnapshot snapshots[2],
+                             MacIslandActivityMetricsSummary activitySummary) {
+    NSRect cutout = NSZeroRect;
+    BOOL hasCutout = MacIslandScreenNotchCutout(targetScreen, &cutout);
+    id client = MacIslandAuditDataValue(MacIslandExistingObjectSetting(settings, @"clientIdentifier"));
+    id persistence = MacIslandAuditDataValue(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"));
+    id elementKind = MacIslandAuditDataValue(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"));
+    id rawMode = MacIslandExistingObjectSetting(settings, @"integratedLayoutMode");
+    id modeName = auditLayoutModeName(rawMode) ?: NSNull.null;
+
+    for (NSUInteger family = 0; family < 2; family++) {
+        MacIslandFamilyAuditSnapshot snap = snapshots[family];
+        if (!snap.hasData) continue;
+        MacIslandNativeLayout *nativeLayout = state.layouts[family];
+        NSUInteger obsFamily = snap.obstructionFamily;
+        MacIslandNativeObstruction *nativeObs = state.obstructions[obsFamily];
+        id rawLocation = MacIslandExistingObjectSetting(settings, MacIslandObstructionSetting(obsFamily, @"Location"))
+            ?: MacIslandExistingObjectSetting(settings, @"integratedObstructionLocation");
+        id obsLocation = MacIslandAuditDataValue(rawLocation);
+        id anchorStyle = MacIslandAuditDataValue(MacIslandExistingObjectSetting(
+            settings, family ? @"hostedIntegratedObstructionAnchorStyle" : @"integratedObstructionAnchorStyle"));
+        id firstBaseline = MacIslandAuditDataValue(MacIslandExistingObjectSetting(
+            settings, family ? @"hostedFirstTextBaselineFromTop" : @"elementViewFirstTextBaselineFromTop"));
+
+        NSDictionary *nativeMargins = MacIslandDecodedMargins(nativeLayout.margins);
+        NSDictionary *afterMargins = snap.patchedMargins == nativeLayout.margins
+            ? nativeMargins : MacIslandDecodedMargins(snap.patchedMargins);
+        BOOL includeActivity = (family == 0 && activitySummary.present);
+
+        NSDictionary *record = @{
+            @"event": @"scene_settings",
+            @"family": family ? @"hosted" : @"elementView",
+            @"obstructionFamily": obsFamily ? @"hosted" : @"elementView",
+            @"client": client,
+            @"persistenceId": persistence,
+            @"elementKind": elementKind,
+            @"layoutMode": modeName,
+            @"layoutModeRaw": MacIslandAuditDataValue(rawMode),
+            @"obstructionLocation": obsLocation,
+            @"anchorStyle": anchorStyle,
+            @"firstBaselineFromTop": firstBaseline,
+            @"displayKnown": @(displayKnown),
+            @"physicalDisplay": @(physicalDisplay),
+            @"notch": hasCutout ? @{
+                @"x": MacIslandAuditNumber(cutout.origin.x),
+                @"y": MacIslandAuditNumber(cutout.origin.y),
+                @"w": MacIslandAuditNumber(cutout.size.width),
+                @"h": MacIslandAuditNumber(cutout.size.height),
+                @"centeredDisplayWidth": MacIslandAuditNumber(snap.policy.centeredDisplayWidth),
+            } : NSNull.null,
+            @"sceneFrame": MacIslandAuditRectDict(state.frame),
+            @"viewport": MacIslandAuditSizeDict(snap.viewport),
+            @"native": @{
+                @"margins": auditMarginsDict(nativeMargins),
+                @"min": nativeLayout.minimum ? MacIslandAuditSizeDict(nativeLayout.minimum.sizeValue) : NSNull.null,
+                @"max": nativeLayout.maximum ? MacIslandAuditSizeDict(nativeLayout.maximum.sizeValue) : NSNull.null,
+                @"obstructionRect": nativeObs.rect ? MacIslandAuditRectDict(nativeObs.rect.rectValue) : NSNull.null,
+                @"obstructionSpace": nativeObs.space ? MacIslandAuditSizeDict(nativeObs.space.sizeValue) : NSNull.null,
+                @"activityMetrics": includeActivity ? @{
+                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.nativeObstruction),
+                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMinW),
+                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMaxW),
+                    @"expandedScale": MacIslandAuditNumber(activitySummary.nativeExpandedScale),
+                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.nativeExpandedCornerRadius),
+                } : NSNull.null,
+            },
+            @"policy": @{
+                @"physical": @(snap.policy.physical),
+                @"intersects": @(snap.policy.intersects),
+                @"extendsBelow": @(snap.policy.extendsBelow),
+                @"top": MacIslandAuditNumber(snap.policy.top),
+                @"leading": MacIslandAuditNumber(snap.policy.leading),
+                @"trailing": MacIslandAuditNumber(snap.policy.trailing),
+                @"shortHeight": MacIslandAuditNumber(snap.shortHeight),
+            },
+            @"patched": @{
+                @"applied": @(snap.applies),
+                @"margins": auditMarginsDict(afterMargins),
+                @"min": snap.patchedMin ? MacIslandAuditSizeDict(snap.patchedMin.sizeValue) : NSNull.null,
+                @"max": snap.patchedMax ? MacIslandAuditSizeDict(snap.patchedMax.sizeValue) : NSNull.null,
+                @"canonicalObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(rects[obsFamily]) : NSNull.null,
+                @"publishedObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(publishedRects[obsFamily]) : NSNull.null,
+                @"cornersZeroed": @(nativeObs.cornersApplied),
+                @"activityMetrics": includeActivity ? @{
+                    @"applied": @(activitySummary.patched),
+                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.patchedObstruction),
+                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMinW),
+                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMaxW),
+                    @"expandedScale": MacIslandAuditNumber(activitySummary.patchedExpandedScale),
+                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.patchedExpandedCornerRadius),
+                } : NSNull.null,
+            },
+        };
+        NSString *signature = MacIslandAuditSerialize(record);
+        if (!signature || [state.auditSignatures[family] isEqualToString:signature]) continue;
+        state.auditSignatures[family] = signature;
+        MacIslandAuditAppendRecord(auditPath, record);
+    }
 }
+MACISLAND_SCENE_AUDIT_M
+
+  cat > "$SCRATCH/activity-metrics.m" <<'MACISLAND_ACTIVITY_METRICS_M'
+#import "safearea-internal.h"
+#import <dlfcn.h>
+#include <pthread.h>
+
 typedef struct {
     uint64_t w0;
     uint64_t w1;
@@ -2094,6 +2248,26 @@ static BOOL readSystemApertureSummary(id<MacIslandActivityMetricsRequest> req,
     return YES;
 }
 
+static MacIslandActivityMetricsSummary summarizeActivityTransition(
+    id<MacIslandActivityMetricsRequest> original,
+    id<MacIslandActivityMetricsRequest> active,
+    BOOL applied) {
+    MacIslandActivityMetricsSummary summary = {0};
+    CGFloat unusedMinH = 0.0, unusedMaxH = 0.0;
+    if (readSystemApertureSummary(original, &summary.nativeObstruction,
+                                  &summary.nativeExpandedMinW, &summary.nativeExpandedMaxW,
+                                  &unusedMinH, &unusedMaxH,
+                                  &summary.nativeExpandedScale, &summary.nativeExpandedCornerRadius) &&
+        readSystemApertureSummary(active, &summary.patchedObstruction,
+                                  &summary.patchedExpandedMinW, &summary.patchedExpandedMaxW,
+                                  &summary.patchedExpandedMinH, &summary.patchedExpandedMaxH,
+                                  &summary.patchedExpandedScale, &summary.patchedExpandedCornerRadius)) {
+        summary.present = YES;
+        summary.patched = applied;
+    }
+    return summary;
+}
+
 static id<MacIslandSystemApertureMetricsRequest> patchedSystemApertureMetrics(
     id<MacIslandSystemApertureMetricsRequest> sa,
     CGSize notchObstruction,
@@ -2194,9 +2368,7 @@ static id<MacIslandActivityMetricsRequest> patchedActivityMetricsRequest(
     NSRect cutout = NSZeroRect;
     if (!MacIslandScreenNotchCutout(targetScreen, &cutout)) return nativeReq;
     CGSize notchObstruction = CGSizeMake(cutout.size.width + 2.0, cutout.size.height + 2.0);
-    CGFloat center = NSMidX(cutout);
-    CGFloat centeredDisplayWidth = 2.0 * MIN(center - NSMinX(targetScreen.frame),
-                                             NSMaxX(targetScreen.frame) - center);
+    CGFloat centeredDisplayWidth = MacIslandCenteredDisplayWidth(targetScreen, cutout);
     if (!(centeredDisplayWidth > notchObstruction.width)) return nativeReq;
 
     id<MacIslandSystemApertureMetricsRequest> oldSA = [nativeReq systemApertureMetrics];
@@ -2218,23 +2390,25 @@ static id<MacIslandActivityMetricsRequest> patchedActivityMetricsRequest(
     return [copy isEqual:nativeReq] ? nativeReq : copy;
 }
 
-static MacIslandActivityMetricsSummary refreshActivityMetrics(id settings, MacIslandSceneInsets *state,
-                                                              NSScreen *targetScreen, BOOL physicalDisplay) {
+MacIslandActivityMetricsSummary MacIslandRefreshActivityMetrics(
+    id settings,
+    MacIslandSceneInsets *state,
+    NSScreen *targetScreen,
+    BOOL physicalDisplay,
+    void (*originalActivityMetricsData)(id, SEL, id),
+    void (*originalActivityMetricsRequest)(id, SEL, id)) {
     if (!state.nativeActivityMetricsData) {
-        id existing = existingObjectSetting(settings, @"metrics");
+        id existing = MacIslandExistingObjectSetting(settings, @"metrics");
         if ([existing isKindOfClass:NSData.class]) state.nativeActivityMetricsData = existing;
     }
     if (!state.nativeActivityMetricsRequest) {
-        state.nativeActivityMetricsRequest = existingObjectSetting(settings, @"metricsRequest");
+        state.nativeActivityMetricsRequest = MacIslandExistingObjectSetting(settings, @"metricsRequest");
     }
 
     MacIslandActivityMetricsSummary summary = {0};
     NSRect cutout = NSZeroRect;
     BOOL hasCutout = physicalDisplay && MacIslandScreenNotchCutout(targetScreen, &cutout);
-    CGFloat center = hasCutout ? NSMidX(cutout) : 0.0;
-    CGFloat centeredWidth = hasCutout
-        ? 2.0 * MIN(center - NSMinX(targetScreen.frame), NSMaxX(targetScreen.frame) - center)
-        : 0.0;
+    CGFloat centeredWidth = hasCutout ? MacIslandCenteredDisplayWidth(targetScreen, cutout) : 0.0;
     if (!hasCutout) cutout = NSZeroRect;
 
     if (state.nativeActivityMetricsData) {
@@ -2252,18 +2426,7 @@ static MacIslandActivityMetricsSummary refreshActivityMetrics(id settings, MacIs
                 BOOL changed = (rewritten != decoded && ![rewritten isEqual:decoded]);
                 if (changed) patchedData = encodeActivityMetricsData(rewritten);
                 id<MacIslandActivityMetricsRequest> active = (changed && patchedData) ? rewritten : decoded;
-                CGFloat unusedMinH = 0.0, unusedMaxH = 0.0;
-                if (readSystemApertureSummary(decoded, &summary.nativeObstruction,
-                                              &summary.nativeExpandedMinW, &summary.nativeExpandedMaxW,
-                                              &unusedMinH, &unusedMaxH,
-                                              &summary.nativeExpandedScale, &summary.nativeExpandedCornerRadius) &&
-                    readSystemApertureSummary(active, &summary.patchedObstruction,
-                                              &summary.patchedExpandedMinW, &summary.patchedExpandedMaxW,
-                                              &summary.patchedExpandedMinH, &summary.patchedExpandedMaxH,
-                                              &summary.patchedExpandedScale, &summary.patchedExpandedCornerRadius)) {
-                    summary.present = YES;
-                    summary.patched = (changed && patchedData != nil);
-                }
+                summary = summarizeActivityTransition(decoded, active, (changed && patchedData != nil));
             }
             state.cachedActivityMetricsSource = state.nativeActivityMetricsData;
             state.cachedActivityMetricsCutout = cutout;
@@ -2274,13 +2437,13 @@ static MacIslandActivityMetricsSummary refreshActivityMetrics(id settings, MacIs
         BOOL shouldApply = (patchedData != nil);
         if (originalActivityMetricsData && (shouldApply || state.activityMetricsDataApplied)) {
             NSData *toWrite = shouldApply
-                ? layoutPayload(patchedData, state.nativeActivityMetricsData)
+                ? MacIslandLayoutPayload(patchedData, state.nativeActivityMetricsData)
                 : state.nativeActivityMetricsData;
             originalActivityMetricsData(settings, @selector(setMetrics:), toWrite);
             if (shouldApply) {
-                id stored = rawObjectSetting(settings, @"metrics");
+                id stored = MacIslandRawObjectSetting(settings, @"metrics");
                 if (stored && stored != state.nativeActivityMetricsData) {
-                    layoutPayload(stored, state.nativeActivityMetricsData);
+                    MacIslandLayoutPayload(stored, state.nativeActivityMetricsData);
                 }
             }
         }
@@ -2293,31 +2456,333 @@ static MacIslandActivityMetricsSummary refreshActivityMetrics(id settings, MacIs
             patchedActivityMetricsRequest(nativeReq, targetScreen, physicalDisplay);
         BOOL shouldApply = (rewritten != nativeReq && ![rewritten isEqual:nativeReq]);
         if (!summary.present) {
-            CGFloat unusedMinH = 0.0, unusedMaxH = 0.0;
             id<MacIslandActivityMetricsRequest> active = shouldApply ? rewritten : nativeReq;
-            if (readSystemApertureSummary(nativeReq, &summary.nativeObstruction,
-                                          &summary.nativeExpandedMinW, &summary.nativeExpandedMaxW,
-                                          &unusedMinH, &unusedMaxH,
-                                          &summary.nativeExpandedScale, &summary.nativeExpandedCornerRadius) &&
-                readSystemApertureSummary(active, &summary.patchedObstruction,
-                                          &summary.patchedExpandedMinW, &summary.patchedExpandedMaxW,
-                                          &summary.patchedExpandedMinH, &summary.patchedExpandedMaxH,
-                                          &summary.patchedExpandedScale, &summary.patchedExpandedCornerRadius)) {
-                summary.present = YES;
-                summary.patched = shouldApply;
-            }
+            summary = summarizeActivityTransition(nativeReq, active, shouldApply);
         }
         if (originalActivityMetricsRequest && (shouldApply || state.activityMetricsRequestApplied)) {
-            id toWrite = shouldApply ? layoutPayload(rewritten, nativeReq) : nativeReq;
+            id toWrite = shouldApply ? MacIslandLayoutPayload(rewritten, nativeReq) : nativeReq;
             originalActivityMetricsRequest(settings, @selector(setMetricsRequest:), toWrite);
             if (shouldApply) {
-                id stored = rawObjectSetting(settings, @"metricsRequest");
-                if (stored && stored != nativeReq) layoutPayload(stored, nativeReq);
+                id stored = MacIslandRawObjectSetting(settings, @"metricsRequest");
+                if (stored && stored != nativeReq) MacIslandLayoutPayload(stored, nativeReq);
             }
         }
         state.activityMetricsRequestApplied = shouldApply;
     }
     return summary;
+}
+MACISLAND_ACTIVITY_METRICS_M
+
+  cat > "$SCRATCH/safearea.m" <<'MACISLAND_SAFEAREA_M'
+#import "safearea-internal.h"
+#import <objc/runtime.h>
+#import <objc/message.h>
+#include <os/log.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+
+// One physical exclusion policy at the shared FBS scene-settings boundary.
+// Both ElementRegistry and MenuBarClient receive it, regardless of provider.
+static char sceneInsetsKey, originalLayoutPayloadKey;
+static void (*originalMargins[2])(id, SEL, id);
+static void (*originalMinimum[2])(id, SEL, id);
+static void (*originalMaximum[2])(id, SEL, id);
+static void (*originalObstruction[2])(id, SEL, id);
+static void (*originalSpace[2])(id, SEL, id);
+static void (*originalCorners[2])(id, SEL, id);
+static void (*originalLocation[2])(id, SEL, id);
+static void (*originalClientIdentifier)(id, SEL, id);
+static void (*originalElementKindIdentifier)(id, SEL, id);
+static void (*originalActivityMetricsData)(id, SEL, id);
+static void (*originalActivityMetricsRequest)(id, SEL, id);
+static void (*originalFrame)(id, SEL, CGRect);
+static void (*originalDisplayConfiguration)(id, SEL, id);
+
+@implementation MacIslandNativeLayout
+@end
+
+@implementation MacIslandNativeObstruction
+@end
+
+@implementation MacIslandSceneInsets
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _layouts = @[[MacIslandNativeLayout new], [MacIslandNativeLayout new]];
+        _obstructions = @[[MacIslandNativeObstruction new], [MacIslandNativeObstruction new]];
+        _auditSignatures = [@[@"", @""] mutableCopy];
+    }
+    return self;
+}
+@end
+
+@protocol MacIslandCornerFactory
+- (instancetype)initWithCornerRadius:(CGFloat)radius;
+@end
+
+static BOOL isPatchedPayload(id value) {
+    return value != nil && objc_getAssociatedObject(value, &originalLayoutPayloadKey) != nil;
+}
+static id nativePayload(id value) {
+    if (!value) return nil;
+    id saved = objc_getAssociatedObject(value, &originalLayoutPayloadKey);
+    if (!saved) return value;
+    return saved == NSNull.null ? nil : saved;
+}
+id MacIslandLayoutPayload(id value, id original) {
+    id unpatched = nativePayload(original);
+    if (value && value != unpatched) {
+        objc_setAssociatedObject(value, &originalLayoutPayloadKey, unpatched ?: NSNull.null,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return value;
+}
+static BOOL isSizeValue(id value) {
+    return [value isKindOfClass:NSValue.class] && !strcmp([value objCType], @encode(NSSize));
+}
+static BOOL isRectValue(id value) {
+    return [value isKindOfClass:NSValue.class] && !strcmp([value objCType], @encode(NSRect));
+}
+id MacIslandRawObjectSetting(id settings, NSString *name) {
+    SEL selector = NSSelectorFromString(name);
+    if (![settings respondsToSelector:selector]) return nil;
+    Method method = class_getInstanceMethod([settings class], selector);
+    if (!method || method_getTypeEncoding(method)[0] != '@') return nil;
+    id (*getter)(id, SEL) = (void *)method_getImplementation(method);
+    return getter(settings, selector);
+}
+id MacIslandExistingObjectSetting(id settings, NSString *name) {
+    return nativePayload(MacIslandRawObjectSetting(settings, name));
+}
+static CGRect existingFrame(id settings) {
+    SEL selector = NSSelectorFromString(@"frame");
+    if (![settings respondsToSelector:selector]) return CGRectZero;
+    Method method = class_getInstanceMethod([settings class], selector);
+    if (!method) return CGRectZero;
+    const char *type = method_getTypeEncoding(method);
+    if (type[0] == '{' && strstr(type, "CGRect")) {
+        CGRect (*getter)(id, SEL) = (void *)method_getImplementation(method);
+        return getter(settings, selector);
+    }
+    id value = MacIslandExistingObjectSetting(settings, @"frame");
+    return isRectValue(value) ? [value rectValue] : CGRectZero;
+}
+static NSString *familySetting(NSUInteger family, NSString *suffix) {
+    return [(family ? @"hosted" : @"elementView") stringByAppendingString:suffix];
+}
+static NSString *familySetter(NSUInteger family, NSString *suffix) {
+    return [[(family ? @"setHosted" : @"setElementView") stringByAppendingString:suffix] stringByAppendingString:@":"];
+}
+NSString *MacIslandObstructionSetting(NSUInteger family, NSString *suffix) {
+    return [(family ? @"hostedIntegratedObstruction" : @"integratedObstruction") stringByAppendingString:suffix];
+}
+static NSString *obstructionSetter(NSUInteger family, NSString *suffix) {
+    return [[(family ? @"setHostedIntegratedObstruction" : @"setIntegratedObstruction") stringByAppendingString:suffix] stringByAppendingString:@":"];
+}
+static BOOL isDetachedObstructionLocation(id raw) {
+    if (!raw) return NO;
+    id value = raw;
+    if ([raw isKindOfClass:NSData.class]) {
+        value = [NSJSONSerialization JSONObjectWithData:(NSData *)raw
+                                                options:NSJSONReadingFragmentsAllowed
+                                                  error:NULL];
+        if (!value) {
+            NSString *text = [[NSString alloc] initWithData:(NSData *)raw encoding:NSUTF8StringEncoding];
+            return text != nil && [text containsString:@"noObstruction"];
+        }
+    }
+    if ([value isKindOfClass:NSDictionary.class]) return ((NSDictionary *)value)[@"noObstruction"] != nil;
+    if ([value isKindOfClass:NSString.class]) return [(NSString *)value isEqualToString:@"noObstruction"];
+    return NO;
+}
+static BOOL containsAirDropToken(id value) {
+    if (!value) return NO;
+    if ([value isKindOfClass:NSString.class]) {
+        return [(NSString *)value rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }
+    if ([value isKindOfClass:NSData.class]) {
+        NSString *text = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
+        if (text) {
+            return [text rangeOfString:@"airdrop" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        }
+    }
+    if ([value isKindOfClass:NSDictionary.class]) {
+        for (id key in (NSDictionary *)value) {
+            if (containsAirDropToken(key) || containsAirDropToken(((NSDictionary *)value)[key])) return YES;
+        }
+    }
+    if ([value isKindOfClass:NSArray.class]) {
+        for (id item in (NSArray *)value) {
+            if (containsAirDropToken(item)) return YES;
+        }
+    }
+    return NO;
+}
+static BOOL isAirDropScene(id settings) {
+    return containsAirDropToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier")) ||
+           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier")) ||
+           containsAirDropToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"));
+}
+
+// FrontBoardServices creates a fresh FBSMutableSceneSettings copy per update,
+// clearing settings-level associated state while preserving payload objects.
+// Recover both the original unpatched values and whether patched values are
+// currently active inside this settings copy.
+static MacIslandSceneInsets *sceneState(id settings) {
+    MacIslandSceneInsets *state = objc_getAssociatedObject(settings, &sceneInsetsKey);
+    if (!state) {
+        state = [MacIslandSceneInsets new];
+        objc_setAssociatedObject(settings, &sceneInsetsKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        for (NSUInteger family = 0; family < state.layouts.count; family++) {
+            MacIslandNativeLayout *native = state.layouts[family];
+            id rawMargins = MacIslandRawObjectSetting(settings, familySetting(family, @"LayoutMargins"));
+            id rawMinimum = MacIslandRawObjectSetting(settings, familySetting(family, @"MinimumSize"));
+            id rawMaximum = MacIslandRawObjectSetting(settings, familySetting(family, @"MaximumSize"));
+            native.applied = isPatchedPayload(rawMargins) || isPatchedPayload(rawMinimum) || isPatchedPayload(rawMaximum);
+            id margins = nativePayload(rawMargins);
+            id minimum = nativePayload(rawMinimum);
+            id maximum = nativePayload(rawMaximum);
+            native.margins = [margins isKindOfClass:NSData.class] ? margins : nil;
+            native.minimum = isSizeValue(minimum) ? minimum : nil;
+            native.maximum = isSizeValue(maximum) ? maximum : nil;
+        }
+        for (NSUInteger family = 0; family < state.obstructions.count; family++) {
+            MacIslandNativeObstruction *native = state.obstructions[family];
+            id rawRect = MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"Rect"));
+            id rawSpace = MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"RectCoordinateSpace"));
+            id rawCorners = MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"CornerRadii"));
+            native.obstructionApplied = isPatchedPayload(rawRect);
+            native.cornersApplied = isPatchedPayload(rawCorners);
+            if (native.cornersApplied) native.rectangularCorners = rawCorners;
+            id rect = nativePayload(rawRect);
+            id space = nativePayload(rawSpace);
+            native.rect = isRectValue(rect) ? rect : nil;
+            native.space = isSizeValue(space) ? space : nil;
+            native.nativeCorners = nativePayload(rawCorners);
+        }
+        id rawMetricsData = MacIslandRawObjectSetting(settings, @"metrics");
+        state.activityMetricsDataApplied = isPatchedPayload(rawMetricsData);
+        id metricsData = nativePayload(rawMetricsData);
+        state.nativeActivityMetricsData = [metricsData isKindOfClass:NSData.class] ? metricsData : nil;
+
+        id rawMetricsReq = MacIslandRawObjectSetting(settings, @"metricsRequest");
+        state.activityMetricsRequestApplied = isPatchedPayload(rawMetricsReq);
+        state.nativeActivityMetricsRequest = nativePayload(rawMetricsReq);
+        state.frame = existingFrame(settings);
+    }
+    return state;
+}
+static BOOL settingsHaveTrackedValues(id settings) {
+    if (objc_getAssociatedObject(settings, &sceneInsetsKey)) return YES;
+    for (NSUInteger family = 0; family < 2; family++) {
+        if (MacIslandRawObjectSetting(settings, familySetting(family, @"LayoutMargins")) ||
+            MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"Rect")) ||
+            MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"CornerRadii")))
+            return YES;
+    }
+    if (MacIslandRawObjectSetting(settings, @"metrics") || MacIslandRawObjectSetting(settings, @"metricsRequest"))
+        return YES;
+    return NO;
+}
+
+static NSScreen *sceneDisplayScreen(id settings, BOOL *known) {
+    id identity = MacIslandExistingObjectSetting(settings, @"displayIdentity");
+    if (!identity) identity = MacIslandExistingObjectSetting(MacIslandExistingObjectSetting(settings, @"displayConfiguration"), @"identity");
+    uint32_t displayID = 0;
+    SEL displaySelector = NSSelectorFromString(@"displayID");
+    if ([identity respondsToSelector:displaySelector]) {
+        Method method = class_getInstanceMethod([identity class], displaySelector);
+        if (method && method_getTypeEncoding(method)[0] == 'I') {
+            uint32_t (*getter)(id, SEL) = (void *)method_getImplementation(method);
+            displayID = getter(identity, displaySelector);
+        }
+    }
+    if (!displayID) {
+        SEL selector = NSSelectorFromString(@"controlCenterItemDisplayID");
+        if ([settings respondsToSelector:selector]) {
+            Method method = class_getInstanceMethod([settings class], selector);
+            if (method && method_getTypeEncoding(method)[0] == 'I') {
+                uint32_t (*getter)(id, SEL) = (void *)method_getImplementation(method);
+                displayID = getter(settings, selector);
+            }
+        }
+    }
+    *known = displayID != 0;
+    for (NSScreen *screen in NSScreen.screens)
+        if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) return screen;
+    return nil;
+}
+static NSScreen *fallbackNotchedScreen(void) {
+    for (NSScreen *screen in NSScreen.screens)
+        if (MacIslandScreenHasNotch(screen)) return screen;
+    return nil;
+}
+static NSRect canonicalObstruction(NSRect native, NSScreen *screen) {
+    NSRect cutout = NSZeroRect;
+    if (!MacIslandScreenNotchCutout(screen, &cutout) || NSIsEmptyRect(native) || !isfinite(native.origin.x) ||
+        !isfinite(native.origin.y) || !isfinite(native.size.width) || !isfinite(native.size.height)) return native;
+    CGFloat width = cutout.size.width;
+    // Correct the common obstruction itself, including legacy pill metrics.
+    // Preserve its scene-local horizontal anchor and existing vertical origin.
+    return NSMakeRect(NSMidX(native) - (width + 2) / 2, native.origin.y,
+                      width + 2, cutout.size.height + 2);
+}
+
+static MacIslandNotchAvoidance notchAvoidance(NSRect obstruction, NSSize viewport, NSArray<NSScreen *> *candidates) {
+    MacIslandNotchAvoidance policy = {0};
+    if (!isfinite(obstruction.origin.x) || !isfinite(obstruction.origin.y) ||
+        !isfinite(obstruction.size.width) || !isfinite(obstruction.size.height) ||
+        obstruction.size.width <= 0 || obstruction.size.height <= 0) return policy;
+    if (!isfinite(viewport.width) || !isfinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0) return policy;
+    for (NSScreen *screen in candidates) {
+        NSRect cutout = NSZeroRect;
+        if (!MacIslandScreenNotchCutout(screen, &cutout)) continue;
+        CGFloat width = cutout.size.width;
+        CGFloat height = cutout.size.height;
+        // Match the physical obstruction itself, not a provider's width,
+        // centering, scene height, identity, or display name.
+        if (fabs(obstruction.size.width - width) > 4 || fabs(obstruction.size.height - height) > 4 ||
+            fabs(obstruction.origin.y) > 3) continue;
+        policy.physical = YES;
+        policy.notchWidth = width;
+        policy.notchHeight = height;
+        policy.centeredDisplayWidth = MacIslandCenteredDisplayWidth(screen, cutout);
+        NSRect physical = NSInsetRect(obstruction, (obstruction.size.width - width) / 2,
+                                                  (obstruction.size.height - height) / 2);
+        NSRect area = NSMakeRect(0, 0, viewport.width, viewport.height);
+        policy.intersects = NSIntersectsRect(physical, area);
+        policy.extendsBelow = policy.intersects && viewport.height > NSMaxY(obstruction) + 1;
+        CGFloat outside = MacIslandNotchFlare + 6;
+        policy.leading = outside;
+        policy.trailing = outside;
+        // Compact side regions reserve a gap against the exclusion as well
+        // as the outside curve. A full-width scene gets the same policy.
+        if (NSMinX(physical) >= NSMaxX(area)) policy.trailing = 6;
+        if (NSMaxX(physical) <= NSMinX(area)) policy.leading = 6;
+        if (policy.extendsBelow) policy.top = ceil(MAX(height, NSMaxY(obstruction))) + 6;
+        return policy;
+    }
+    return policy;
+}
+NSDictionary *MacIslandDecodedMargins(NSData *data) {
+    if (![data isKindOfClass:NSData.class]) return nil;
+    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![decoded isKindOfClass:NSDictionary.class]) return nil;
+    for (NSString *key in @[@"top", @"leading", @"bottom", @"trailing"])
+        if (![decoded[key] isKindOfClass:NSNumber.class] || !isfinite([decoded[key] doubleValue])) return nil;
+    return decoded;
+}
+static NSData *safeMargins(NSData *native, NSDictionary *decoded, MacIslandNotchAvoidance policy) {
+    if (!policy.physical || !decoded) return native;
+    NSMutableDictionary *margins = [decoded mutableCopy];
+    margins[@"top"] = @(MAX([decoded[@"top"] doubleValue], policy.top));
+    margins[@"leading"] = @(MAX([decoded[@"leading"] doubleValue], policy.leading));
+    margins[@"trailing"] = @(MAX([decoded[@"trailing"] doubleValue], policy.trailing));
+    if ([margins isEqualToDictionary:decoded]) return native;
+    NSData *raw = [NSJSONSerialization dataWithJSONObject:margins options:NSJSONWritingSortedKeys error:NULL];
+    NSData *data = raw ? [NSData dataWithData:raw] : nil;
+    return MacIslandLayoutPayload(data ?: native, native);
 }
 
 static void writeFamily(id settings, NSUInteger family, MacIslandNativeLayout *native, NSData *margins,
@@ -2333,312 +2798,182 @@ static void writeFamily(id settings, NSUInteger family, MacIslandNativeLayout *n
     if (native.maximum)
         maximumSetter(settings, NSSelectorFromString(familySetter(family, @"MaximumSize")), maximum);
 }
-typedef struct {
-    BOOL hasData;
-    NSUInteger obstructionFamily;
-    NSSize viewport;
-    MacIslandNotchAvoidance policy;
-    CGFloat shortHeight;
-    BOOL applies;
-    NSData *patchedMargins;
-    NSValue *patchedMin;
-    NSValue *patchedMax;
-} MacIslandFamilyAuditSnapshot;
 
-static NSString *auditLayoutModeName(id rawMode) {
-    if (![rawMode isKindOfClass:NSNumber.class]) return nil;
-    switch ([rawMode integerValue]) {
-        case 0: return @"none";
-        case 1: return @"minimal";
-        case 2: return @"compact";
-        case 3: return @"expanded";
-        default: return [NSString stringWithFormat:@"mode_%ld", (long)[rawMode integerValue]];
-    }
-}
-
-static id auditMarginsDict(NSDictionary *decoded) {
-    if (!decoded) return NSNull.null;
-    return @{
-        @"top": MacIslandAuditDataValue(decoded[@"top"]),
-        @"leading": MacIslandAuditDataValue(decoded[@"leading"]),
-        @"bottom": MacIslandAuditDataValue(decoded[@"bottom"]),
-        @"trailing": MacIslandAuditDataValue(decoded[@"trailing"]),
-    };
-}
-
-static void emitSceneAudit(NSString *auditPath, id settings, MacIslandSceneInsets *state,
-                           NSScreen *targetScreen, BOOL displayKnown, BOOL physicalDisplay,
-                           const NSRect rects[2], const NSRect publishedRects[2],
-                           const MacIslandFamilyAuditSnapshot snapshots[2],
-                           MacIslandActivityMetricsSummary activitySummary) {
-    NSRect cutout = NSZeroRect;
-    BOOL hasCutout = MacIslandScreenNotchCutout(targetScreen, &cutout);
-    id client = MacIslandAuditDataValue(existingObjectSetting(settings, @"clientIdentifier"));
-    id persistence = MacIslandAuditDataValue(existingObjectSetting(settings, @"persistenceIdentifier"));
-    id elementKind = MacIslandAuditDataValue(existingObjectSetting(settings, @"elementKindIdentifier"));
-    id rawMode = existingObjectSetting(settings, @"integratedLayoutMode");
-    id modeName = auditLayoutModeName(rawMode) ?: NSNull.null;
-
-    for (NSUInteger family = 0; family < 2; family++) {
-        MacIslandFamilyAuditSnapshot snap = snapshots[family];
-        if (!snap.hasData) continue;
-        MacIslandNativeLayout *nativeLayout = state.layouts[family];
-        NSUInteger obsFamily = snap.obstructionFamily;
-        MacIslandNativeObstruction *nativeObs = state.obstructions[obsFamily];
-        id rawLocation = existingObjectSetting(settings, obstructionSetting(obsFamily, @"Location"))
-            ?: existingObjectSetting(settings, @"integratedObstructionLocation");
-        id obsLocation = MacIslandAuditDataValue(rawLocation);
-        id anchorStyle = MacIslandAuditDataValue(existingObjectSetting(
-            settings, family ? @"hostedIntegratedObstructionAnchorStyle" : @"integratedObstructionAnchorStyle"));
-        id firstBaseline = MacIslandAuditDataValue(existingObjectSetting(
-            settings, family ? @"hostedFirstTextBaselineFromTop" : @"elementViewFirstTextBaselineFromTop"));
-
-        NSDictionary *nativeMargins = decodedMargins(nativeLayout.margins);
-        NSDictionary *afterMargins = snap.patchedMargins == nativeLayout.margins
-            ? nativeMargins : decodedMargins(snap.patchedMargins);
-        BOOL includeActivity = (family == 0 && activitySummary.present);
-
-        NSDictionary *record = @{
-            @"event": @"scene_settings",
-            @"family": family ? @"hosted" : @"elementView",
-            @"obstructionFamily": obsFamily ? @"hosted" : @"elementView",
-            @"client": client,
-            @"persistenceId": persistence,
-            @"elementKind": elementKind,
-            @"layoutMode": modeName,
-            @"layoutModeRaw": MacIslandAuditDataValue(rawMode),
-            @"obstructionLocation": obsLocation,
-            @"anchorStyle": anchorStyle,
-            @"firstBaselineFromTop": firstBaseline,
-            @"displayKnown": @(displayKnown),
-            @"physicalDisplay": @(physicalDisplay),
-            @"notch": hasCutout ? @{
-                @"x": MacIslandAuditNumber(cutout.origin.x),
-                @"y": MacIslandAuditNumber(cutout.origin.y),
-                @"w": MacIslandAuditNumber(cutout.size.width),
-                @"h": MacIslandAuditNumber(cutout.size.height),
-                @"centeredDisplayWidth": MacIslandAuditNumber(snap.policy.centeredDisplayWidth),
-            } : NSNull.null,
-            @"sceneFrame": MacIslandAuditRectDict(state.frame),
-            @"viewport": MacIslandAuditSizeDict(snap.viewport),
-            @"native": @{
-                @"margins": auditMarginsDict(nativeMargins),
-                @"min": nativeLayout.minimum ? MacIslandAuditSizeDict(nativeLayout.minimum.sizeValue) : NSNull.null,
-                @"max": nativeLayout.maximum ? MacIslandAuditSizeDict(nativeLayout.maximum.sizeValue) : NSNull.null,
-                @"obstructionRect": nativeObs.rect ? MacIslandAuditRectDict(nativeObs.rect.rectValue) : NSNull.null,
-                @"obstructionSpace": nativeObs.space ? MacIslandAuditSizeDict(nativeObs.space.sizeValue) : NSNull.null,
-                @"activityMetrics": includeActivity ? @{
-                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.nativeObstruction),
-                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMinW),
-                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.nativeExpandedMaxW),
-                    @"expandedScale": MacIslandAuditNumber(activitySummary.nativeExpandedScale),
-                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.nativeExpandedCornerRadius),
-                } : NSNull.null,
-            },
-            @"policy": @{
-                @"physical": @(snap.policy.physical),
-                @"intersects": @(snap.policy.intersects),
-                @"extendsBelow": @(snap.policy.extendsBelow),
-                @"top": MacIslandAuditNumber(snap.policy.top),
-                @"leading": MacIslandAuditNumber(snap.policy.leading),
-                @"trailing": MacIslandAuditNumber(snap.policy.trailing),
-                @"shortHeight": MacIslandAuditNumber(snap.shortHeight),
-            },
-            @"patched": @{
-                @"applied": @(snap.applies),
-                @"margins": auditMarginsDict(afterMargins),
-                @"min": snap.patchedMin ? MacIslandAuditSizeDict(snap.patchedMin.sizeValue) : NSNull.null,
-                @"max": snap.patchedMax ? MacIslandAuditSizeDict(snap.patchedMax.sizeValue) : NSNull.null,
-                @"canonicalObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(rects[obsFamily]) : NSNull.null,
-                @"publishedObstructionRect": nativeObs.rect ? MacIslandAuditRectDict(publishedRects[obsFamily]) : NSNull.null,
-                @"cornersZeroed": @(nativeObs.cornersApplied),
-                @"activityMetrics": includeActivity ? @{
-                    @"applied": @(activitySummary.patched),
-                    @"obstructionSize": MacIslandAuditSizeDict(activitySummary.patchedObstruction),
-                    @"expandedMinWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMinW),
-                    @"expandedMaxWidth": MacIslandAuditNumber(activitySummary.patchedExpandedMaxW),
-                    @"expandedScale": MacIslandAuditNumber(activitySummary.patchedExpandedScale),
-                    @"expandedCornerRadius": MacIslandAuditNumber(activitySummary.patchedExpandedCornerRadius),
-                } : NSNull.null,
-            },
-        };
-        NSString *signature = MacIslandAuditSerialize(record);
-        if (!signature || [state.auditSignatures[family] isEqualToString:signature]) continue;
-        state.auditSignatures[family] = signature;
-        MacIslandAuditAppendRecord(auditPath, record);
-    }
-}
-
-static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
-    if (state.updating) return;
-    state.updating = YES;
-    BOOL displayKnown = NO;
-    NSScreen *resolvedScreen = sceneDisplayScreen(settings, &displayKnown);
-    NSScreen *targetScreen = displayKnown ? resolvedScreen : fallbackNotchedScreen();
-    NSArray<NSScreen *> *candidates = displayKnown ? (resolvedScreen ? @[resolvedScreen] : @[]) : NSScreen.screens;
-    BOOL physicalDisplay = MacIslandScreenHasNotch(targetScreen);
-    BOOL airDropScene = isAirDropScene(settings);
-    NSRect rects[2] = {NSZeroRect, NSZeroRect};
-    NSRect publishedRects[2] = {NSZeroRect, NSZeroRect};
-    BOOL detached[2] = {NO, NO};
-    MacIslandFamilyAuditSnapshot snapshots[2] = {{0}, {0}};
-    MacIslandActivityMetricsSummary activitySummary =
-        refreshActivityMetrics(settings, state, targetScreen, physicalDisplay);
+static void collectObstructionSnapshots(id settings, MacIslandSceneInsets *state, NSScreen *targetScreen,
+                                        NSRect rects[2], BOOL detached[2]) {
     for (NSUInteger family = 0; family < state.obstructions.count; family++) {
         MacIslandNativeObstruction *native = state.obstructions[family];
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
         rects[family] = canonicalObstruction(original, targetScreen);
         detached[family] = isDetachedObstructionLocation(
-            existingObjectSetting(settings, obstructionSetting(family, @"Location")));
+            MacIslandExistingObjectSetting(settings, MacIslandObstructionSetting(family, @"Location")));
     }
-    for (NSUInteger family = 0; family < state.layouts.count; family++) {
-        MacIslandNativeLayout *native = state.layouts[family];
-        if (!native.margins) {
-            id value = existingObjectSetting(settings, familySetting(family, @"LayoutMargins"));
-            if ([value isKindOfClass:NSData.class]) native.margins = value;
+}
+
+static MacIslandFamilyAuditSnapshot applyFamilyLayout(
+    id settings,
+    MacIslandSceneInsets *state,
+    NSUInteger family,
+    BOOL physicalDisplay,
+    BOOL airDropScene,
+    NSArray<NSScreen *> *candidates,
+    const NSRect rects[2],
+    const BOOL detached[2],
+    MacIslandActivityMetricsSummary activitySummary) {
+    MacIslandNativeLayout *native = state.layouts[family];
+    if (!native.margins) {
+        id value = MacIslandExistingObjectSetting(settings, familySetting(family, @"LayoutMargins"));
+        if ([value isKindOfClass:NSData.class]) native.margins = value;
+    }
+    if (!native.minimum) {
+        id value = MacIslandExistingObjectSetting(settings, familySetting(family, @"MinimumSize"));
+        if (isSizeValue(value)) native.minimum = value;
+    }
+    if (!native.maximum) {
+        id value = MacIslandExistingObjectSetting(settings, familySetting(family, @"MaximumSize"));
+        if (isSizeValue(value)) native.maximum = value;
+    }
+    // Optional geometry may be absent on early or legacy scene settings.
+    // Native size constraints still describe whether the root can extend
+    // below the cutout. Use that shared capability until its viewport arrives.
+    // The two native transports carry separate obstruction coordinates.
+    // Fall back to the other transport only when this one is absent;
+    // an explicitly empty rectangle must continue to mean no exclusion.
+    NSUInteger obstructionFamily = state.obstructions[family].rect ? family : 1 - family;
+    MacIslandNativeObstruction *obstruction = state.obstructions[obstructionFamily];
+    BOOL isDetached = detached[obstructionFamily];
+    NSRect rect = rects[obstructionFamily];
+    NSSize layoutViewport = obstruction.space ? obstruction.space.sizeValue : state.frame.size;
+    if (layoutViewport.width <= 0 || layoutViewport.height <= 0) {
+        if (native.maximum) layoutViewport = native.maximum.sizeValue;
+        else if (native.minimum) layoutViewport = native.minimum.sizeValue;
+    }
+    MacIslandNotchAvoidance policy = (!isDetached && obstruction.rect && physicalDisplay) ?
+        notchAvoidance(rect, layoutViewport, candidates) : (MacIslandNotchAvoidance){0};
+    NSDictionary *before = MacIslandDecodedMargins(native.margins);
+    // Compact leading/trailing wing scenes arrive with asymmetric native
+    // margins before obstructionSpace is populated. Stabilize their wing
+    // margins up front so opening/closing transitions never jump by 6pt.
+    if (policy.physical && !obstruction.space &&
+        (state.frame.size.width <= 0 || state.frame.size.height <= 0) &&
+        layoutViewport.height <= policy.notchHeight + 4 && before) {
+        CGFloat lead = [before[@"leading"] doubleValue];
+        CGFloat trail = [before[@"trailing"] doubleValue];
+        if (lead > 0 && trail == 0) {
+            policy.intersects = NO;
+            policy.extendsBelow = NO;
+            policy.top = 0;
+            policy.leading = MacIslandNotchFlare + 6;
+            policy.trailing = 6;
+        } else if (lead == 0 && trail > 0) {
+            policy.intersects = NO;
+            policy.extendsBelow = NO;
+            policy.top = 0;
+            policy.leading = 6;
+            policy.trailing = MacIslandNotchFlare + 6;
         }
-        if (!native.minimum) {
-            id value = existingObjectSetting(settings, familySetting(family, @"MinimumSize"));
-            if (isSizeValue(value)) native.minimum = value;
-        }
-        if (!native.maximum) {
-            id value = existingObjectSetting(settings, familySetting(family, @"MaximumSize"));
-            if (isSizeValue(value)) native.maximum = value;
-        }
-        // Optional geometry may be absent on early or legacy scene settings.
-        // Native size constraints still describe whether the root can extend
-        // below the cutout. Use that shared capability until its viewport arrives.
-        // The two native transports carry separate obstruction coordinates.
-        // Fall back to the other transport only when this one is absent;
-        // an explicitly empty rectangle must continue to mean no exclusion.
-        NSUInteger obstructionFamily = state.obstructions[family].rect ? family : 1 - family;
-        MacIslandNativeObstruction *obstruction = state.obstructions[obstructionFamily];
-        BOOL isDetached = detached[obstructionFamily];
-        NSRect rect = rects[obstructionFamily];
-        NSSize layoutViewport = obstruction.space ? obstruction.space.sizeValue : state.frame.size;
-        if (layoutViewport.width <= 0 || layoutViewport.height <= 0) {
-            if (native.maximum) layoutViewport = native.maximum.sizeValue;
-            else if (native.minimum) layoutViewport = native.minimum.sizeValue;
-        }
-        MacIslandNotchAvoidance policy = (!isDetached && obstruction.rect && physicalDisplay) ?
-            notchAvoidance(rect, layoutViewport, candidates) : (MacIslandNotchAvoidance){0};
-        NSDictionary *before = decodedMargins(native.margins);
-        // Compact leading/trailing wing scenes arrive with asymmetric native
-        // margins before obstructionSpace is populated. Stabilize their wing
-        // margins up front so opening/closing transitions never jump by 6pt.
-        if (policy.physical && !obstruction.space &&
-            (state.frame.size.width <= 0 || state.frame.size.height <= 0) &&
-            layoutViewport.height <= policy.notchHeight + 4 && before) {
-            CGFloat lead = [before[@"leading"] doubleValue];
-            CGFloat trail = [before[@"trailing"] doubleValue];
-            if (lead > 0 && trail == 0) {
-                policy.intersects = NO;
-                policy.extendsBelow = NO;
-                policy.top = 0;
-                policy.leading = MacIslandNotchFlare + 6;
-                policy.trailing = 6;
-            } else if (lead == 0 && trail > 0) {
-                policy.intersects = NO;
-                policy.extendsBelow = NO;
-                policy.top = 0;
-                policy.leading = 6;
-                policy.trailing = MacIslandNotchFlare + 6;
+    }
+    CGFloat shortHeight = 0;
+    NSData *margins = safeMargins(native.margins, before, policy);
+    BOOL applies = margins != native.margins;
+    NSValue *minimumValue = native.minimum, *maximumValue = native.maximum;
+    if (policy.physical && before && native.minimum && native.maximum) {
+        NSDictionary *after = margins == native.margins ? before : MacIslandDecodedMargins(margins);
+        CGFloat extraX = [after[@"leading"] doubleValue] - [before[@"leading"] doubleValue] +
+                         [after[@"trailing"] doubleValue] - [before[@"trailing"] doubleValue];
+        CGFloat extraY = [after[@"top"] doubleValue] - [before[@"top"] doubleValue];
+        NSSize minimum = native.minimum.sizeValue, maximum = native.maximum.sizeValue;
+        if (policy.extendsBelow && family == 0 && activitySummary.present) {
+            // ActivityKit / WidgetRenderer_Activities scenes render Jindo wings from
+            // y=0 around SystemApertureMetricsRequest.obstructionSize rather than
+            // below elementViewLayoutMargins.top. Match the rewritten Jindo width
+            // and height bounds directly without inflating minimum height by extraY.
+            CGFloat width = MAX(policy.notchWidth + 164, activitySummary.patchedExpandedMinW);
+            CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
+            CGFloat ceiling = MIN(MAX(MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth),
+                                      activitySummary.patchedExpandedMaxW),
+                                  policy.centeredDisplayWidth);
+            minimum.width = floor;
+            if (isfinite(maximum.width)) {
+                maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
             }
-        }
-        CGFloat shortHeight = 0;
-        NSData *margins = safeMargins(native.margins, before, policy);
-        BOOL applies = margins != native.margins;
-        NSValue *minimumValue = native.minimum, *maximumValue = native.maximum;
-        if (policy.physical && before && native.minimum && native.maximum) {
-            NSDictionary *after = margins == native.margins ? before : decodedMargins(margins);
-            CGFloat extraX = [after[@"leading"] doubleValue] - [before[@"leading"] doubleValue] +
-                             [after[@"trailing"] doubleValue] - [before[@"trailing"] doubleValue];
-            CGFloat extraY = [after[@"top"] doubleValue] - [before[@"top"] doubleValue];
-            NSSize minimum = native.minimum.sizeValue, maximum = native.maximum.sizeValue;
-            if (policy.extendsBelow && family == 0 && activitySummary.present) {
-                // ActivityKit / WidgetRenderer_Activities scenes render Jindo wings from
-                // y=0 around SystemApertureMetricsRequest.obstructionSize rather than
-                // below elementViewLayoutMargins.top. Match the rewritten Jindo width
-                // and height bounds directly without inflating minimum height by extraY.
-                CGFloat width = MAX(policy.notchWidth + 164, activitySummary.patchedExpandedMinW);
+            CGFloat minExpandedH = MAX(rect.size.height + 8.0, activitySummary.patchedExpandedMinH);
+            minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
+            if (isfinite(maximum.height)) {
+                maximum.height = MAX(maximum.height, MAX(minimum.height, activitySummary.patchedExpandedMaxH));
+            }
+        } else if (policy.extendsBelow && family == 0 && airDropScene) {
+            // AirDropUI's ObstructionClearingWidthLayout sizes vertical incoming share
+            // and failure cards to 274pt (224pt content + 25pt horizontal margins), so
+            // forcing the generic 384pt wing-activity floor leaves 55pt of empty black
+            // platter per side. Keep a snug 274pt floor (with >=27pt shoulders outside
+            // the notch) while preserving the 540pt ceiling for horizontal progress views.
+            CGFloat width = MAX(MacIslandAirDropCardWidth,
+                                policy.notchWidth + MacIslandAirDropShoulderSpan);
+            CGFloat floor = MAX(minimum.width + extraX, MIN(width, policy.centeredDisplayWidth));
+            CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+            minimum.width = floor;
+            if (isfinite(maximum.width)) {
+                maximum.width = MAX(maximum.width + extraX, MAX(minimum.width, ceiling));
+            }
+            CGFloat minExpandedH = rect.size.height + MacIslandAirDropObstructionClearance + 8.0;
+            minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
+            if (isfinite(maximum.height)) {
+                maximum.height = MAX(maximum.height, minimum.height);
+            }
+        } else {
+            minimum.width += extraX;
+            minimum.height = MAX(minimum.height + extraY, shortHeight);
+            // Hosted system banners (volume, brightness, AirPods) size their
+            // own content below the cutout; their native width stays.
+            if (policy.extendsBelow && family == 0) {
+                // Element activities place wing or body content around the cutout.
+                // Reserve at least 57pt per wing outside the 12pt shoulder margin
+                // and 12pt camera clearance (384pt on a 220pt notch for 52pt artwork
+                // or icons), while aligning the ceiling with MenuBarAgent's overridden
+                // HostedSceneMetricsMaximumContentWidth (540pt on a 220pt notch) so
+                // wider providers such as ClockAngel (522pt) and NowPlaying (~390pt)
+                // negotiate freely without CenterHUD outer-platter clipping.
+                CGFloat width = policy.notchWidth + 164;
                 CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
-                CGFloat ceiling = MIN(MAX(MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth),
-                                          activitySummary.patchedExpandedMaxW),
-                                      policy.centeredDisplayWidth);
+                CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
                 minimum.width = floor;
                 if (isfinite(maximum.width)) {
                     maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
                 }
-                CGFloat minExpandedH = MAX(rect.size.height + 8.0, activitySummary.patchedExpandedMinH);
-                minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
-                if (isfinite(maximum.height)) {
-                    maximum.height = MAX(maximum.height, MAX(minimum.height, activitySummary.patchedExpandedMaxH));
-                }
-            } else if (policy.extendsBelow && family == 0 && airDropScene) {
-                // AirDropUI's ObstructionClearingWidthLayout sizes vertical incoming share
-                // and failure cards to 274pt (224pt content + 25pt horizontal margins), so
-                // forcing the generic 384pt wing-activity floor leaves 55pt of empty black
-                // platter per side. Keep a snug 274pt floor (with >=27pt shoulders outside
-                // the notch) while preserving the 540pt ceiling for horizontal progress views.
-                CGFloat width = MAX(MacIslandAirDropCardWidth,
-                                    policy.notchWidth + MacIslandAirDropShoulderSpan);
-                CGFloat floor = MAX(minimum.width + extraX, MIN(width, policy.centeredDisplayWidth));
-                CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
-                minimum.width = floor;
-                if (isfinite(maximum.width)) {
-                    maximum.width = MAX(maximum.width + extraX, MAX(minimum.width, ceiling));
-                }
-                CGFloat minExpandedH = rect.size.height + MacIslandAirDropObstructionClearance + 8.0;
-                minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
-                if (isfinite(maximum.height)) {
-                    maximum.height = MAX(maximum.height, minimum.height);
-                }
-            } else {
-                minimum.width += extraX;
-                minimum.height = MAX(minimum.height + extraY, shortHeight);
-                // Hosted system banners (volume, brightness, AirPods) size their
-                // own content below the cutout; their native width stays.
-                if (policy.extendsBelow && family == 0) {
-                    // Element activities place wing or body content around the cutout.
-                    // Reserve at least 57pt per wing outside the 12pt shoulder margin
-                    // and 12pt camera clearance (384pt on a 220pt notch for 52pt artwork
-                    // or icons), while aligning the ceiling with MenuBarAgent's overridden
-                    // HostedSceneMetricsMaximumContentWidth (540pt on a 220pt notch) so
-                    // wider providers such as ClockAngel (522pt) and NowPlaying (~390pt)
-                    // negotiate freely without CenterHUD outer-platter clipping.
-                    CGFloat width = policy.notchWidth + 164;
-                    CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
-                    CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
-                    minimum.width = floor;
-                    if (isfinite(maximum.width)) {
-                        maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
-                    }
-                } else if (isfinite(maximum.width)) {
-                    maximum.width = MAX(maximum.width + extraX, minimum.width);
-                }
-                if (isfinite(maximum.height)) {
-                    maximum.height = MAX(maximum.height, minimum.height);
-                }
+            } else if (isfinite(maximum.width)) {
+                maximum.width = MAX(maximum.width + extraX, minimum.width);
             }
-            minimumValue = layoutPayload([NSValue valueWithSize:minimum], native.minimum);
-            maximumValue = layoutPayload([NSValue valueWithSize:maximum], native.maximum);
-            applies |= !NSEqualSizes(minimum, native.minimum.sizeValue) || !NSEqualSizes(maximum, native.maximum.sizeValue);
+            if (isfinite(maximum.height)) {
+                maximum.height = MAX(maximum.height, minimum.height);
+            }
         }
-        if (applies || native.applied) writeFamily(settings, family, native, margins, minimumValue, maximumValue);
-        native.applied = applies;
-        snapshots[family] = (MacIslandFamilyAuditSnapshot){
-            .hasData = (native.margins != nil || native.minimum != nil || native.maximum != nil ||
-                        state.obstructions[family].rect != nil || (family == 0 && activitySummary.present)),
-            .obstructionFamily = obstructionFamily,
-            .viewport = layoutViewport,
-            .policy = policy,
-            .shortHeight = shortHeight,
-            .applies = applies,
-            .patchedMargins = margins,
-            .patchedMin = minimumValue,
-            .patchedMax = maximumValue,
-        };
+        minimumValue = MacIslandLayoutPayload([NSValue valueWithSize:minimum], native.minimum);
+        maximumValue = MacIslandLayoutPayload([NSValue valueWithSize:maximum], native.maximum);
+        applies |= !NSEqualSizes(minimum, native.minimum.sizeValue) || !NSEqualSizes(maximum, native.maximum.sizeValue);
     }
+    if (applies || native.applied) writeFamily(settings, family, native, margins, minimumValue, maximumValue);
+    native.applied = applies;
+    return (MacIslandFamilyAuditSnapshot){
+        .hasData = (native.margins != nil || native.minimum != nil || native.maximum != nil ||
+                    state.obstructions[family].rect != nil || (family == 0 && activitySummary.present)),
+        .obstructionFamily = obstructionFamily,
+        .viewport = layoutViewport,
+        .policy = policy,
+        .shortHeight = shortHeight,
+        .applies = applies,
+        .patchedMargins = margins,
+        .patchedMin = minimumValue,
+        .patchedMax = maximumValue,
+    };
+}
+
+static void publishObstructionUpdates(id settings, MacIslandSceneInsets *state,
+                                      BOOL physicalDisplay, BOOL airDropScene,
+                                      NSArray<NSScreen *> *candidates,
+                                      const NSRect rects[2], const BOOL detached[2],
+                                      const MacIslandFamilyAuditSnapshot snapshots[2],
+                                      NSRect publishedRects[2]) {
     for (NSUInteger family = 0; family < state.obstructions.count; family++) {
         MacIslandNativeObstruction *native = state.obstructions[family];
         NSRect original = native.rect ? native.rect.rectValue : NSZeroRect;
@@ -2657,11 +2992,11 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
         void (*setRect)(id, SEL, id) = originalObstruction[family];
         BOOL corrected = !detached[family] && native.rect != nil && !NSEqualRects(published, original);
         if (setRect && (corrected || native.obstructionApplied)) {
-            id value = corrected ? layoutPayload([NSValue valueWithRect:published], native.rect) : native.rect;
+            id value = corrected ? MacIslandLayoutPayload([NSValue valueWithRect:published], native.rect) : native.rect;
             setRect(settings, NSSelectorFromString(obstructionSetter(family, @"Rect")), value);
             if (corrected) {
-                id stored = rawObjectSetting(settings, obstructionSetting(family, @"Rect"));
-                if (stored && stored != native.rect) layoutPayload(stored, native.rect);
+                id stored = MacIslandRawObjectSetting(settings, MacIslandObstructionSetting(family, @"Rect"));
+                if (stored && stored != native.rect) MacIslandLayoutPayload(stored, native.rect);
             }
         }
         native.obstructionApplied = corrected;
@@ -2677,7 +3012,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
                     native.rectangularCorners = [(id<MacIslandCornerFactory>)[factory alloc] initWithCornerRadius:0];
             }
             if (native.rectangularCorners)
-                native.rectangularCorners = layoutPayload(native.rectangularCorners, native.nativeCorners);
+                native.rectangularCorners = MacIslandLayoutPayload(native.rectangularCorners, native.nativeCorners);
         }
         if (native.rectangularCorners && rectangular)
             setter(settings, NSSelectorFromString(obstructionSetter(family, @"CornerRadii")), native.rectangularCorners);
@@ -2685,10 +3020,39 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
             setter(settings, NSSelectorFromString(obstructionSetter(family, @"CornerRadii")), native.nativeCorners);
         native.cornersApplied = rectangular && native.rectangularCorners != nil;
     }
+}
+
+static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
+    if (state.updating) return;
+    state.updating = YES;
+    BOOL displayKnown = NO;
+    NSScreen *resolvedScreen = sceneDisplayScreen(settings, &displayKnown);
+    NSScreen *targetScreen = displayKnown ? resolvedScreen : fallbackNotchedScreen();
+    NSArray<NSScreen *> *candidates = displayKnown ? (resolvedScreen ? @[resolvedScreen] : @[]) : NSScreen.screens;
+    BOOL physicalDisplay = MacIslandScreenHasNotch(targetScreen);
+    BOOL airDropScene = isAirDropScene(settings);
+    NSRect rects[2] = {NSZeroRect, NSZeroRect};
+    NSRect publishedRects[2] = {NSZeroRect, NSZeroRect};
+    BOOL detached[2] = {NO, NO};
+    MacIslandFamilyAuditSnapshot snapshots[2] = {{0}, {0}};
+    MacIslandActivityMetricsSummary activitySummary = MacIslandRefreshActivityMetrics(
+        settings, state, targetScreen, physicalDisplay,
+        originalActivityMetricsData, originalActivityMetricsRequest);
+
+    collectObstructionSnapshots(settings, state, targetScreen, rects, detached);
+    for (NSUInteger family = 0; family < state.layouts.count; family++) {
+        snapshots[family] = applyFamilyLayout(
+            settings, state, family, physicalDisplay, airDropScene,
+            candidates, rects, detached, activitySummary);
+    }
+    publishObstructionUpdates(
+        settings, state, physicalDisplay, airDropScene, candidates,
+        rects, detached, snapshots, publishedRects);
+
     NSString *auditPath = MacIslandAuditLogPath();
     if (auditPath) {
-        emitSceneAudit(auditPath, settings, state, targetScreen, displayKnown, physicalDisplay,
-                       rects, publishedRects, snapshots, activitySummary);
+        MacIslandEmitSceneAudit(auditPath, settings, state, targetScreen, displayKnown, physicalDisplay,
+                                rects, publishedRects, snapshots, activitySummary);
     }
     state.updating = NO;
 }
@@ -2976,30 +3340,21 @@ __attribute__((constructor)) static void installNotchContentInsets(void) {
 }
 MACISLAND_SAFEAREA_M
 
-  cat > "$SCRATCH/mask.m" <<'MACISLAND_MASK_M'
-#import <AppKit/AppKit.h>
-#import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
+  cat > "$SCRATCH/mask-geometry.m" <<'MACISLAND_MASK_GEOMETRY_M'
+#import "mask-internal.h"
 #import <objc/message.h>
-#import "notch-layout.h"
-#include <os/lock.h>
-#include <stdlib.h>
-#include <string.h>
+#import <objc/runtime.h>
 
-static char mergeVisibilityKey, secondaryMergeKey, suppressedOpacityKey;
-static void (*originalSetHidden)(id, SEL, BOOL);
-static void (*originalSetOpacity)(id, SEL, float);
-static char maskObserverKey, parentGeometryKey, sceneLayersKey, sceneOriginObserverKey;
-static void (*originalSetCornerRadius)(id, SEL, CGFloat);
-static void (*baseSetBounds)(id, SEL, CGRect);
-static void (*baseSetPosition)(id, SEL, CGPoint);
+@implementation MacIslandScreenGeometry
++ (instancetype)shared {
+    static MacIslandScreenGeometry *geometry;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ geometry = [MacIslandScreenGeometry new]; });
+    return geometry;
+}
+@end
 
-// Strict leaf lock guarding in-memory observer state only. Never hold across
-// Core Animation, AppKit, KVO registration, or @synchronized calls.
-static os_unfair_lock maskStateLock = OS_UNFAIR_LOCK_INIT;
-static _Thread_local const void *activeModelWriteObserver;
-
-static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY) {
+CGPathRef MacIslandNotchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShoulders, CGFloat scaleY) {
     CGFloat flare = MIN(MacIslandNotchFlare, MIN(size.width / 4, size.height / 3));
     CGFloat bottom = MIN(14, size.height / 2);
     CGFloat width = size.width;
@@ -3028,7 +3383,7 @@ static CGPathRef notchMaskPathAtTop(CGSize size, CGFloat top, BOOL outwardShould
     return path;
 }
 
-static BOOL isOpaqueBlack(CGColorRef color) {
+BOOL MacIslandIsOpaqueBlack(CGColorRef color) {
     if (!color || CGColorGetAlpha(color) < 0.95) return NO;
     size_t count = CGColorGetNumberOfComponents(color);
     if (count != 2 && count != 4) return NO;
@@ -3037,21 +3392,6 @@ static BOOL isOpaqueBlack(CGColorRef color) {
         if (components[i] > 0.05) return NO;
     return YES;
 }
-
-// AppKit screen information is captured on the main thread. Native layer
-// updates may arrive on MenuBarAgent's background animation thread.
-@interface MacIslandScreenGeometry : NSObject
-@property(atomic, copy) NSArray<NSDictionary *> *layouts;
-+ (instancetype)shared;
-@end
-@implementation MacIslandScreenGeometry
-+ (instancetype)shared {
-    static MacIslandScreenGeometry *geometry;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ geometry = [MacIslandScreenGeometry new]; });
-    return geometry;
-}
-@end
 
 // Scaled display modes do not map points onto whole panel pixels. On a
 // 3024-pixel panel shown as 1800 points, the 38-point safe area covers 63.84
@@ -3077,7 +3417,8 @@ static CGFloat panelBottomSnap(NSScreen *screen, CGFloat height) {
     CGFloat snap = ceil(rows - 0.01) / scale - height;
     return snap > 0.001 && snap < 1 / scale ? snap : 0;
 }
-static void updateScreenGeometry(void) {
+
+void MacIslandUpdateScreenGeometry(void) {
     NSMutableArray *layouts = [NSMutableArray array];
     for (NSScreen *screen in NSScreen.screens) {
         NSRect cutout = NSZeroRect;
@@ -3091,7 +3432,8 @@ static void updateScreenGeometry(void) {
     }
     [MacIslandScreenGeometry shared].layouts = layouts;
 }
-static NSDictionary *screenLayoutForLayer(CALayer *layer) {
+
+NSDictionary *MacIslandScreenLayoutForLayer(CALayer *layer) {
     CGSize parent = layer.superlayer.bounds.size;
     for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
         CGSize size = [layout[@"size"] sizeValue];
@@ -3100,117 +3442,7 @@ static NSDictionary *screenLayoutForLayer(CALayer *layer) {
     return nil;
 }
 
-@class MacIslandNativeMaskObserver;
-static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
-static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
-static id nativeModifierObject(id object, NSString *name);
-static BOOL nativeModifierEnabled(id modifier);
-
-typedef struct {
-    CGFloat pixelInset;
-    CGFloat horizontalFlare;
-    CGFloat bottomExtension;
-    CGFloat topExtension;
-} MacIslandPaintExtensions;
-
-@interface MacIslandNativeMaskObserver : NSObject {
-  @package
-    __weak MacIslandNativeMaskObserver *_mergeInput;
-    __weak MacIslandNativeMaskObserver *_contourPeer;
-    __weak MacIslandNativeMaskObserver *_detachedOwner;
-    __weak MacIslandNativeMaskObserver *_detachedPaint;
-
-    __weak CALayer *_desiredObservedParent;
-    __weak CALayer *_registeredObservedParent;
-    BOOL _reconcilingParentKVO;
-
-    __weak CALayer *_desiredMergeScene;
-    __weak CALayer *_registeredMergeScene;
-    BOOL _reconcilingMergeSceneKVO;
-
-    __weak CALayer *_desiredHeldUnion;
-    __weak CALayer *_registeredHeldUnion;
-    id _desiredHeldBlur;
-    id _registeredHeldBlur;
-    BOOL _reconcilingHeldKVO;
-
-    __weak CALayer *_desiredObservedUnion;
-    __weak CALayer *_registeredObservedUnion;
-    id _desiredObservedBlur;
-    id _registeredObservedBlur;
-    BOOL _reconcilingObservedKVO;
-
-    NSHashTable<CALayer *> *_suppressedPaint;
-    CAShapeLayer *_shapeMask;
-    MacIslandPaintExtensions _extensions;
-    NSArray *_modifierBindings;
-    NSArray *_nativeMaskGroups;
-    id _nativeMaskSize;
-
-    BOOL _refreshing;
-    BOOL _refreshDirty;
-    BOOL _maskRefreshing;
-    BOOL _maskDirty;
-    BOOL _syncingGeometry;
-    BOOL _geometryDirty;
-}
-@property(nonatomic, weak) CALayer *source;
-@property(nonatomic, strong) NSArray<NSString *> *keys;
-@property(atomic) CGFloat nativeRadius;
-@property(atomic) BOOL nativeHidden;
-@property(atomic) BOOL applied;
-@property(atomic) CGRect nativeBounds;
-@property(atomic) CGPoint nativePosition;
-- (instancetype)initWithLayer:(CALayer *)layer;
-- (CAShapeLayer *)shapeMask;
-- (CAShapeLayer *)ensureShapeMask;
-- (void)refresh;
-- (void)refreshMask;
-- (void)reconcileObservedParent:(CALayer *)parent;
-- (void)reconcileMergeScene:(CALayer *)scene;
-- (void)reconcileHeldVisibilityKVO;
-- (void)reconcileObservedMergeKVO;
-- (void)endVisibilityHold:(BOOL)applyHide;
-- (void)updateVisibilityHold;
-- (BOOL)holdVisibilityInUnion:(CALayer *)group blur:(id)blur;
-- (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
-                      paints:(NSArray<CALayer *> *)paints;
-- (void)useDetachedPaint:(MacIslandNativeMaskObserver *)peer inUnion:(CALayer *)group blur:(id)blur;
-@end
-
-static inline MacIslandPaintExtensions observerPaintExtensions(MacIslandNativeMaskObserver *observer) {
-    MacIslandPaintExtensions ext = {0, 0, 0, 0};
-    if (!observer) return ext;
-    os_unfair_lock_lock(&maskStateLock);
-    ext = observer->_extensions;
-    os_unfair_lock_unlock(&maskStateLock);
-    return ext;
-}
-
-static inline void setObserverPaintExtensions(MacIslandNativeMaskObserver *observer, MacIslandPaintExtensions ext) {
-    if (!observer) return;
-    os_unfair_lock_lock(&maskStateLock);
-    observer->_extensions = ext;
-    os_unfair_lock_unlock(&maskStateLock);
-}
-
-static inline MacIslandNativeMaskObserver *observerMergeInput(MacIslandNativeMaskObserver *observer) {
-    if (!observer) return nil;
-    os_unfair_lock_lock(&maskStateLock);
-    MacIslandNativeMaskObserver *input = observer->_mergeInput;
-    os_unfair_lock_unlock(&maskStateLock);
-    return input;
-}
-
-static inline CALayer *observerDesiredObservedUnion(MacIslandNativeMaskObserver *observer) {
-    if (!observer) return nil;
-    os_unfair_lock_lock(&maskStateLock);
-    CALayer *unionLayer = observer->_desiredObservedUnion;
-    os_unfair_lock_unlock(&maskStateLock);
-    return unionLayer;
-}
-
-static CGRect nativeBodyFrame(MacIslandNativeMaskObserver *observer) {
+CGRect MacIslandNativeBodyFrame(MacIslandNativeMaskObserver *observer) {
     CALayer *layer = observer.source;
     CGSize size = observer.nativeBounds.size;
     CGRect box = CGRectMake(-layer.anchorPoint.x * size.width, -layer.anchorPoint.y * size.height,
@@ -3219,7 +3451,7 @@ static CGRect nativeBodyFrame(MacIslandNativeMaskObserver *observer) {
     return CGRectOffset(frame, observer.nativePosition.x, observer.nativePosition.y);
 }
 
-static BOOL isNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *observer) {
+BOOL MacIslandIsNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *observer) {
     // Include the native rim, shadow, and transparent clipping containers.
     // The latter clip the animated hover highlight: retaining their native
     // pill radius cuts a different outline into an otherwise notched island.
@@ -3233,7 +3465,7 @@ static BOOL isNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *obser
     CGRect frame = layer.frame;
     // Eligibility follows Apple's original geometry, not the larger paint
     // bounds used for shoulders and offscreen filter sampling.
-    if (observer) frame = nativeBodyFrame(observer);
+    if (observer) frame = MacIslandNativeBodyFrame(observer);
     if (!parent || CGRectGetMinY(frame) > 2) return NO;
     for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
         CGFloat height = [layout[@"height"] doubleValue];
@@ -3254,37 +3486,37 @@ static BOOL isNotchBackground(CALayer *layer, MacIslandNativeMaskObserver *obser
     return NO;
 }
 
-static CGFloat nativeSceneEdgeCompensation(CALayer *layer) {
+CGFloat MacIslandNativeSceneEdgeCompensation(CALayer *layer) {
     for (CALayer *parent = layer.superlayer; parent; parent = parent.superlayer) {
-        id observer = objc_getAssociatedObject(parent, &sceneOriginObserverKey);
+        id observer = objc_getAssociatedObject(parent, &MacIslandSceneOriginObserverKey);
         SEL pixel = NSSelectorFromString(@"pixel");
         if ([observer respondsToSelector:pixel]) return MAX(0, ((CGFloat (*)(id, SEL))objc_msgSend)(observer, pixel));
     }
     return 0;
 }
-static id nativeModifierObject(id object, NSString *name);
-static BOOL nativeModifierEnabled(id modifier);
 
 // Core Animation releases its transaction lock as soon as CALayer.sublayers /
 // filters / presentationModifiers returns its internal array wrapper, so an
 // unlocked [layer.sublayers copy] on the background DisplayLink thread can race
 // with main-thread addSublayer:/removeFromSuperlayer inside __NSArrayI_new.
 // Snapshot under +[CATransaction lock] (recursive on main, never nested inside
-// maskStateLock).
-static NSArray<CALayer *> *copyLayerSublayers(CALayer *layer) {
+// MacIslandMaskStateLock).
+NSArray<CALayer *> *MacIslandCopyLayerSublayers(CALayer *layer) {
     if (!layer) return nil;
     [CATransaction lock];
     NSArray<CALayer *> *snapshot = [layer.sublayers copy];
     [CATransaction unlock];
     return snapshot;
 }
-static BOOL layerHasSublayers(CALayer *layer) {
+
+BOOL MacIslandLayerHasSublayers(CALayer *layer) {
     if (!layer) return NO;
     [CATransaction lock];
     BOOL has = layer.sublayers.count != 0;
     [CATransaction unlock];
     return has;
 }
+
 static NSArray *copyLayerFilters(CALayer *layer) {
     if (!layer) return nil;
     [CATransaction lock];
@@ -3292,14 +3524,16 @@ static NSArray *copyLayerFilters(CALayer *layer) {
     [CATransaction unlock];
     return snapshot;
 }
-static NSArray *copyLayerModifiers(CALayer *layer) {
+
+NSArray *MacIslandCopyLayerModifiers(CALayer *layer) {
     if (!layer) return nil;
     [CATransaction lock];
-    NSArray *snapshot = [nativeModifierObject(layer, @"presentationModifiers") copy];
+    NSArray *snapshot = [MacIslandNativeModifierObject(layer, @"presentationModifiers") copy];
     [CATransaction unlock];
     return snapshot;
 }
-static NSArray<NSString *> *copyLayerAnimationKeys(CALayer *layer) {
+
+NSArray<NSString *> *MacIslandCopyLayerAnimationKeys(CALayer *layer) {
     if (!layer) return nil;
     [CATransaction lock];
     NSArray<NSString *> *snapshot = [layer.animationKeys copy];
@@ -3307,38 +3541,37 @@ static NSArray<NSString *> *copyLayerAnimationKeys(CALayer *layer) {
     return snapshot;
 }
 
-static BOOL hasMergeFilters(CALayer *layer) {
+BOOL MacIslandHasMergeFilters(CALayer *layer) {
     if (!layer) return NO;
     BOOL blur = NO, threshold = NO;
     NSArray *filters = copyLayerFilters(layer);
     for (id filter in filters) {
-        id type = nativeModifierObject(filter, @"type");
+        id type = MacIslandNativeModifierObject(filter, @"type");
         blur |= [type isEqual:@"gaussianBlur"];
         threshold |= [type isEqual:@"alphaThreshold"];
     }
     return blur && threshold;
 }
 
-static BOOL isNativeUnionFill(CALayer *layer) {
-    return isOpaqueBlack(layer.backgroundColor) && hasMergeFilters(layer.superlayer);
+BOOL MacIslandIsNativeUnionFill(CALayer *layer) {
+    return MacIslandIsOpaqueBlack(layer.backgroundColor) && MacIslandHasMergeFilters(layer.superlayer);
 }
 
 // Only a secondary opaque input of the same native notch compositor joins
 // the primary's transaction. Its path, size, velocity and paint stay native.
-static BOOL isSecondaryMergeInput(CALayer *layer) {
-    return isOpaqueBlack(layer.backgroundColor) && hasMergeFilters(layer.superlayer.superlayer) &&
-           nativeSceneEdgeCompensation(layer) > 0;
+BOOL MacIslandIsSecondaryMergeInput(CALayer *layer) {
+    return MacIslandIsOpaqueBlack(layer.backgroundColor) && MacIslandHasMergeFilters(layer.superlayer.superlayer) &&
+           MacIslandNativeSceneEdgeCompensation(layer) > 0;
 }
 
-// Only paint-only, childless black backgrounds qualify for delayed hiding.
-static id activeMergeBlur(CALayer *group) {
+id MacIslandActiveMergeBlur(CALayer *group) {
     if (!group) return nil;
     id blur = nil;
     BOOL threshold = NO;
     NSArray *filters = copyLayerFilters(group);
     for (id filter in filters) {
-        if (!nativeModifierEnabled(filter)) continue;
-        id type = nativeModifierObject(filter, @"type");
+        if (!MacIslandNativeModifierEnabled(filter)) continue;
+        id type = MacIslandNativeModifierObject(filter, @"type");
         if ([type isEqual:@"alphaThreshold"]) threshold = YES;
         if ([type isEqual:@"gaussianBlur"] && [[filter valueForKey:@"inputRadius"] doubleValue] > 0)
             blur = filter;
@@ -3346,21 +3579,19 @@ static id activeMergeBlur(CALayer *group) {
     return threshold ? blur : nil;
 }
 
-static MacIslandNativeMaskObserver *modelMaskObserver(CALayer *layer);
-
-static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize *sizeOut,
-                                      CGPoint *positionOut, CGPoint *anchorOut, CATransform3D *transformOut) {
+void MacIslandPresentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize *sizeOut,
+                                        CGPoint *positionOut, CGPoint *anchorOut, CATransform3D *transformOut) {
     CGRect bounds = layer.bounds;
     CGPoint origin = bounds.origin;
     CGSize size = bounds.size;
     CGPoint position = layer.position;
     CGPoint anchor = layer.anchorPoint;
     CATransform3D transform = layer.transform;
-    NSArray *modifiers = copyLayerModifiers(layer);
+    NSArray *modifiers = MacIslandCopyLayerModifiers(layer);
     for (id modifier in modifiers) {
-        if (!nativeModifierEnabled(modifier)) continue;
-        NSString *key = nativeModifierObject(modifier, @"keyPath");
-        id value = nativeModifierObject(modifier, @"value");
+        if (!MacIslandNativeModifierEnabled(modifier)) continue;
+        NSString *key = MacIslandNativeModifierObject(modifier, @"keyPath");
+        id value = MacIslandNativeModifierObject(modifier, @"value");
         if (![value isKindOfClass:NSValue.class]) continue;
         const char *type = [value objCType];
         if ([key isEqual:@"bounds"] && !strcmp(type, @encode(CGRect))) {
@@ -3386,248 +3617,15 @@ static void presentationLayerGeometry(CALayer *layer, CGPoint *originOut, CGSize
     *transformOut = transform;
 }
 
-static CGRect layerFrameInAncestor(CALayer *layer, CALayer *ancestor, BOOL presentation) {
-    CGPoint origin, position, anchor;
-    CGSize size;
-    CATransform3D transform;
-    CGRect rect = CGRectZero;
-    for (CALayer *cur = layer; cur && cur != ancestor; cur = cur.superlayer) {
-        if (presentation) {
-            presentationLayerGeometry(cur, &origin, &size, &position, &anchor, &transform);
-        } else {
-            origin = cur.bounds.origin;
-            size = cur.bounds.size;
-            position = cur.position;
-            anchor = cur.anchorPoint;
-            transform = cur.transform;
-        }
-        if (cur == layer) rect = (CGRect){origin, size};
-        CGRect centered = CGRectOffset(rect, -origin.x - anchor.x * size.width, -origin.y - anchor.y * size.height);
-        CGRect transformed = CGRectApplyAffineTransform(centered, CATransform3DGetAffineTransform(transform));
-        rect = CGRectOffset(transformed, position.x, position.y);
-    }
-    return rect;
-}
-
-static CGRect presentationLayerFrameInAncestor(CALayer *layer, CALayer *ancestor) {
-    return layerFrameInAncestor(layer, ancestor, YES);
-}
-
-// Apple supplies two black fills for the circle: the filtered input and a
-// matching opaque fallback outside the group. Match the fallback by its
-// presentation bounds in the same scene, including the native pixel inset.
-static BOOL sameCircleFrame(CGRect a, CGRect b) {
-    return fabs(CGRectGetMinX(a) - CGRectGetMinX(b)) <= 1.5 &&
-           fabs(CGRectGetMaxX(a) - CGRectGetMaxX(b)) <= 1.5 &&
-           fabs(CGRectGetMinY(a) - CGRectGetMinY(b)) <= 1.5 &&
-           fabs(CGRectGetMaxY(a) - CGRectGetMaxY(b)) <= 1.5;
-}
-
-static NSArray<CALayer *> *secondaryPaints(CALayer *leaf, CALayer *group) {
-    CALayer *scene = group.superlayer;
-    if (!scene) return @[leaf];
-    CGRect circle = presentationLayerFrameInAncestor(leaf, scene);
-    CALayer *match = nil;
-    NSArray<CALayer *> *sceneBranches = copyLayerSublayers(scene);
-    for (CALayer *branch in sceneBranches) {
-        if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
-        for (CALayer *candidate in candidates) {
-            if (![candidate.name hasPrefix:@"SimpleViewDisplayItem-"] ||
-                !isOpaqueBlack(candidate.backgroundColor) || candidate.contents || layerHasSublayers(candidate))
-                continue;
-            CGRect rect = presentationLayerFrameInAncestor(candidate, scene);
-            if (!sameCircleFrame(circle, rect)) continue;
-            if (match) return @[leaf];
-            match = candidate;
-        }
-    }
-    if (!match) return @[leaf];
-
-    // The circular backdrops and gain map still draw after the two black
-    // fills are suppressed. The transition backdrop has a two-point bleed
-    // on the same native spring frame.
-    CGRect fallback = presentationLayerFrameInAncestor(match, scene);
-    NSMutableArray<CALayer *> *paints = [NSMutableArray arrayWithArray:@[leaf, match]];
-    for (CALayer *branch in sceneBranches) {
-        if (branch == group || branch.contents) continue;
-        NSArray<CALayer *> *candidates = copyLayerSublayers(branch);
-        for (CALayer *candidate in candidates) {
-            if (candidate.contents || layerHasSublayers(candidate)) continue;
-            CGRect expected = fallback;
-            if ([candidate.name hasPrefix:@"BackdropViewDisplayItem-"]) {
-                NSArray *filters = copyLayerFilters(candidate);
-                NSArray *types = [filters valueForKey:@"type"];
-                if (types.count) {
-                    if (types.count != 2 || ![types containsObject:@"colorMatrix"] ||
-                        ![types containsObject:@"colorInvertDisplayAware"]) continue;
-                    expected = CGRectInset(fallback, -2, -2);
-                }
-            } else if (branch != match.superlayer || ![candidate.name hasPrefix:@"GainMapViewDisplayItem-"]) {
-                continue;
-            }
-            if (sameCircleFrame(expected, presentationLayerFrameInAncestor(candidate, scene)))
-                [paints addObject:candidate];
-        }
-    }
-    return paints;
-}
-
-static void clearSecondaryMergeInputs(CALayer *unionLayer) {
-    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
-    for (CALayer *branch in branches) {
-        NSArray<CALayer *> *children = copyLayerSublayers(branch);
-        if (children.count != 1) continue;
-        MacIslandNativeMaskObserver *secondary = modelMaskObserver(children.firstObject);
-        if (observerDesiredObservedUnion(secondary))
-            [secondary setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
-    }
-}
-
-static void refreshSecondaryMergeInputs(MacIslandNativeMaskObserver *input, CGRect primaryBody) {
-    CALayer *unionLayer = input.source.superlayer;
-    if (!unionLayer) return;
-    id blur = activeMergeBlur(unionLayer);
-    NSArray<CALayer *> *branches = copyLayerSublayers(unionLayer);
-    for (CALayer *branch in branches) {
-        if (branch == input.source || branch.contents ||
-            (branch.backgroundColor && CGColorGetAlpha(branch.backgroundColor) > 0))
-            continue;
-        NSArray<CALayer *> *children = copyLayerSublayers(branch);
-        if (children.count != 1) continue;
-        CALayer *leaf = children.firstObject;
-        if (!isSecondaryMergeInput(leaf) || leaf.contents || layerHasSublayers(leaf)) continue;
-        MacIslandNativeMaskObserver *secondaryObserver = modelMaskObserver(leaf);
-        CGRect circle = presentationLayerFrameInAncestor(leaf, unionLayer);
-        BOOL trailing = CGRectGetMidX(circle) >= CGRectGetMidX(primaryBody);
-        CGFloat gap = trailing ? CGRectGetMinX(circle) - CGRectGetMaxX(primaryBody)
-                               : CGRectGetMinX(primaryBody) - CGRectGetMaxX(circle);
-        CGFloat radius = [[blur valueForKey:@"inputRadius"] doubleValue];
-        // Both contours spread into the gap before the threshold joins them.
-        // Start retiring the paint when the circle's spring targets the
-        // inside of the primary, even before its diameter starts shrinking.
-        // A full-size circle at its detached endpoint stays visible.
-        NSDictionary *screen = screenLayoutForLayer(input.source);
-        CGFloat compactHeight = [screen[@"height"] doubleValue];
-        CGFloat pixel = [screen[@"pixel"] doubleValue];
-        CGRect target = layerFrameInAncestor(leaf, unionLayer, NO);
-        CGFloat targetGap = trailing ? CGRectGetMinX(target) - CGRectGetMaxX(primaryBody)
-                                     : CGRectGetMinX(primaryBody) - CGRectGetMaxX(target);
-        BOOL entering = compactHeight > 0 && targetGap < -pixel &&
-                        target.size.height < compactHeight - 3 * pixel;
-        BOOL moving = !sameCircleFrame(circle, target);
-        BOOL absorbing = moving && (gap < radius || (entering && gap <= 2 * radius));
-        NSArray<CALayer *> *paints = blur && gap <= 2 * radius ? secondaryPaints(leaf, unionLayer) : nil;
-        MacIslandNativeMaskObserver *detached = !absorbing && paints.count > 1
-            ? modelMaskObserver(paints[1]) : nil;
-        BOOL suppress = paints.count && (absorbing || detached);
-        [secondaryObserver setMergeSuppression:suppress unionLayer:unionLayer blur:blur
-                                        paints:absorbing ? paints : (detached ? @[leaf] : nil)];
-        [secondaryObserver useDetachedPaint:detached inUnion:unionLayer blur:blur];
-    }
-}
-
-static void notifyUnionPrimaryObserver(CALayer *secondary) {
-    NSArray<CALayer *> *siblings = copyLayerSublayers(secondary.superlayer.superlayer);
-    for (CALayer *sibling in siblings) {
-        if (!isNativeUnionFill(sibling)) continue;
-        MacIslandNativeMaskObserver *primary = modelMaskObserver(sibling);
-        if (primary.applied) [primary refreshMask];
-    }
-}
-
-// An opaque material can draw the shoulder without smoothing it a second
-// time through the native merge filter. Never hold maskStateLock across any
-// CALayer, CAFilter, or KVO call: Core Animation invokes KVO while holding its
-// layer/transaction locks on main, while DisplayLink flushes run on the
-// background animation thread.
-static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
-    CALayer *source = input.source;
-    CALayer *unionLayer = source ? source.superlayer : nil;
-    MacIslandPaintExtensions ext = observerPaintExtensions(input);
-    CALayer *scene = (unionLayer && ext.topExtension > 0) ? unionLayer.superlayer : nil;
-    [input reconcileMergeScene:scene];
-
-    os_unfair_lock_lock(&maskStateLock);
-    MacIslandNativeMaskObserver *previous = input->_contourPeer;
-    BOOL prevHeldHere = (previous != nil && previous->_desiredHeldBlur != nil &&
-                         previous->_desiredHeldUnion == unionLayer && previous->_mergeInput == input);
-    os_unfair_lock_unlock(&maskStateLock);
-
-    id blur = unionLayer ? activeMergeBlur(unionLayer) : nil;
-    // The two model layers finish their bounds and position writes separately.
-    // Once Apple requests the hide, the identified material stays responsible
-    // until this same filter hands off. Revalidate ownership, not model endpoints.
-    if (scene && previous && prevHeldHere && previous.applied) {
-        CALayer *heldMaterial = previous.source;
-        CAShapeLayer *prevMask = [previous shapeMask];
-        if (heldMaterial && heldMaterial.superlayer == scene &&
-            prevMask && heldMaterial.mask == prevMask && !heldMaterial.hidden &&
-            heldMaterial.opacity >= 1 && !heldMaterial.contents && !layerHasSublayers(heldMaterial) &&
-            isOpaqueBlack(heldMaterial.backgroundColor)) {
-            return YES;
-        }
-    }
-
-    MacIslandNativeMaskObserver *selected = nil;
-    if (scene && unionLayer) {
-        CGRect body = [unionLayer convertRect:nativeBodyFrame(input) toLayer:scene];
-        NSArray<CALayer *> *sublayers = copyLayerSublayers(scene);
-        for (CALayer *layer in sublayers) {
-            if (layer.superlayer != scene || !isOpaqueBlack(layer.backgroundColor)) continue;
-            id association = objc_getAssociatedObject(layer, &maskObserverKey);
-            if (![association isKindOfClass:MacIslandNativeMaskObserver.class]) continue;
-            MacIslandNativeMaskObserver *peer = association;
-            CAShapeLayer *peerMask = [peer shapeMask];
-            if (!peer.applied || !peerMask || layer.mask != peerMask) continue;
-            CGRect r = nativeBodyFrame(peer);
-            // Native material and opaque merge input differ by a backing-pixel inset.
-            if (fabs(CGRectGetMinX(r) - CGRectGetMinX(body)) > 1 ||
-                fabs(CGRectGetMaxX(r) - CGRectGetMaxX(body)) > 1 ||
-                fabs(CGRectGetMinY(r) - CGRectGetMinY(body)) > 1 ||
-                fabs(CGRectGetMaxY(r) - CGRectGetMaxY(body)) > 1) continue;
-            os_unfair_lock_lock(&maskStateLock);
-            peer->_mergeInput = input;
-            os_unfair_lock_unlock(&maskStateLock);
-            if (layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
-                (!layer.hidden || (blur && !source.hidden && source.opacity >= 1 &&
-                                    !unionLayer.hidden && unionLayer.opacity >= 1))) {
-                selected = peer;
-                break;
-            }
-        }
-    }
-
-    CALayer *selectedSource = selected ? selected.source : nil;
-    BOOL needHoldSelected = (selected != nil && blur != nil && selectedSource != nil && selectedSource.hidden);
-
-    os_unfair_lock_lock(&maskStateLock);
-    MacIslandNativeMaskObserver *oldPeer = input->_contourPeer;
-    input->_contourPeer = selected;
-    MacIslandNativeMaskObserver *releasePeer =
-        (oldPeer != nil && oldPeer != selected && oldPeer->_desiredHeldBlur != nil) ? oldPeer : nil;
-    os_unfair_lock_unlock(&maskStateLock);
-
-    if (needHoldSelected) {
-        // Sharing can hide the material before the merge starts. Reuse the
-        // matched native paint until the same blur releases it.
-        if ([selected holdVisibilityInUnion:unionLayer blur:blur]) {
-            originalSetHidden(selectedSource, @selector(setHidden:), NO);
-        }
-    }
-    if (releasePeer) [releasePeer endVisibilityHold:YES];
-    return selected != nil;
-}
-
-static CGSize paintSize(MacIslandNativeMaskObserver *observer, CGSize size) {
-    MacIslandPaintExtensions ext = observerPaintExtensions(observer);
+CGSize MacIslandPaintSize(MacIslandNativeMaskObserver *observer, CGSize size) {
+    MacIslandPaintExtensions ext = MacIslandObserverPaintExtensions(observer);
     size.width += 2 * ext.horizontalFlare;
     size.height += ext.topExtension + 2 * ext.pixelInset + ext.bottomExtension;
     return size;
 }
 
-static CGPoint paintPosition(MacIslandNativeMaskObserver *observer, CGPoint point) {
-    MacIslandPaintExtensions ext = observerPaintExtensions(observer);
+CGPoint MacIslandPaintPosition(MacIslandNativeMaskObserver *observer, CGPoint point) {
+    MacIslandPaintExtensions ext = MacIslandObserverPaintExtensions(observer);
     CGPoint anchor = observer.source.anchorPoint;
     point.x += (2 * anchor.x - 1) * ext.horizontalFlare;
     point.y += (anchor.y - 1) * ext.topExtension + (2 * anchor.y - 1) * ext.pixelInset +
@@ -3635,13 +3633,13 @@ static CGPoint paintPosition(MacIslandNativeMaskObserver *observer, CGPoint poin
     return point;
 }
 
-static CAAnimation *animationWithoutPillCorners(CAAnimation *animation) {
+CAAnimation *MacIslandAnimationWithoutPillCorners(CAAnimation *animation) {
     if ([animation isKindOfClass:CAAnimationGroup.class]) {
         CAAnimationGroup *group = (CAAnimationGroup *)animation;
         NSMutableArray *children = [NSMutableArray array];
         BOOL changed = NO;
         for (CAAnimation *child in group.animations) {
-            CAAnimation *adjusted = animationWithoutPillCorners(child);
+            CAAnimation *adjusted = MacIslandAnimationWithoutPillCorners(child);
             changed |= adjusted != child;
             [children addObject:adjusted];
         }
@@ -3671,7 +3669,7 @@ static CAAnimation *animationWithoutPillCorners(CAAnimation *animation) {
     return animation;
 }
 
-static void observeNativeAnimations(CALayer *layer) {
+void MacIslandObserveNativeAnimations(CALayer *layer) {
     @synchronized (CALayer.class) {
         static NSMutableSet<NSValue *> *methods;
         if (!methods) methods = [NSMutableSet set];
@@ -3680,624 +3678,22 @@ static void observeNativeAnimations(CALayer *layer) {
         [methods addObject:[NSValue valueWithPointer:method]];
         void (*previous)(id, SEL, CAAnimation *, NSString *) = (void *)method_getImplementation(method);
         IMP implementation = imp_implementationWithBlock(^(CALayer *target, CAAnimation *animation, NSString *key) {
-            id association = objc_getAssociatedObject(target, &maskObserverKey);
-            MacIslandNativeMaskObserver *observer = [association isKindOfClass:MacIslandNativeMaskObserver.class] ? association : nil;
-            previous(target, @selector(addAnimation:forKey:), observer.applied ? animationWithoutPillCorners(animation) : animation, key);
+            id association = objc_getAssociatedObject(target, &MacIslandMaskObserverKey);
+            MacIslandNativeMaskObserver *observer =
+                [association isKindOfClass:MacIslandNativeMaskObserver.class] ? association : nil;
+            previous(target, @selector(addAnimation:forKey:),
+                     observer.applied ? MacIslandAnimationWithoutPillCorners(animation) : animation, key);
         });
         method_setImplementation(method, implementation);
     }
 }
+MACISLAND_MASK_GEOMETRY_M
 
-@implementation MacIslandNativeMaskObserver
-- (instancetype)initWithLayer:(CALayer *)layer {
-    self = [super init];
-    if (self) {
-        _source = layer;
-        _nativeRadius = layer.cornerRadius;
-        _nativeHidden = layer.hidden;
-        _nativeBounds = layer.bounds;
-        _nativePosition = layer.position;
-        _keys = @[@"bounds", @"position", @"anchorPoint", @"transform",
-                  @"superlayer", @"name", @"hidden", @"opacity", @"backgroundColor", @"shadowColor", @"shadowOpacity", @"masksToBounds", @"mask"];
-        for (NSString *key in _keys)
-            [layer addObserver:self forKeyPath:key options:0 context:&maskObserverKey];
-        observeNativeAnimations(layer);
-        [self refresh];
-    }
-    return self;
-}
-
-- (CAShapeLayer *)shapeMask {
-    os_unfair_lock_lock(&maskStateLock);
-    CAShapeLayer *mask = _shapeMask;
-    os_unfair_lock_unlock(&maskStateLock);
-    return mask;
-}
-
-- (CAShapeLayer *)ensureShapeMask {
-    CAShapeLayer *existing = [self shapeMask];
-    if (existing) return existing;
-    CAShapeLayer *created = [CAShapeLayer layer];
-    created.fillColor = NSColor.whiteColor.CGColor;
-    created.name = @"MacIslandNativeNotchMask";
-    created.anchorPoint = CGPointZero;
-    // Match the native background: antialias the Bezier contour, not the
-    // mask's rectangular surface edge during fractional native motion.
-    created.edgeAntialiasingMask = 0;
-    created.actions = @{@"path": NSNull.null, @"bounds": NSNull.null, @"position": NSNull.null};
-    os_unfair_lock_lock(&maskStateLock);
-    if (!_shapeMask) _shapeMask = created;
-    existing = _shapeMask;
-    os_unfair_lock_unlock(&maskStateLock);
-    return existing;
-}
-
-- (void)reconcileObservedParent:(CALayer *)parent {
-    os_unfair_lock_lock(&maskStateLock);
-    _desiredObservedParent = parent;
-    if (_reconcilingParentKVO) {
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _reconcilingParentKVO = YES;
-    for (;;) {
-        CALayer *current = _registeredObservedParent;
-        CALayer *desired = _desiredObservedParent;
-        if (current == desired) {
-            _reconcilingParentKVO = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _registeredObservedParent = desired;
-        os_unfair_lock_unlock(&maskStateLock);
-        if (current) [current removeObserver:self forKeyPath:@"bounds" context:&parentGeometryKey];
-        if (desired) [desired addObserver:self forKeyPath:@"bounds" options:0 context:&parentGeometryKey];
-        os_unfair_lock_lock(&maskStateLock);
-    }
-}
-
-- (void)reconcileMergeScene:(CALayer *)scene {
-    os_unfair_lock_lock(&maskStateLock);
-    _desiredMergeScene = scene;
-    if (_reconcilingMergeSceneKVO) {
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _reconcilingMergeSceneKVO = YES;
-    for (;;) {
-        CALayer *current = _registeredMergeScene;
-        CALayer *desired = _desiredMergeScene;
-        if (current == desired) {
-            _reconcilingMergeSceneKVO = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _registeredMergeScene = desired;
-        os_unfair_lock_unlock(&maskStateLock);
-        if (current) [current removeObserver:self forKeyPath:@"sublayers" context:&sceneLayersKey];
-        if (desired) [desired addObserver:self forKeyPath:@"sublayers" options:0 context:&sceneLayersKey];
-        os_unfair_lock_lock(&maskStateLock);
-    }
-}
-
-- (void)reconcileHeldVisibilityKVO {
-    os_unfair_lock_lock(&maskStateLock);
-    if (_reconcilingHeldKVO) {
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _reconcilingHeldKVO = YES;
-    for (;;) {
-        CALayer *currentUnion = _registeredHeldUnion;
-        id currentBlur = _registeredHeldBlur;
-        CALayer *desiredUnion = _desiredHeldUnion;
-        id desiredBlur = _desiredHeldBlur;
-        if (currentUnion == desiredUnion && currentBlur == desiredBlur) {
-            _reconcilingHeldKVO = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _registeredHeldUnion = desiredUnion;
-        _registeredHeldBlur = desiredBlur;
-        os_unfair_lock_unlock(&maskStateLock);
-        if (currentBlur != desiredBlur) {
-            if (currentBlur) {
-                [currentBlur removeObserver:self forKeyPath:@"inputRadius" context:&mergeVisibilityKey];
-                [currentBlur removeObserver:self forKeyPath:@"enabled" context:&mergeVisibilityKey];
-            }
-            if (desiredBlur) {
-                [desiredBlur addObserver:self forKeyPath:@"inputRadius" options:0 context:&mergeVisibilityKey];
-                [desiredBlur addObserver:self forKeyPath:@"enabled" options:0 context:&mergeVisibilityKey];
-            }
-        }
-        if (currentUnion != desiredUnion) {
-            if (currentUnion) [currentUnion removeObserver:self forKeyPath:@"filters" context:&mergeVisibilityKey];
-            if (desiredUnion) [desiredUnion addObserver:self forKeyPath:@"filters" options:0 context:&mergeVisibilityKey];
-        }
-        os_unfair_lock_lock(&maskStateLock);
-    }
-}
-
-- (void)reconcileObservedMergeKVO {
-    os_unfair_lock_lock(&maskStateLock);
-    if (_reconcilingObservedKVO) {
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _reconcilingObservedKVO = YES;
-    for (;;) {
-        CALayer *currentUnion = _registeredObservedUnion;
-        id currentBlur = _registeredObservedBlur;
-        CALayer *desiredUnion = _desiredObservedUnion;
-        id desiredBlur = _desiredObservedBlur;
-        if (currentUnion == desiredUnion && currentBlur == desiredBlur) {
-            _reconcilingObservedKVO = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _registeredObservedUnion = desiredUnion;
-        _registeredObservedBlur = desiredBlur;
-        os_unfair_lock_unlock(&maskStateLock);
-        if (currentBlur != desiredBlur) {
-            if (currentBlur) {
-                [currentBlur removeObserver:self forKeyPath:@"inputRadius" context:&secondaryMergeKey];
-                [currentBlur removeObserver:self forKeyPath:@"enabled" context:&secondaryMergeKey];
-            }
-            if (desiredBlur) {
-                [desiredBlur addObserver:self forKeyPath:@"inputRadius" options:0 context:&secondaryMergeKey];
-                [desiredBlur addObserver:self forKeyPath:@"enabled" options:0 context:&secondaryMergeKey];
-            }
-        }
-        if (currentUnion != desiredUnion) {
-            if (currentUnion) [currentUnion removeObserver:self forKeyPath:@"filters" context:&secondaryMergeKey];
-            if (desiredUnion) [desiredUnion addObserver:self forKeyPath:@"filters" options:0 context:&secondaryMergeKey];
-        }
-        os_unfair_lock_lock(&maskStateLock);
-    }
-}
-
-- (void)refresh {
-    os_unfair_lock_lock(&maskStateLock);
-    if (_refreshing) {
-        _refreshDirty = YES;
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _refreshing = YES;
-    _refreshDirty = NO;
-    os_unfair_lock_unlock(&maskStateLock);
-
-    NSUInteger passes = 0;
-    for (;;) {
-        CALayer *source = self.source;
-        // Native children may settle before their display parent gets its size.
-        // Eligibility must follow that existing parent's layout too.
-        CALayer *parent = source ? source.superlayer : nil;
-        [self reconcileObservedParent:parent];
-
-        CAShapeLayer *currentMask = [self shapeMask];
-        BOOL ownsMask = currentMask && source && source.mask == currentMask;
-        BOOL eligible = source && (self.nativeRadius > 0 || self.applied) && isNotchBackground(source, self) &&
-                        (ownsMask || !source.mask);
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        if (eligible) {
-            // Apple's opaque fill is inset by one physical pixel inside its
-            // material. Remove only that vertical inset on the existing fill.
-            CGFloat inset = 0;
-            if ([source.name hasPrefix:@"SimpleViewDisplayItem-"] &&
-                isOpaqueBlack(source.backgroundColor) && CATransform3DIsIdentity(source.transform)) {
-                CGFloat nativeTop = self.nativePosition.y - source.anchorPoint.y * self.nativeBounds.size.height;
-                for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
-                    CGSize size = [layout[@"size"] sizeValue];
-                    if (fabs(source.superlayer.bounds.size.width - size.width) > 1 ||
-                        fabs(source.superlayer.bounds.size.height - size.height) > 1) continue;
-                    CGFloat pixel = [layout[@"pixel"] doubleValue];
-                    if (isNativeUnionFill(source) || (nativeTop > 0 && fabs(nativeTop - pixel) < 0.05)) inset = pixel;
-                }
-            }
-            CGFloat flare = MacIslandNotchFlare;
-            // Reach the camera housing's last physical row in scaled modes.
-            CGFloat bottom = nativeSceneEdgeCompensation(source) + [screenLayoutForLayer(source)[@"bottomSnap"] doubleValue];
-            // Build 26C5035r uses a 6 2/3-point native merge blur. Its
-            // three-radius sampling support must continue above the bezel.
-            // Reserve it even while idle so native spring geometry never jumps
-            // when the filter switches on or off. This is outside the display.
-            CGFloat top = isNativeUnionFill(source) ? 20 : 0;
-            CGRect bounds = self.nativeBounds;
-            CGPoint position = self.nativePosition;
-            // The shoulder sits outside the native body, rather than consuming
-            // its absorption area. Offset the bounds origin so existing children
-            // keep their native coordinates when the paint surface grows.
-            bounds.origin.x -= flare;
-            bounds.origin.y -= top;
-            setObserverPaintExtensions(self, (MacIslandPaintExtensions){inset, flare, bottom, top});
-            bounds.size = paintSize(self, bounds.size);
-            position = paintPosition(self, position);
-            CAShapeLayer *maskLayer = [self ensureShapeMask];
-            const void *previousWriteObserver = activeModelWriteObserver;
-            activeModelWriteObserver = (__bridge const void *)self;
-            baseSetBounds(source, @selector(setBounds:), bounds);
-            baseSetPosition(source, @selector(setPosition:), position);
-            originalSetCornerRadius(source, @selector(setCornerRadius:), 0);
-            source.mask = maskLayer;
-            activeModelWriteObserver = previousWriteObserver;
-            BOOL newlyApplied = !self.applied;
-            self.applied = YES;
-            if (newlyApplied) {
-                NSArray<NSString *> *animKeys = copyLayerAnimationKeys(source);
-                for (NSString *key in animKeys) {
-                    CAAnimation *animation = [source animationForKey:key];
-                    CAAnimation *adjusted = animationWithoutPillCorners(animation);
-                    if (adjusted != animation) [source addAnimation:adjusted forKey:key];
-                }
-            }
-            [self refreshMask];
-        } else if (self.applied) {
-            os_unfair_lock_lock(&maskStateLock);
-            MacIslandNativeMaskObserver *peer = _contourPeer;
-            _contourPeer = nil;
-            os_unfair_lock_unlock(&maskStateLock);
-            [self reconcileMergeScene:nil];
-            [peer endVisibilityHold:YES];
-            [self endVisibilityHold:YES];
-            if (source && isNativeUnionFill(source)) clearSecondaryMergeInputs(source.superlayer);
-            if (source) {
-                const void *previousWriteObserver = activeModelWriteObserver;
-                activeModelWriteObserver = (__bridge const void *)self;
-                baseSetBounds(source, @selector(setBounds:), self.nativeBounds);
-                baseSetPosition(source, @selector(setPosition:), self.nativePosition);
-                if (ownsMask) source.mask = nil;
-                originalSetCornerRadius(source, @selector(setCornerRadius:), self.nativeRadius);
-                activeModelWriteObserver = previousWriteObserver;
-            }
-            self.applied = NO;
-        }
-        if (!self.applied) {
-            CALayer *obsUnion = observerDesiredObservedUnion(self);
-            if (obsUnion && (!source || source.superlayer.superlayer != obsUnion || !isSecondaryMergeInput(source)))
-                [self setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
-            synchronizeNativeMaskGeometry(self);
-            if (source && isSecondaryMergeInput(source)) notifyUnionPrimaryObserver(source);
-        }
-        // Re-evaluate immediately if the native material is hidden or removed.
-        [observerMergeInput(self) refreshMask];
-        [CATransaction commit];
-
-        os_unfair_lock_lock(&maskStateLock);
-        if (!_refreshDirty) {
-            _refreshing = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _refreshDirty = NO;
-        if (++passes >= 4) {
-            _refreshing = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            dispatch_async(dispatch_get_main_queue(), ^{ [self refresh]; });
-            return;
-        }
-        os_unfair_lock_unlock(&maskStateLock);
-    }
-}
-
-- (void)refreshMask {
-    os_unfair_lock_lock(&maskStateLock);
-    if (_maskRefreshing) {
-        _maskDirty = YES;
-        os_unfair_lock_unlock(&maskStateLock);
-        return;
-    }
-    _maskRefreshing = YES;
-    _maskDirty = NO;
-    os_unfair_lock_unlock(&maskStateLock);
-
-    NSUInteger passes = 0;
-    for (;;) {
-        CALayer *source = self.source;
-        if (!self.applied) {
-            if (source && isSecondaryMergeInput(source)) {
-                synchronizeNativeMaskGeometry(self);
-                notifyUnionPrimaryObserver(source);
-            }
-        } else {
-            CAShapeLayer *maskLayer = [self shapeMask];
-            if (source && maskLayer && source.mask == maskLayer) {
-                synchronizeNativeMaskGeometry(self);
-                CGPoint origin, position, anchor;
-                CGSize size;
-                CATransform3D transform;
-                presentationLayerGeometry(source, &origin, &size, &position, &anchor, &transform);
-                if (isfinite(size.width) && isfinite(size.height) && size.width > 0 && size.height > 0) {
-                    CGFloat scaleY = hypot(transform.m21, transform.m22);
-                    CGFloat top = MAX(0, -(position.y - anchor.y * size.height)) / MAX(scaleY, 0.001);
-                    [CATransaction begin];
-                    [CATransaction setDisableActions:YES];
-                    maskLayer.bounds = (CGRect){CGPointZero, size};
-                    maskLayer.position = origin;
-                    maskLayer.contentsScale = MAX(source.contentsScale, 2);
-                    BOOL peerOwnsShoulder = hasOpaqueContourPeer(self) && activeMergeBlur(source.superlayer);
-                    CGPathRef path = notchMaskPathAtTop(size, top, !peerOwnsShoulder, scaleY);
-                    maskLayer.path = path;
-                    CGPathRelease(path);
-                    [CATransaction commit];
-                    if (isNativeUnionFill(source)) {
-                        MacIslandPaintExtensions ext = observerPaintExtensions(self);
-                        CGFloat verticalPad = ext.topExtension + 2 * ext.pixelInset + ext.bottomExtension;
-                        CGRect primaryBody = CGRectMake((position.x - anchor.x * size.width) + ext.horizontalFlare,
-                                                        (position.y - anchor.y * size.height) + ext.topExtension + ext.pixelInset,
-                                                        MAX(0, size.width - 2 * ext.horizontalFlare),
-                                                        MAX(0, size.height - verticalPad));
-                        refreshSecondaryMergeInputs(self, primaryBody);
-                    }
-                }
-            }
-        }
-
-        os_unfair_lock_lock(&maskStateLock);
-        if (!_maskDirty) {
-            _maskRefreshing = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            return;
-        }
-        _maskDirty = NO;
-        if (++passes >= 4) {
-            _maskRefreshing = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            dispatch_async(dispatch_get_main_queue(), ^{ [self refreshMask]; });
-            return;
-        }
-        os_unfair_lock_unlock(&maskStateLock);
-    }
-}
-
-// Apple hides its existing primary material partway through closing, before
-// the merge kernel is disabled. Preserve this previously-visible paint until
-// the native filter handoff; a new show request cancels the pending hide.
-- (void)endVisibilityHold:(BOOL)applyHide {
-    id oldBlur = nil;
-    os_unfair_lock_lock(&maskStateLock);
-    oldBlur = _desiredHeldBlur;
-    BOOL hadHold = (oldBlur != nil || _desiredHeldUnion != nil);
-    _desiredHeldBlur = nil;
-    _desiredHeldUnion = nil;
-    os_unfair_lock_unlock(&maskStateLock);
-    (void)oldBlur;
-    if (!hadHold) return;
-
-    [self reconcileHeldVisibilityKVO];
-    if (!applyHide) return;
-    CALayer *source = self.source;
-    if (!source) return;
-    os_unfair_lock_lock(&maskStateLock);
-    BOOL shouldHide = (_desiredHeldBlur == nil) && self.nativeHidden;
-    os_unfair_lock_unlock(&maskStateLock);
-    if (shouldHide) originalSetHidden(source, @selector(setHidden:), YES);
-}
-
-- (BOOL)holdVisibilityInUnion:(CALayer *)group blur:(id)blur {
-    if (!group || !blur) return NO;
-    os_unfair_lock_lock(&maskStateLock);
-    if (!_desiredHeldBlur) {
-        _desiredHeldUnion = group;
-        _desiredHeldBlur = blur;
-    }
-    BOOL held = (_desiredHeldBlur != nil);
-    os_unfair_lock_unlock(&maskStateLock);
-    [self reconcileHeldVisibilityKVO];
-    return held;
-}
-
-- (void)updateVisibilityHold {
-    os_unfair_lock_lock(&maskStateLock);
-    id currentBlur = _desiredHeldBlur;
-    CALayer *unionLayer = _desiredHeldUnion;
-    MacIslandNativeMaskObserver *input = _mergeInput;
-    os_unfair_lock_unlock(&maskStateLock);
-    if (!currentBlur) return;
-
-    id blur = unionLayer ? activeMergeBlur(unionLayer) : nil;
-    if (blur == currentBlur) return;
-    if (blur) {
-        id oldBlur = nil;
-        os_unfair_lock_lock(&maskStateLock);
-        if (_desiredHeldBlur == currentBlur && _desiredHeldUnion == unionLayer) {
-            oldBlur = _desiredHeldBlur;
-            _desiredHeldBlur = blur;
-        }
-        os_unfair_lock_unlock(&maskStateLock);
-        (void)oldBlur;
-        [self reconcileHeldVisibilityKVO];
-        return;
-    }
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [self endVisibilityHold:YES];
-    [input refreshMask];
-    [CATransaction commit];
-}
-
-- (void)useDetachedPaint:(MacIslandNativeMaskObserver *)peer inUnion:(CALayer *)group blur:(id)blur {
-    os_unfair_lock_lock(&maskStateLock);
-    MacIslandNativeMaskObserver *previous = _detachedPaint;
-    if (previous != peer) {
-        if (previous && previous->_detachedOwner == self) previous->_detachedOwner = nil;
-        _detachedPaint = peer;
-        if (peer) peer->_detachedOwner = self;
-    } else {
-        previous = nil;
-    }
-    os_unfair_lock_unlock(&maskStateLock);
-
-    // The stock fallback is painted at the same spring frame, outside the
-    // union. It keeps the two contours separate while the filter is active.
-    CALayer *peerSource = peer ? peer.source : nil;
-    if (peer && blur && peerSource && peerSource.hidden) {
-        if ([peer holdVisibilityInUnion:group blur:blur]) {
-            originalSetHidden(peerSource, @selector(setHidden:), NO);
-        }
-    }
-    if (previous) [previous endVisibilityHold:YES];
-}
-
-- (void)setMergeSuppression:(BOOL)suppress unionLayer:(CALayer *)unionLayer blur:(id)blur
-                     paints:(NSArray<CALayer *> *)paints {
-    if (!suppress) [self useDetachedPaint:nil inUnion:nil blur:nil];
-    id nextBlur = suppress ? blur : nil;
-    CALayer *nextUnion = nextBlur ? unionLayer : nil;
-    NSArray<CALayer *> *targets = suppress && paints ? paints : @[];
-    NSMutableArray<NSNumber *> *targetOpacities = [NSMutableArray arrayWithCapacity:targets.count];
-    for (CALayer *paint in targets) {
-        [targetOpacities addObject:@(paint.opacity)];
-    }
-    NSMutableArray<CALayer *> *restored = [NSMutableArray array];
-    NSMutableArray<NSNumber *> *restoredOpacities = [NSMutableArray array];
-    NSHashTable<CALayer *> *freshTable = targets.count
-        ? [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality]
-        : nil;
-    id oldBlur = nil;
-
-    os_unfair_lock_lock(&maskStateLock);
-    oldBlur = _desiredObservedBlur;
-    _desiredObservedBlur = nextBlur;
-    _desiredObservedUnion = nextUnion;
-    if (targets.count && !_suppressedPaint) _suppressedPaint = freshTable;
-    NSArray<CALayer *> *existingSuppressed = _suppressedPaint ? _suppressedPaint.allObjects : nil;
-    for (CALayer *paint in existingSuppressed) {
-        if ([targets containsObject:paint]) continue;
-        [_suppressedPaint removeObject:paint];
-        NSNumber *saved = objc_getAssociatedObject(paint, &suppressedOpacityKey);
-        objc_setAssociatedObject(paint, &suppressedOpacityKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (saved) {
-            [restored addObject:paint];
-            [restoredOpacities addObject:saved];
-        }
-    }
-    for (NSUInteger i = 0; i < targets.count; i++) {
-        CALayer *paint = targets[i];
-        if (!objc_getAssociatedObject(paint, &suppressedOpacityKey)) {
-            objc_setAssociatedObject(paint, &suppressedOpacityKey, targetOpacities[i],
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        [_suppressedPaint addObject:paint];
-    }
-    os_unfair_lock_unlock(&maskStateLock);
-    (void)oldBlur;
-    (void)freshTable;
-
-    [self reconcileObservedMergeKVO];
-
-    if (!restored.count && !targets.count) return;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    for (NSUInteger i = 0; i < restored.count; i++) {
-        CALayer *paint = restored[i];
-        os_unfair_lock_lock(&maskStateLock);
-        BOOL resuppressed = (objc_getAssociatedObject(paint, &suppressedOpacityKey) != nil);
-        os_unfair_lock_unlock(&maskStateLock);
-        if (!resuppressed) originalSetOpacity(paint, @selector(setOpacity:), restoredOpacities[i].floatValue);
-    }
-    for (CALayer *paint in targets) {
-        os_unfair_lock_lock(&maskStateLock);
-        BOOL stillSuppressed = (objc_getAssociatedObject(paint, &suppressedOpacityKey) != nil);
-        os_unfair_lock_unlock(&maskStateLock);
-        if (stillSuppressed && paint.opacity > 0.0f) originalSetOpacity(paint, @selector(setOpacity:), 0.0f);
-    }
-    [CATransaction commit];
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
-                        change:(NSDictionary *)change context:(void *)context {
-    if (context == &mergeVisibilityKey) { [self updateVisibilityHold]; return; }
-    if (context == &secondaryMergeKey) {
-        CALayer *obsUnion = observerDesiredObservedUnion(self);
-        id blur = activeMergeBlur(obsUnion);
-        if (!blur || !isSecondaryMergeInput(self.source)) {
-            [self setMergeSuppression:NO unionLayer:nil blur:nil paints:nil];
-        } else {
-            notifyUnionPrimaryObserver(self.source);
-        }
-        return;
-    }
-    if (context == &sceneLayersKey) { [self refreshMask]; return; }
-    if (context == &parentGeometryKey) { [self refresh]; return; }
-    if (context != &maskObserverKey) {
-        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
-        return;
-    }
-    if (activeModelWriteObserver == (__bridge const void *)self) return;
-    if ([keyPath isEqualToString:@"hidden"] || [keyPath isEqualToString:@"opacity"]) {
-        [observerMergeInput(self) refreshMask];
-        return;
-    }
-    CALayer *source = self.source;
-    if (!source) return;
-    if ([keyPath isEqualToString:@"bounds"]) self.nativeBounds = source.bounds;
-    if ([keyPath isEqualToString:@"position"]) self.nativePosition = source.position;
-    [self refresh];
-}
-
-- (void)dealloc {
-    MacIslandNativeMaskObserver *peer = _contourPeer;
-    _contourPeer = nil;
-    CALayer *scene = _registeredMergeScene;
-    _registeredMergeScene = nil;
-    _desiredMergeScene = nil;
-    if (scene) [scene removeObserver:self forKeyPath:@"sublayers" context:&sceneLayersKey];
-
-    [peer endVisibilityHold:YES];
-
-    id heldBlur = _registeredHeldBlur;
-    CALayer *heldUnion = _registeredHeldUnion;
-    _registeredHeldBlur = nil;
-    _desiredHeldBlur = nil;
-    _registeredHeldUnion = nil;
-    _desiredHeldUnion = nil;
-    if (heldBlur) {
-        [heldBlur removeObserver:self forKeyPath:@"inputRadius" context:&mergeVisibilityKey];
-        [heldBlur removeObserver:self forKeyPath:@"enabled" context:&mergeVisibilityKey];
-    }
-    if (heldUnion) [heldUnion removeObserver:self forKeyPath:@"filters" context:&mergeVisibilityKey];
-
-    CALayer *parent = _registeredObservedParent;
-    _registeredObservedParent = nil;
-    _desiredObservedParent = nil;
-    if (parent) [parent removeObserver:self forKeyPath:@"bounds" context:&parentGeometryKey];
-
-    removeNativeMaskGeometry(self);
-
-    MacIslandNativeMaskObserver *detached = _detachedPaint;
-    _detachedPaint = nil;
-    [detached endVisibilityHold:YES];
-
-    id obsBlur = _registeredObservedBlur;
-    CALayer *obsUnion = _registeredObservedUnion;
-    _registeredObservedBlur = nil;
-    _desiredObservedBlur = nil;
-    _registeredObservedUnion = nil;
-    _desiredObservedUnion = nil;
-    if (obsBlur) {
-        [obsBlur removeObserver:self forKeyPath:@"inputRadius" context:&secondaryMergeKey];
-        [obsBlur removeObserver:self forKeyPath:@"enabled" context:&secondaryMergeKey];
-    }
-    if (obsUnion) [obsUnion removeObserver:self forKeyPath:@"filters" context:&secondaryMergeKey];
-
-    NSArray<CALayer *> *suppressed = _suppressedPaint ? _suppressedPaint.allObjects : nil;
-    _suppressedPaint = nil;
-    if (suppressed.count) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        for (CALayer *paint in suppressed) {
-            os_unfair_lock_lock(&maskStateLock);
-            NSNumber *saved = objc_getAssociatedObject(paint, &suppressedOpacityKey);
-            objc_setAssociatedObject(paint, &suppressedOpacityKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            os_unfair_lock_unlock(&maskStateLock);
-            if (saved) originalSetOpacity(paint, @selector(setOpacity:), saved.floatValue);
-        }
-        [CATransaction commit];
-    }
-}
-@end
+  cat > "$SCRATCH/mask-modifiers.m" <<'MACISLAND_MASK_MODIFIERS_M'
+#import "mask-internal.h"
+#import <objc/message.h>
+#import <objc/runtime.h>
+#include <string.h>
 
 // MenuBarAgent drives hover through CAPresentationModifier, not only
 // CABasicAnimation or model setters. A live cornerRadius modifier can restore
@@ -4319,17 +3715,31 @@ static void (*originalModifierEnabled)(id, SEL, BOOL);
 static void (*originalAddPresentationModifier)(id, SEL, id);
 static void (*originalSetPresentationModifiers)(id, SEL, id);
 static void (*originalRemovePresentationModifier)(id, SEL, id);
-static id nativeModifierObject(id object, NSString *name) {
+static _Thread_local NSUInteger nativeGroupFlushDepth;
+
+id MacIslandNativeModifierObject(id object, NSString *name) {
     SEL selector = NSSelectorFromString(name);
     return [object respondsToSelector:selector] ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
 }
+
+BOOL MacIslandNativeModifierEnabled(id modifier) {
+    SEL selector = NSSelectorFromString(@"isEnabled");
+    return [modifier respondsToSelector:selector] && ((BOOL (*)(id, SEL))objc_msgSend)(modifier, selector);
+}
+
+MacIslandNativeMaskObserver *MacIslandModelMaskObserver(CALayer *layer) {
+    if (!layer || layer.modelLayer != layer) return nil;
+    id value = objc_getAssociatedObject(layer, &MacIslandMaskObserverKey);
+    return [value isKindOfClass:MacIslandNativeMaskObserver.class] ? value : nil;
+}
+
 static id paintValue(MacIslandModifierBinding *binding, id value) {
     if ([binding.key isEqual:@"cornerRadius"]) return @0;
     if (![value isKindOfClass:NSValue.class]) return value;
     if ([binding.key isEqual:@"bounds.size"] && !strcmp([value objCType], @encode(CGSize)))
-        return [NSValue valueWithSize:paintSize(binding.observer, [value sizeValue])];
+        return [NSValue valueWithSize:MacIslandPaintSize(binding.observer, [value sizeValue])];
     if ([binding.key isEqual:@"position"] && !strcmp([value objCType], @encode(CGPoint)))
-        return [NSValue valueWithPoint:paintPosition(binding.observer, [value pointValue])];
+        return [NSValue valueWithPoint:MacIslandPaintPosition(binding.observer, [value pointValue])];
     return value;
 }
 
@@ -4345,11 +3755,13 @@ static void setModifierValueVelocity(id modifier, SEL selector, id value, id vel
     }
     originalModifierValueVelocity(modifier, selector, value, velocity);
 }
+
 static void setModifierEnabled(id modifier, SEL selector, BOOL enabled) {
     originalModifierEnabled(modifier, selector, enabled);
     MacIslandModifierBinding *binding = objc_getAssociatedObject(modifier, &modifierBindingKey);
     if (binding.observer.applied) [binding.observer refreshMask];
 }
+
 static void bindNativeModifier(MacIslandNativeMaskObserver *observer, id modifier, NSString *key) {
     if (!([key isEqual:@"cornerRadius"] || [key isEqual:@"bounds.size"] || [key isEqual:@"position"])) return;
     if (((BOOL (*)(id, SEL))objc_msgSend)(modifier, NSSelectorFromString(@"additive"))) return;
@@ -4360,7 +3772,7 @@ static void bindNativeModifier(MacIslandNativeMaskObserver *observer, id modifie
         binding.observer = observer;
         binding.modifier = modifier;
         binding.key = key;
-        binding.nativeValue = nativeModifierObject(modifier, @"value");
+        binding.nativeValue = MacIslandNativeModifierObject(modifier, @"value");
         // A spring may already be moving when Apple attaches its modifier.
         // This pinned build exposes the value getter but only an object ivar
         // for its derivative. Read it once at attachment, never on each flush.
@@ -4369,57 +3781,59 @@ static void bindNativeModifier(MacIslandNativeMaskObserver *observer, id modifie
             binding.nativeVelocity = object_getIvar(modifier, velocity);
         objc_setAssociatedObject(modifier, &modifierBindingKey, binding, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         NSArray *oldBindings = nil;
-        os_unfair_lock_lock(&maskStateLock);
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
         oldBindings = observer->_modifierBindings;
         observer->_modifierBindings = [(oldBindings ?: @[]) arrayByAddingObject:binding];
-        os_unfair_lock_unlock(&maskStateLock);
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
         (void)oldBindings;
     }
     id adjusted = paintValue(binding, binding.nativeValue);
-    if (adjusted && ![adjusted isEqual:nativeModifierObject(modifier, @"value")])
+    if (adjusted && ![adjusted isEqual:MacIslandNativeModifierObject(modifier, @"value")])
         originalModifierValueVelocity(modifier, NSSelectorFromString(@"setValue:velocity:"), adjusted,
                                       [key isEqual:@"cornerRadius"] && binding.nativeVelocity ? @0 : binding.nativeVelocity);
 }
+
 static void unbindModifier(MacIslandModifierBinding *binding) {
     id modifier = binding.modifier;
     if (modifier && objc_getAssociatedObject(modifier, &modifierBindingKey) == binding) {
         objc_setAssociatedObject(modifier, &modifierBindingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        originalModifierValueVelocity(modifier, NSSelectorFromString(@"setValue:velocity:"), binding.nativeValue, binding.nativeVelocity);
+        originalModifierValueVelocity(modifier, NSSelectorFromString(@"setValue:velocity:"),
+                                      binding.nativeValue, binding.nativeVelocity);
     }
     binding.observer = nil;
 }
-static MacIslandNativeMaskObserver *modelMaskObserver(CALayer *layer) {
-    if (!layer || layer.modelLayer != layer) return nil;
-    id value = objc_getAssociatedObject(layer, &maskObserverKey);
-    return [value isKindOfClass:MacIslandNativeMaskObserver.class] ? value : nil;
-}
+
 static void modifierListChanged(CALayer *layer) {
-    MacIslandNativeMaskObserver *observer = modelMaskObserver(layer);
+    MacIslandNativeMaskObserver *observer = MacIslandModelMaskObserver(layer);
     if (observer.applied) [observer refreshMask];
-    else if (observer) synchronizeNativeMaskGeometry(observer);
-    else if (hasMergeFilters(layer.superlayer)) {
-        NSArray<CALayer *> *children = copyLayerSublayers(layer);
+    else if (observer) MacIslandSynchronizeNativeMaskGeometry(observer);
+    else if (MacIslandHasMergeFilters(layer.superlayer)) {
+        NSArray<CALayer *> *children = MacIslandCopyLayerSublayers(layer);
         for (CALayer *child in children) {
-            MacIslandNativeMaskObserver *childObserver = modelMaskObserver(child);
-            if (childObserver) synchronizeNativeMaskGeometry(childObserver);
+            MacIslandNativeMaskObserver *childObserver = MacIslandModelMaskObserver(child);
+            if (childObserver) MacIslandSynchronizeNativeMaskGeometry(childObserver);
         }
     }
 }
+
 static void addPresentationModifier(CALayer *layer, SEL selector, id modifier) {
     originalAddPresentationModifier(layer, selector, modifier);
     modifierListChanged(layer);
 }
+
 static void setPresentationModifiers(CALayer *layer, SEL selector, id modifiers) {
     originalSetPresentationModifiers(layer, selector, modifiers);
     modifierListChanged(layer);
 }
-static BOOL nativeModifierEnabled(id modifier) {
-    SEL selector = NSSelectorFromString(@"isEnabled");
-    return [modifier respondsToSelector:selector] && ((BOOL (*)(id, SEL))objc_msgSend)(modifier, selector);
+
+static void removePresentationModifier(CALayer *layer, SEL selector, id modifier) {
+    originalRemovePresentationModifier(layer, selector, modifier);
+    modifierListChanged(layer);
 }
-static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
+
+void MacIslandRemoveNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     // Detach all state under the lock, then call out to Core Animation.
-    os_unfair_lock_lock(&maskStateLock);
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
     id size = observer->_nativeMaskSize;
     NSArray *groups = observer->_nativeMaskGroups;
     NSArray *bindings = observer->_modifierBindings;
@@ -4427,7 +3841,7 @@ static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     observer->_nativeMaskSize = nil;
     observer->_nativeMaskGroups = nil;
     observer->_modifierBindings = nil;
-    os_unfair_lock_unlock(&maskStateLock);
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
     if (size && maskLayer && originalRemovePresentationModifier)
         originalRemovePresentationModifier(maskLayer, NSSelectorFromString(@"removePresentationModifier:"), size);
     for (id group in groups) {
@@ -4435,29 +3849,30 @@ static void removeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     }
     for (MacIslandModifierBinding *binding in bindings) unbindModifier(binding);
 }
-static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
+
+void MacIslandSynchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer) {
     if (!observer || !originalAddPresentationModifier) return;
-    os_unfair_lock_lock(&maskStateLock);
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
     if (observer->_syncingGeometry) {
         observer->_geometryDirty = YES;
-        os_unfair_lock_unlock(&maskStateLock);
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
         return;
     }
     observer->_syncingGeometry = YES;
     observer->_geometryDirty = NO;
-    os_unfair_lock_unlock(&maskStateLock);
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
 
     NSUInteger passes = 0;
     for (;;) {
         CALayer *source = observer.source;
         BOOL applied = observer.applied;
-        BOOL secondary = !applied && source && isSecondaryMergeInput(source);
+        BOOL secondary = !applied && source && MacIslandIsSecondaryMergeInput(source);
         BOOL member = applied || secondary;
-        NSArray *modifiers = (member && source) ? copyLayerModifiers(source) : nil;
+        NSArray *modifiers = (member && source) ? MacIslandCopyLayerModifiers(source) : nil;
 
-        os_unfair_lock_lock(&maskStateLock);
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
         NSArray *currentBindings = observer->_modifierBindings;
-        os_unfair_lock_unlock(&maskStateLock);
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
 
         NSMutableArray *stale = [NSMutableArray array];
         for (MacIslandModifierBinding *binding in currentBindings) {
@@ -4466,43 +3881,43 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         }
         if (stale.count) {
             NSArray *oldBindings = nil;
-            os_unfair_lock_lock(&maskStateLock);
+            os_unfair_lock_lock(&MacIslandMaskStateLock);
             oldBindings = observer->_modifierBindings;
             NSMutableArray *kept = [oldBindings mutableCopy] ?: [NSMutableArray array];
             for (id binding in stale) [kept removeObjectIdenticalTo:binding];
             observer->_modifierBindings = [kept copy];
-            os_unfair_lock_unlock(&maskStateLock);
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
             (void)oldBindings;
             for (MacIslandModifierBinding *binding in stale) unbindModifier(binding);
         }
         id size = nil;
         NSMutableArray *groups = [NSMutableArray array];
         for (id modifier in modifiers) {
-            NSString *key = nativeModifierObject(modifier, @"keyPath");
+            NSString *key = MacIslandNativeModifierObject(modifier, @"keyPath");
             if (applied) {
                 bindNativeModifier(observer, modifier, key);
-                if ([key isEqual:@"bounds.size"] && nativeModifierEnabled(modifier) &&
+                if ([key isEqual:@"bounds.size"] && MacIslandNativeModifierEnabled(modifier) &&
                     ((MacIslandModifierBinding *)objc_getAssociatedObject(modifier, &modifierBindingKey)).observer == observer)
                     size = modifier;
             }
-            id group = nativeModifierObject(modifier, @"group");
+            id group = MacIslandNativeModifierObject(modifier, @"group");
             if (group && ![groups containsObject:group]) [groups addObject:group];
         }
         if (secondary) {
-            NSArray *parentModifiers = copyLayerModifiers(source.superlayer);
+            NSArray *parentModifiers = MacIslandCopyLayerModifiers(source.superlayer);
             for (id modifier in parentModifiers) {
-                id group = nativeModifierObject(modifier, @"group");
+                id group = MacIslandNativeModifierObject(modifier, @"group");
                 if (group && ![groups containsObject:group]) [groups addObject:group];
             }
         }
-        NSArray * immutableGroups = [groups copy];
-        os_unfair_lock_lock(&maskStateLock);
+        NSArray *immutableGroups = [groups copy];
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
         NSArray *previousGroups = observer->_nativeMaskGroups ?: @[];
         observer->_nativeMaskGroups = immutableGroups;
         id previousSize = observer->_nativeMaskSize;
         BOOL sizeChanged = previousSize != size;
         if (sizeChanged) observer->_nativeMaskSize = size;
-        os_unfair_lock_unlock(&maskStateLock);
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
 
         for (id group in previousGroups) {
             if (![immutableGroups containsObject:group]) {
@@ -4532,34 +3947,36 @@ static void synchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer)
         (void)previousSize;
         (void)previousGroups;
 
-        os_unfair_lock_lock(&maskStateLock);
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
         if (!observer->_geometryDirty) {
             observer->_syncingGeometry = NO;
-            os_unfair_lock_unlock(&maskStateLock);
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
             return;
         }
         observer->_geometryDirty = NO;
         if (++passes >= 4) {
             observer->_syncingGeometry = NO;
-            os_unfair_lock_unlock(&maskStateLock);
-            dispatch_async(dispatch_get_main_queue(), ^{ synchronizeNativeMaskGeometry(observer); });
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            dispatch_async(dispatch_get_main_queue(), ^{ MacIslandSynchronizeNativeMaskGeometry(observer); });
             return;
         }
-        os_unfair_lock_unlock(&maskStateLock);
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
     }
 }
-static _Thread_local NSUInteger nativeGroupFlushDepth;
+
 static NSArray *nativeGroupMaskObservers(id group) {
     NSArray *snapshot;
     @synchronized(group) { snapshot = [objc_getAssociatedObject(group, &nativeMaskGroupObserversKey) allObjects]; }
     // Reparenting an entire secondary branch need not notify its leaf.
     for (MacIslandNativeMaskObserver *observer in snapshot)
-        if (observer.applied || isSecondaryMergeInput(observer.source)) return snapshot;
+        if (observer.applied || MacIslandIsSecondaryMergeInput(observer.source)) return snapshot;
     return nil;
 }
+
 static void refreshNativeGroupMasks(NSArray *observers) {
     for (MacIslandNativeMaskObserver *observer in observers) [observer refreshMask];
 }
+
 static void installNativeGroupFlushHooks(void) {
     Class groupClass = NSClassFromString(@"CAPresentationModifierGroup");
     // All three untimed entry points forward to their timed counterparts.
@@ -4587,12 +4004,8 @@ static void installNativeGroupFlushHooks(void) {
         }));
     }
 }
-static void removePresentationModifier(CALayer *layer, SEL selector, id modifier) {
-    originalRemovePresentationModifier(layer, selector, modifier);
-    modifierListChanged(layer);
-}
 
-static void installNativeCornerModifierHooks(void) {
+void MacIslandInstallNativeCornerModifierHooks(void) {
     Class modifier = NSClassFromString(@"CAPresentationModifier");
     Method value = class_getInstanceMethod(modifier, NSSelectorFromString(@"setValue:"));
     Method velocity = class_getInstanceMethod(modifier, NSSelectorFromString(@"setValue:velocity:"));
@@ -4613,61 +4026,568 @@ static void installNativeCornerModifierHooks(void) {
     method_setImplementation(remove, (IMP)removePresentationModifier);
     installNativeGroupFlushHooks();
 }
+MACISLAND_MASK_MODIFIERS_M
+
+  cat > "$SCRATCH/mask.m" <<'MACISLAND_MASK_M'
+#import "mask-internal.h"
+#import <objc/runtime.h>
+
+os_unfair_lock MacIslandMaskStateLock = OS_UNFAIR_LOCK_INIT;
+_Thread_local const void *MacIslandActiveModelWriteObserver;
+
+char MacIslandMaskObserverKey;
+char MacIslandSceneOriginObserverKey;
+char MacIslandMergeVisibilityKey;
+char MacIslandParentGeometryKey;
+char MacIslandSceneLayersKey;
+
+void (*MacIslandOriginalSetHidden)(id, SEL, BOOL);
+void (*MacIslandOriginalSetCornerRadius)(id, SEL, CGFloat);
+void (*MacIslandBaseSetBounds)(id, SEL, CGRect);
+void (*MacIslandBaseSetPosition)(id, SEL, CGPoint);
+
+static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
+
+typedef NS_ENUM(NSUInteger, MacIslandSingleLayerKVOKind) {
+    MacIslandSingleLayerKVOParentBounds = 0,
+    MacIslandSingleLayerKVOMergeSceneSublayers = 1,
+};
+
+// An opaque material can draw the shoulder without smoothing it a second
+// time through the native merge filter. Never hold MacIslandMaskStateLock across
+// any CALayer, CAFilter, or KVO call: Core Animation invokes KVO while holding
+// its layer/transaction locks on main, while DisplayLink flushes run on the
+// background animation thread.
+static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
+    CALayer *source = input.source;
+    CALayer *unionLayer = source ? source.superlayer : nil;
+    MacIslandPaintExtensions ext = MacIslandObserverPaintExtensions(input);
+    CALayer *scene = (unionLayer && ext.topExtension > 0) ? unionLayer.superlayer : nil;
+    [input reconcileMergeScene:scene];
+
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    MacIslandNativeMaskObserver *previous = input->_contourPeer;
+    BOOL prevHeldHere = (previous != nil && previous->_desiredHeldBlur != nil &&
+                         previous->_desiredHeldUnion == unionLayer && previous->_mergeInput == input);
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+
+    id blur = unionLayer ? MacIslandActiveMergeBlur(unionLayer) : nil;
+    // The two model layers finish their bounds and position writes separately.
+    // Once the peer is held for this merge filter, the identified material stays
+    // responsible until this same filter hands off. Revalidate ownership, not
+    // model endpoints.
+    if (scene && previous && prevHeldHere && previous.applied && blur != nil) {
+        CALayer *heldMaterial = previous.source;
+        CAShapeLayer *prevMask = [previous shapeMask];
+        if (heldMaterial && heldMaterial.superlayer == scene &&
+            prevMask && heldMaterial.mask == prevMask && !heldMaterial.hidden &&
+            heldMaterial.opacity >= 1 && !heldMaterial.contents && !MacIslandLayerHasSublayers(heldMaterial) &&
+            MacIslandIsOpaqueBlack(heldMaterial.backgroundColor)) {
+            return YES;
+        }
+    }
+
+    MacIslandNativeMaskObserver *selected = nil;
+    if (scene && unionLayer) {
+        CGRect body = [unionLayer convertRect:MacIslandNativeBodyFrame(input) toLayer:scene];
+        NSArray<CALayer *> *sublayers = MacIslandCopyLayerSublayers(scene);
+        for (CALayer *layer in sublayers) {
+            if (layer.superlayer != scene || !MacIslandIsOpaqueBlack(layer.backgroundColor)) continue;
+            id association = objc_getAssociatedObject(layer, &MacIslandMaskObserverKey);
+            if (![association isKindOfClass:MacIslandNativeMaskObserver.class]) continue;
+            MacIslandNativeMaskObserver *peer = association;
+            CAShapeLayer *peerMask = [peer shapeMask];
+            if (!peer.applied || !peerMask || layer.mask != peerMask) continue;
+            CGRect r = MacIslandNativeBodyFrame(peer);
+            // Native material and opaque merge input differ by a backing-pixel inset.
+            if (fabs(CGRectGetMinX(r) - CGRectGetMinX(body)) > 1 ||
+                fabs(CGRectGetMaxX(r) - CGRectGetMaxX(body)) > 1 ||
+                fabs(CGRectGetMinY(r) - CGRectGetMinY(body)) > 1 ||
+                fabs(CGRectGetMaxY(r) - CGRectGetMaxY(body)) > 1) continue;
+            os_unfair_lock_lock(&MacIslandMaskStateLock);
+            peer->_mergeInput = input;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            if (layer.opacity >= 1 && !layer.contents && !MacIslandLayerHasSublayers(layer) &&
+                (!layer.hidden || (blur && !source.hidden && source.opacity >= 1 &&
+                                    !unionLayer.hidden && unionLayer.opacity >= 1))) {
+                selected = peer;
+                break;
+            }
+        }
+    }
+
+    CALayer *selectedSource = selected ? selected.source : nil;
+    BOOL needHoldSelected = (selected != nil && blur != nil && selectedSource != nil);
+
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    MacIslandNativeMaskObserver *oldPeer = input->_contourPeer;
+    input->_contourPeer = selected;
+    MacIslandNativeMaskObserver *releasePeer =
+        (oldPeer != nil && oldPeer != selected && oldPeer->_desiredHeldBlur != nil) ? oldPeer : nil;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+
+    if (needHoldSelected) {
+        // Hold the opaque shoulder owner whenever a merge blur is active so
+        // intermediate model updates keep the crisp outer notch contour.
+        if ([selected holdVisibilityInUnion:unionLayer blur:blur] && selectedSource.hidden) {
+            MacIslandOriginalSetHidden(selectedSource, @selector(setHidden:), NO);
+        }
+    } else if (selected && blur == nil) {
+        [selected endVisibilityHold:YES];
+    }
+    if (releasePeer) [releasePeer endVisibilityHold:YES];
+    return selected != nil;
+}
+
+@implementation MacIslandNativeMaskObserver
+- (instancetype)initWithLayer:(CALayer *)layer {
+    self = [super init];
+    if (self) {
+        _source = layer;
+        _nativeRadius = layer.cornerRadius;
+        _nativeHidden = layer.hidden;
+        _nativeBounds = layer.bounds;
+        _nativePosition = layer.position;
+        _keys = @[@"bounds", @"position", @"anchorPoint", @"transform",
+                  @"superlayer", @"name", @"hidden", @"opacity", @"backgroundColor",
+                  @"shadowColor", @"shadowOpacity", @"masksToBounds", @"mask"];
+        for (NSString *key in _keys)
+            [layer addObserver:self forKeyPath:key options:0 context:&MacIslandMaskObserverKey];
+        MacIslandObserveNativeAnimations(layer);
+        [self refresh];
+    }
+    return self;
+}
+
+- (CAShapeLayer *)shapeMask {
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    CAShapeLayer *mask = _shapeMask;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    return mask;
+}
+
+- (CAShapeLayer *)ensureShapeMask {
+    CAShapeLayer *existing = [self shapeMask];
+    if (existing) return existing;
+    CAShapeLayer *created = [CAShapeLayer layer];
+    created.fillColor = NSColor.whiteColor.CGColor;
+    created.name = @"MacIslandNativeNotchMask";
+    created.anchorPoint = CGPointZero;
+    // Match the native background: antialias the Bezier contour, not the
+    // mask's rectangular surface edge during fractional native motion.
+    created.edgeAntialiasingMask = 0;
+    created.actions = @{@"path": NSNull.null, @"bounds": NSNull.null, @"position": NSNull.null};
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    if (!_shapeMask) _shapeMask = created;
+    existing = _shapeMask;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    return existing;
+}
+
+- (void)reconcileSingleLayerKVO:(MacIslandSingleLayerKVOKind)kind target:(CALayer *)target {
+    NSString *keyPath = kind == MacIslandSingleLayerKVOParentBounds ? @"bounds" : @"sublayers";
+    void *context = kind == MacIslandSingleLayerKVOParentBounds ? &MacIslandParentGeometryKey : &MacIslandSceneLayersKey;
+
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    BOOL *reconciling = kind == MacIslandSingleLayerKVOParentBounds ? &_reconcilingParentKVO : &_reconcilingMergeSceneKVO;
+    if (kind == MacIslandSingleLayerKVOParentBounds) _desiredObservedParent = target;
+    else _desiredMergeScene = target;
+    if (*reconciling) {
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        return;
+    }
+    *reconciling = YES;
+    for (;;) {
+        CALayer *current = kind == MacIslandSingleLayerKVOParentBounds ? _registeredObservedParent : _registeredMergeScene;
+        CALayer *desired = kind == MacIslandSingleLayerKVOParentBounds ? _desiredObservedParent : _desiredMergeScene;
+        if (current == desired) {
+            *reconciling = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            return;
+        }
+        if (kind == MacIslandSingleLayerKVOParentBounds) _registeredObservedParent = desired;
+        else _registeredMergeScene = desired;
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        if (current) [current removeObserver:self forKeyPath:keyPath context:context];
+        if (desired) [desired addObserver:self forKeyPath:keyPath options:0 context:context];
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
+    }
+}
+
+- (void)reconcileObservedParent:(CALayer *)parent {
+    [self reconcileSingleLayerKVO:MacIslandSingleLayerKVOParentBounds target:parent];
+}
+
+- (void)reconcileMergeScene:(CALayer *)scene {
+    [self reconcileSingleLayerKVO:MacIslandSingleLayerKVOMergeSceneSublayers target:scene];
+}
+
+- (void)reconcileHeldVisibilityKVO {
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    if (_reconcilingHeldKVO) {
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        return;
+    }
+    _reconcilingHeldKVO = YES;
+    for (;;) {
+        CALayer *currentUnion = _registeredHeldUnion;
+        id currentBlur = _registeredHeldBlur;
+        CALayer *desiredUnion = _desiredHeldUnion;
+        id desiredBlur = _desiredHeldBlur;
+        if (currentUnion == desiredUnion && currentBlur == desiredBlur) {
+            _reconcilingHeldKVO = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            return;
+        }
+        _registeredHeldUnion = desiredUnion;
+        _registeredHeldBlur = desiredBlur;
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        if (currentBlur != desiredBlur) {
+            if (currentBlur) {
+                [currentBlur removeObserver:self forKeyPath:@"inputRadius" context:&MacIslandMergeVisibilityKey];
+                [currentBlur removeObserver:self forKeyPath:@"enabled" context:&MacIslandMergeVisibilityKey];
+            }
+            if (desiredBlur) {
+                [desiredBlur addObserver:self forKeyPath:@"inputRadius" options:0 context:&MacIslandMergeVisibilityKey];
+                [desiredBlur addObserver:self forKeyPath:@"enabled" options:0 context:&MacIslandMergeVisibilityKey];
+            }
+        }
+        if (currentUnion != desiredUnion) {
+            if (currentUnion) [currentUnion removeObserver:self forKeyPath:@"filters" context:&MacIslandMergeVisibilityKey];
+            if (desiredUnion) [desiredUnion addObserver:self forKeyPath:@"filters" options:0 context:&MacIslandMergeVisibilityKey];
+        }
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
+    }
+}
+
+- (void)refresh {
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    if (_refreshing) {
+        _refreshDirty = YES;
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        return;
+    }
+    _refreshing = YES;
+    _refreshDirty = NO;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+
+    NSUInteger passes = 0;
+    for (;;) {
+        CALayer *source = self.source;
+        // Native children may settle before their display parent gets its size.
+        // Eligibility must follow that existing parent's layout too.
+        CALayer *parent = source ? source.superlayer : nil;
+        [self reconcileObservedParent:parent];
+
+        CAShapeLayer *currentMask = [self shapeMask];
+        BOOL ownsMask = currentMask && source && source.mask == currentMask;
+        BOOL eligible = source && (self.nativeRadius > 0 || self.applied) && MacIslandIsNotchBackground(source, self) &&
+                        (ownsMask || !source.mask);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        if (eligible) {
+            // Apple's opaque fill is inset by one physical pixel inside its
+            // material. Remove only that vertical inset on the existing fill.
+            CGFloat inset = 0;
+            if ([source.name hasPrefix:@"SimpleViewDisplayItem-"] &&
+                MacIslandIsOpaqueBlack(source.backgroundColor) && CATransform3DIsIdentity(source.transform)) {
+                CGFloat nativeTop = self.nativePosition.y - source.anchorPoint.y * self.nativeBounds.size.height;
+                for (NSDictionary *layout in [MacIslandScreenGeometry shared].layouts) {
+                    CGSize size = [layout[@"size"] sizeValue];
+                    if (fabs(source.superlayer.bounds.size.width - size.width) > 1 ||
+                        fabs(source.superlayer.bounds.size.height - size.height) > 1) continue;
+                    CGFloat pixel = [layout[@"pixel"] doubleValue];
+                    if (MacIslandIsNativeUnionFill(source) || (nativeTop > 0 && fabs(nativeTop - pixel) < 0.05)) inset = pixel;
+                }
+            }
+            CGFloat flare = MacIslandNotchFlare;
+            // Reach the camera housing's last physical row in scaled modes.
+            CGFloat bottom = MacIslandNativeSceneEdgeCompensation(source) +
+                             [MacIslandScreenLayoutForLayer(source)[@"bottomSnap"] doubleValue];
+            // Build 26C5035r uses a 6 2/3-point native merge blur. Its
+            // three-radius sampling support must continue above the bezel.
+            // Reserve it even while idle so native spring geometry never jumps
+            // when the filter switches on or off. This is outside the display.
+            CGFloat top = MacIslandIsNativeUnionFill(source) ? 20 : 0;
+            CGRect bounds = self.nativeBounds;
+            CGPoint position = self.nativePosition;
+            // The shoulder sits outside the native body, rather than consuming
+            // its absorption area. Offset the bounds origin so existing children
+            // keep their native coordinates when the paint surface grows.
+            bounds.origin.x -= flare;
+            bounds.origin.y -= top;
+            MacIslandSetObserverPaintExtensions(self, (MacIslandPaintExtensions){inset, flare, bottom, top});
+            bounds.size = MacIslandPaintSize(self, bounds.size);
+            position = MacIslandPaintPosition(self, position);
+            CAShapeLayer *maskLayer = [self ensureShapeMask];
+            const void *previousWriteObserver = MacIslandActiveModelWriteObserver;
+            MacIslandActiveModelWriteObserver = (__bridge const void *)self;
+            MacIslandBaseSetBounds(source, @selector(setBounds:), bounds);
+            MacIslandBaseSetPosition(source, @selector(setPosition:), position);
+            MacIslandOriginalSetCornerRadius(source, @selector(setCornerRadius:), 0);
+            source.mask = maskLayer;
+            MacIslandActiveModelWriteObserver = previousWriteObserver;
+            BOOL newlyApplied = !self.applied;
+            self.applied = YES;
+            if (newlyApplied) {
+                NSArray<NSString *> *animKeys = MacIslandCopyLayerAnimationKeys(source);
+                for (NSString *key in animKeys) {
+                    CAAnimation *animation = [source animationForKey:key];
+                    CAAnimation *adjusted = MacIslandAnimationWithoutPillCorners(animation);
+                    if (adjusted != animation) [source addAnimation:adjusted forKey:key];
+                }
+            }
+            [self refreshMask];
+        } else if (self.applied) {
+            os_unfair_lock_lock(&MacIslandMaskStateLock);
+            MacIslandNativeMaskObserver *peer = _contourPeer;
+            _contourPeer = nil;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            [self reconcileMergeScene:nil];
+            [peer endVisibilityHold:YES];
+            [self endVisibilityHold:YES];
+            if (source) {
+                const void *previousWriteObserver = MacIslandActiveModelWriteObserver;
+                MacIslandActiveModelWriteObserver = (__bridge const void *)self;
+                MacIslandBaseSetBounds(source, @selector(setBounds:), self.nativeBounds);
+                MacIslandBaseSetPosition(source, @selector(setPosition:), self.nativePosition);
+                if (ownsMask) source.mask = nil;
+                MacIslandOriginalSetCornerRadius(source, @selector(setCornerRadius:), self.nativeRadius);
+                MacIslandActiveModelWriteObserver = previousWriteObserver;
+            }
+            self.applied = NO;
+        }
+        if (!self.applied) MacIslandSynchronizeNativeMaskGeometry(self);
+        // Re-evaluate immediately if the native material is hidden or removed.
+        [MacIslandObserverMergeInput(self) refreshMask];
+        [CATransaction commit];
+
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
+        if (!_refreshDirty) {
+            _refreshing = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            return;
+        }
+        _refreshDirty = NO;
+        if (++passes >= 4) {
+            _refreshing = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            dispatch_async(dispatch_get_main_queue(), ^{ [self refresh]; });
+            return;
+        }
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    }
+}
+
+- (void)refreshMask {
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    if (_maskRefreshing) {
+        _maskDirty = YES;
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        return;
+    }
+    _maskRefreshing = YES;
+    _maskDirty = NO;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+
+    NSUInteger passes = 0;
+    for (;;) {
+        CALayer *source = self.source;
+        if (!self.applied) {
+            if (source && MacIslandIsSecondaryMergeInput(source)) {
+                MacIslandSynchronizeNativeMaskGeometry(self);
+            }
+        } else {
+            CAShapeLayer *maskLayer = [self shapeMask];
+            if (source && maskLayer && source.mask == maskLayer) {
+                MacIslandSynchronizeNativeMaskGeometry(self);
+                CGPoint origin, position, anchor;
+                CGSize size;
+                CATransform3D transform;
+                MacIslandPresentationLayerGeometry(source, &origin, &size, &position, &anchor, &transform);
+                if (isfinite(size.width) && isfinite(size.height) && size.width > 0 && size.height > 0) {
+                    CGFloat scaleY = hypot(transform.m21, transform.m22);
+                    CGFloat top = MAX(0, -(position.y - anchor.y * size.height)) / MAX(scaleY, 0.001);
+                    [CATransaction begin];
+                    [CATransaction setDisableActions:YES];
+                    maskLayer.bounds = (CGRect){CGPointZero, size};
+                    maskLayer.position = origin;
+                    maskLayer.contentsScale = MAX(source.contentsScale, 2);
+                    BOOL peerOwnsShoulder = hasOpaqueContourPeer(self);
+                    CGPathRef path = MacIslandNotchMaskPathAtTop(size, top, !peerOwnsShoulder, scaleY);
+                    maskLayer.path = path;
+                    CGPathRelease(path);
+                    [CATransaction commit];
+                }
+            }
+        }
+
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
+        if (!_maskDirty) {
+            _maskRefreshing = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            return;
+        }
+        _maskDirty = NO;
+        if (++passes >= 4) {
+            _maskRefreshing = NO;
+            os_unfair_lock_unlock(&MacIslandMaskStateLock);
+            dispatch_async(dispatch_get_main_queue(), ^{ [self refreshMask]; });
+            return;
+        }
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    }
+}
+
+// Apple hides its existing primary material partway through closing, before
+// the merge kernel is disabled. Preserve this previously-visible paint until
+// the native filter handoff; a new show request cancels the pending hide.
+- (void)endVisibilityHold:(BOOL)applyHide {
+    id oldBlur = nil;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    oldBlur = _desiredHeldBlur;
+    BOOL hadHold = (oldBlur != nil || _desiredHeldUnion != nil);
+    _desiredHeldBlur = nil;
+    _desiredHeldUnion = nil;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    (void)oldBlur;
+    if (!hadHold) return;
+
+    [self reconcileHeldVisibilityKVO];
+    if (!applyHide) return;
+    CALayer *source = self.source;
+    if (!source) return;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    BOOL shouldHide = (_desiredHeldBlur == nil) && self.nativeHidden;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    if (shouldHide) MacIslandOriginalSetHidden(source, @selector(setHidden:), YES);
+}
+
+- (BOOL)holdVisibilityInUnion:(CALayer *)group blur:(id)blur {
+    if (!group || !blur) return NO;
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    if (!_desiredHeldBlur) {
+        _desiredHeldUnion = group;
+        _desiredHeldBlur = blur;
+    }
+    BOOL held = (_desiredHeldBlur != nil);
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    [self reconcileHeldVisibilityKVO];
+    return held;
+}
+
+- (void)updateVisibilityHold {
+    os_unfair_lock_lock(&MacIslandMaskStateLock);
+    id currentBlur = _desiredHeldBlur;
+    CALayer *unionLayer = _desiredHeldUnion;
+    MacIslandNativeMaskObserver *input = _mergeInput;
+    os_unfair_lock_unlock(&MacIslandMaskStateLock);
+    if (!currentBlur) return;
+
+    id blur = unionLayer ? MacIslandActiveMergeBlur(unionLayer) : nil;
+    if (blur == currentBlur) return;
+    if (blur) {
+        id oldBlur = nil;
+        os_unfair_lock_lock(&MacIslandMaskStateLock);
+        if (_desiredHeldBlur == currentBlur && _desiredHeldUnion == unionLayer) {
+            oldBlur = _desiredHeldBlur;
+            _desiredHeldBlur = blur;
+        }
+        os_unfair_lock_unlock(&MacIslandMaskStateLock);
+        (void)oldBlur;
+        [self reconcileHeldVisibilityKVO];
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self endVisibilityHold:YES];
+    [input refreshMask];
+    [CATransaction commit];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context == &MacIslandMergeVisibilityKey) { [self updateVisibilityHold]; return; }
+    if (context == &MacIslandSceneLayersKey) { [self refreshMask]; return; }
+    if (context == &MacIslandParentGeometryKey) { [self refresh]; return; }
+    if (context != &MacIslandMaskObserverKey) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    if (MacIslandActiveModelWriteObserver == (__bridge const void *)self) return;
+    if ([keyPath isEqualToString:@"hidden"] || [keyPath isEqualToString:@"opacity"]) {
+        [MacIslandObserverMergeInput(self) refreshMask];
+        return;
+    }
+    CALayer *source = self.source;
+    if (!source) return;
+    if ([keyPath isEqualToString:@"bounds"]) self.nativeBounds = source.bounds;
+    if ([keyPath isEqualToString:@"position"]) self.nativePosition = source.position;
+    [self refresh];
+}
+
+- (void)dealloc {
+    MacIslandNativeMaskObserver *peer = _contourPeer;
+    _contourPeer = nil;
+    CALayer *scene = _registeredMergeScene;
+    _registeredMergeScene = nil;
+    _desiredMergeScene = nil;
+    if (scene) [scene removeObserver:self forKeyPath:@"sublayers" context:&MacIslandSceneLayersKey];
+
+    [peer endVisibilityHold:YES];
+
+    id heldBlur = _registeredHeldBlur;
+    CALayer *heldUnion = _registeredHeldUnion;
+    _registeredHeldBlur = nil;
+    _desiredHeldBlur = nil;
+    _registeredHeldUnion = nil;
+    _desiredHeldUnion = nil;
+    if (heldBlur) {
+        [heldBlur removeObserver:self forKeyPath:@"inputRadius" context:&MacIslandMergeVisibilityKey];
+        [heldBlur removeObserver:self forKeyPath:@"enabled" context:&MacIslandMergeVisibilityKey];
+    }
+    if (heldUnion) [heldUnion removeObserver:self forKeyPath:@"filters" context:&MacIslandMergeVisibilityKey];
+
+    CALayer *parent = _registeredObservedParent;
+    _registeredObservedParent = nil;
+    _desiredObservedParent = nil;
+    if (parent) [parent removeObserver:self forKeyPath:@"bounds" context:&MacIslandParentGeometryKey];
+
+    MacIslandRemoveNativeMaskGeometry(self);
+}
+@end
 
 static void setNativeMaterialHidden(CALayer *layer, SEL selector, BOOL hidden) {
     if (layer.modelLayer == layer) {
-        id association = objc_getAssociatedObject(layer, &maskObserverKey);
+        id association = objc_getAssociatedObject(layer, &MacIslandMaskObserverKey);
         if ([association isKindOfClass:MacIslandNativeMaskObserver.class]) {
             MacIslandNativeMaskObserver *peer = association;
             peer.nativeHidden = hidden;
             if (!hidden) {
                 [peer endVisibilityHold:NO];
             } else {
-                os_unfair_lock_lock(&maskStateLock);
-                BOOL alreadyHeldDetached = (peer->_desiredHeldBlur != nil) && !peer.applied;
-                MacIslandNativeMaskObserver *detachedOwner = peer->_detachedOwner;
-                CALayer *detachedUnion = detachedOwner ? detachedOwner->_desiredObservedUnion : nil;
+                os_unfair_lock_lock(&MacIslandMaskStateLock);
                 MacIslandNativeMaskObserver *input = peer->_mergeInput;
                 BOOL isContourPeer = (input != nil && input->_contourPeer == peer);
-                os_unfair_lock_unlock(&maskStateLock);
+                os_unfair_lock_unlock(&MacIslandMaskStateLock);
 
-                if (alreadyHeldDetached) return;
-                id detachedBlur = detachedUnion ? activeMergeBlur(detachedUnion) : nil;
-                if (detachedOwner && detachedBlur && !layer.hidden) {
-                    if ([peer holdVisibilityInUnion:detachedUnion blur:detachedBlur]) return;
-                }
                 CALayer *inputSource = isContourPeer ? input.source : nil;
                 CALayer *group = inputSource ? inputSource.superlayer : nil;
                 CAShapeLayer *peerMask = [peer shapeMask];
                 if (isContourPeer && input.applied && peer.applied && group &&
-                    !layer.hidden && layer.opacity >= 1 && !layer.contents && !layerHasSublayers(layer) &&
-                    isOpaqueBlack(layer.backgroundColor) && peerMask && layer.mask == peerMask &&
+                    !layer.hidden && layer.opacity >= 1 && !layer.contents && !MacIslandLayerHasSublayers(layer) &&
+                    MacIslandIsOpaqueBlack(layer.backgroundColor) && peerMask && layer.mask == peerMask &&
                     layer.superlayer == group.superlayer) {
-                    id blur = activeMergeBlur(group);
-                    if (blur && [peer holdVisibilityInUnion:group blur:blur]) return;
+                    id blur = MacIslandActiveMergeBlur(group);
+                    if (blur && [peer holdVisibilityInUnion:group blur:blur]) {
+                        [input refreshMask];
+                        return;
+                    }
                 }
             }
         }
     }
-    originalSetHidden(layer, selector, hidden);
-}
-
-static void setLayerOpacity(CALayer *layer, SEL selector, float opacity) {
-    if (layer.modelLayer == layer) {
-        id oldSaved = nil;
-        os_unfair_lock_lock(&maskStateLock);
-        oldSaved = objc_getAssociatedObject(layer, &suppressedOpacityKey);
-        if (oldSaved) {
-            objc_setAssociatedObject(layer, &suppressedOpacityKey, @(opacity),
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            os_unfair_lock_unlock(&maskStateLock);
-            (void)oldSaved;
-            originalSetOpacity(layer, selector, 0.0f);
-            return;
-        }
-        os_unfair_lock_unlock(&maskStateLock);
-    }
-    originalSetOpacity(layer, selector, opacity);
+    MacIslandOriginalSetHidden(layer, selector, hidden);
 }
 
 static void setCornerRadius(CALayer *layer, SEL selector, CGFloat radius) {
@@ -4677,30 +4597,30 @@ static void setCornerRadius(CALayer *layer, SEL selector, CGFloat radius) {
     // recursively requesting another presentation copy.
     CALayer *model = layer.modelLayer;
     if (model != layer) {
-        id modelAssociation = objc_getAssociatedObject(model, &maskObserverKey);
-        MacIslandNativeMaskObserver *observer = [modelAssociation isKindOfClass:MacIslandNativeMaskObserver.class] ? modelAssociation : nil;
-        originalSetCornerRadius(layer, selector, observer.applied && isNotchBackground(model, observer) ? 0 : radius);
+        id modelAssociation = objc_getAssociatedObject(model, &MacIslandMaskObserverKey);
+        MacIslandNativeMaskObserver *observer =
+            [modelAssociation isKindOfClass:MacIslandNativeMaskObserver.class] ? modelAssociation : nil;
+        MacIslandOriginalSetCornerRadius(
+            layer, selector, observer.applied && MacIslandIsNotchBackground(model, observer) ? 0 : radius);
         return;
     }
-    id association = objc_getAssociatedObject(layer, &maskObserverKey);
+    id association = objc_getAssociatedObject(layer, &MacIslandMaskObserverKey);
     if ([association isKindOfClass:MacIslandNativeMaskObserver.class]) {
         MacIslandNativeMaskObserver *observer = association;
-        originalSetCornerRadius(layer, selector, radius);
+        MacIslandOriginalSetCornerRadius(layer, selector, radius);
         observer.nativeRadius = radius;
         [observer refresh];
         return;
     }
-    originalSetCornerRadius(layer, selector, radius);
+    MacIslandOriginalSetCornerRadius(layer, selector, radius);
     if (radius <= 0 || association ||
         ![NSStringFromClass(layer.class) hasPrefix:@"MBGated_"]) return;
-    objc_setAssociatedObject(layer, &maskObserverKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(layer, &MacIslandMaskObserverKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // Install before the native creation transaction commits. Deferring to
     // main leaves a newly created expansion background briefly pill-shaped.
     MacIslandNativeMaskObserver *observer = [[MacIslandNativeMaskObserver alloc] initWithLayer:layer];
-    objc_setAssociatedObject(layer, &maskObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(layer, &MacIslandMaskObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
-
-static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
 
 // Apply the half-backing-pixel sampling correction after the native scene has
 // drawn its masks and merge effects. Do not reshape individual islands.
@@ -4717,7 +4637,7 @@ static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
     if ((self = [super init])) {
         _source = layer;
         _nativeTransform = layer.sublayerTransform;
-        [layer addObserver:self forKeyPath:@"sublayerTransform" options:0 context:&sceneOriginObserverKey];
+        [layer addObserver:self forKeyPath:@"sublayerTransform" options:0 context:&MacIslandSceneOriginObserverKey];
     }
     return self;
 }
@@ -4732,7 +4652,7 @@ static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
     self.updating = NO;
 }
 - (void)observeValueForKeyPath:(NSString *)key ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
-    if (context != &sceneOriginObserverKey) {
+    if (context != &MacIslandSceneOriginObserverKey) {
         [super observeValueForKeyPath:key ofObject:object change:change context:context];
         return;
     }
@@ -4747,9 +4667,9 @@ static void (*baseSetSublayerTransform)(id, SEL, CATransform3D);
 @end
 
 static void refreshNativeBackgroundCoverage(CALayer *layer) {
-    id observer = objc_getAssociatedObject(layer, &maskObserverKey);
+    id observer = objc_getAssociatedObject(layer, &MacIslandMaskObserverKey);
     if ([observer isKindOfClass:MacIslandNativeMaskObserver.class]) [observer refresh];
-    NSArray<CALayer *> *children = copyLayerSublayers(layer);
+    NSArray<CALayer *> *children = MacIslandCopyLayerSublayers(layer);
     for (CALayer *child in children) refreshNativeBackgroundCoverage(child);
 }
 
@@ -4757,7 +4677,7 @@ static void refreshNativeSceneOrigin(NSWindow *window) {
     if (![window isKindOfClass:NSWindow.class]) return;
     CALayer *root = window.contentView.layer;
     if (!root) return;
-    MacIslandSceneOriginObserver *observer = objc_getAssociatedObject(root, &sceneOriginObserverKey);
+    MacIslandSceneOriginObserver *observer = objc_getAssociatedObject(root, &MacIslandSceneOriginObserverKey);
     NSScreen *screen = window.screen;
     BOOL eligible = window.visible && MacIslandScreenHasNotch(screen) &&
         [NSStringFromClass(root.class) hasPrefix:@"MBGated_"] &&
@@ -4768,30 +4688,28 @@ static void refreshNativeSceneOrigin(NSWindow *window) {
     if (!eligible && !observer) return;
     if (!observer) {
         observer = [[MacIslandSceneOriginObserver alloc] initWithLayer:root];
-        objc_setAssociatedObject(root, &sceneOriginObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(root, &MacIslandSceneOriginObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     CGFloat pixel = eligible ? 0.5 / MAX(screen.backingScaleFactor, 1) : 0;
     if (observer.pixel != pixel) { observer.pixel = pixel; [observer refresh]; refreshNativeBackgroundCoverage(root); }
 }
+
 static void refreshAllNativeSceneOrigins(void) {
     for (NSWindow *window in NSApp.windows) refreshNativeSceneOrigin(window);
 }
 
 static void installMaskLayerHooks(void) {
-    if (originalSetCornerRadius) return;
+    if (MacIslandOriginalSetCornerRadius) return;
     Method method = class_getInstanceMethod(CALayer.class, @selector(setCornerRadius:));
-    originalSetCornerRadius = (void *)method_getImplementation(method);
-    baseSetBounds = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setBounds:)));
-    baseSetPosition = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setPosition:)));
+    MacIslandOriginalSetCornerRadius = (void *)method_getImplementation(method);
+    MacIslandBaseSetBounds = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setBounds:)));
+    MacIslandBaseSetPosition = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setPosition:)));
     baseSetSublayerTransform = (void *)method_getImplementation(class_getInstanceMethod(CALayer.class, @selector(setSublayerTransform:)));
     Method visibility = class_getInstanceMethod(CALayer.class, @selector(setHidden:));
-    originalSetHidden = (void *)method_getImplementation(visibility);
-    Method opacityMethod = class_getInstanceMethod(CALayer.class, @selector(setOpacity:));
-    originalSetOpacity = (void *)method_getImplementation(opacityMethod);
+    MacIslandOriginalSetHidden = (void *)method_getImplementation(visibility);
     method_setImplementation(visibility, (IMP)setNativeMaterialHidden);
-    method_setImplementation(opacityMethod, (IMP)setLayerOpacity);
     method_setImplementation(method, (IMP)setCornerRadius);
-    installNativeCornerModifierHooks();
+    MacIslandInstallNativeCornerModifierHooks();
 }
 
 #ifdef MACISLAND_TESTING
@@ -4800,10 +4718,10 @@ void MacIslandInstallMaskHooksForTesting(NSArray<NSDictionary *> *layouts) {
     installMaskLayerHooks();
 }
 void MacIslandSetSceneEdgeCompensationForTesting(CALayer *root, CGFloat pixel) {
-    MacIslandSceneOriginObserver *observer = objc_getAssociatedObject(root, &sceneOriginObserverKey);
+    MacIslandSceneOriginObserver *observer = objc_getAssociatedObject(root, &MacIslandSceneOriginObserverKey);
     if (!observer) {
         observer = [[MacIslandSceneOriginObserver alloc] initWithLayer:root];
-        objc_setAssociatedObject(root, &sceneOriginObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(root, &MacIslandSceneOriginObserverKey, observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     observer.pixel = pixel;
     [observer refresh];
@@ -4815,7 +4733,7 @@ __attribute__((constructor))
 static void installNativeNotchMask(void) {
     if (!MacIslandIsMenuBarAgent()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        updateScreenGeometry();
+        MacIslandUpdateScreenGeometry();
         refreshAllNativeSceneOrigins();
         for (NSNotificationName name in @[NSWindowDidUpdateNotification, NSWindowDidResizeNotification, NSWindowDidChangeScreenNotification])
             [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue
@@ -4823,7 +4741,7 @@ static void installNativeNotchMask(void) {
         [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification
                                                        object:nil queue:NSOperationQueue.mainQueue
                                                    usingBlock:^(__unused NSNotification *notification) {
-            updateScreenGeometry();
+            MacIslandUpdateScreenGeometry();
             refreshAllNativeSceneOrigins();
             // A resolution change can keep the backing scale (so no pixel change
             // above) while moving the notch in points. Re-evaluate every mask.
@@ -4838,13 +4756,80 @@ static void installNativeNotchMask(void) {
 MACISLAND_MASK_M
 
   cat > "$SCRATCH/provider-abi.c" <<'MACISLAND_PROVIDER_ABI_C'
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <ptrauth.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/sysctl.h>
+
+#include "supported-builds.h"
 
 extern const void *swift_getGenericMetadata(
     uintptr_t request, const void *const *arguments, const void *description);
+
+static atomic_bool mi_allow_unverified = false;
+
+static bool allow_unverified_from_env(void) {
+    const char *raw = getenv("MACISLAND_ALLOW_UNVERIFIED_BUILD");
+    if (!raw) return false;
+    while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') raw++;
+    size_t len = strlen(raw);
+    while (len > 0 && (raw[len - 1] == ' ' || raw[len - 1] == '\t' ||
+                       raw[len - 1] == '\n' || raw[len - 1] == '\r')) {
+        len--;
+    }
+    return (len == 1 && raw[0] == '1') ||
+           (len == 4 && strncasecmp(raw, "true", 4) == 0) ||
+           (len == 3 && strncasecmp(raw, "yes", 3) == 0);
+}
+
+void mi_set_allow_unverified_build(int allow) {
+    atomic_store(&mi_allow_unverified, allow != 0);
+}
+
+bool mi_is_supported_build(void) {
+    if (atomic_load(&mi_allow_unverified) || allow_unverified_from_env()) return true;
+    char build[64] = {0};
+    size_t size = sizeof(build);
+    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) != 0) return false;
+    static const char *const supported[] = { MACISLAND_SUPPORTED_BUILDS_LIST };
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        if (strcmp(build, supported[i]) == 0) return true;
+    }
+    return false;
+}
+
+bool mi_is_writable_region(const void *address, size_t bytes) {
+    if (!address || bytes == 0) return false;
+    mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_address_t region = start;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &count, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    return kr == KERN_SUCCESS && (info.protection & VM_PROT_WRITE) != 0 &&
+           region <= start && (mach_vm_size_t)bytes <= size - (start - region);
+}
+
+static const uint8_t *auth_vwt(const void *metadata) {
+    const void *const *slot = ((const void *const *)metadata) - 1;
+    const void *vwt = *slot;
+#if __has_feature(ptrauth_calls)
+    // Swift SpecialPointerAuthDiscriminators::ValueWitnessTable = 0x2e3f.
+    vwt = ptrauth_auth_data(
+        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
+#endif
+    return (const uint8_t *)vwt;
+}
 
 uintptr_t move_signed(uintptr_t *from, uintptr_t *to, uint32_t disc) {
 #if __has_feature(ptrauth_calls)
@@ -4883,30 +4868,20 @@ const void *mi_get_generic_metadata(
 }
 
 size_t mi_type_layout_size(const void *metadata) {
-    const void *const *slot = ((const void *const *)metadata) - 1;
-    const void *vwt = *slot;
-#if __has_feature(ptrauth_calls)
-    // Swift SpecialPointerAuthDiscriminators::ValueWitnessTable = 0x2e3f.
-    vwt = ptrauth_auth_data(
-        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
-#endif
-    return *(const size_t *)((const uint8_t *)vwt + 0x40);
+    const uint8_t *vwt = auth_vwt(metadata);
+    return *(const size_t *)(vwt + 0x40);
 }
 
 bool mi_is_optional_some(const void *enum_addr, const void *wrapped_metadata) {
     if (!enum_addr || !wrapped_metadata) return false;
-    const void *const *slot = ((const void *const *)wrapped_metadata) - 1;
-    const void *vwt = *slot;
+    const uint8_t *vwt = auth_vwt(wrapped_metadata);
+    const void *const *fn_slot = (const void *const *)(vwt + 0x30);
 #if __has_feature(ptrauth_calls)
-    vwt = ptrauth_auth_data(
-        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
-    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x30);
     // Swift SpecialPointerAuthDiscriminators::GetEnumTagSinglePayload = 0x60f0.
     unsigned (*get_tag)(const void *, unsigned, const void *) = ptrauth_auth_and_resign(
         (void *)*fn_slot, ptrauth_key_asia, ptrauth_blend_discriminator(fn_slot, 0x60f0),
         ptrauth_key_function_pointer, 0);
 #else
-    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x30);
     unsigned (*get_tag)(const void *, unsigned, const void *) =
         (unsigned (*)(const void *, unsigned, const void *))*fn_slot;
 #endif
@@ -4925,18 +4900,14 @@ const void *mi_get_type_by_mangled_name(const char *start, size_t len) {
 
 void mi_store_optional_tag(void *enum_addr, unsigned which_case, const void *wrapped_metadata) {
     if (!enum_addr || !wrapped_metadata) return;
-    const void *const *slot = ((const void *const *)wrapped_metadata) - 1;
-    const void *vwt = *slot;
+    const uint8_t *vwt = auth_vwt(wrapped_metadata);
+    const void *const *fn_slot = (const void *const *)(vwt + 0x38);
 #if __has_feature(ptrauth_calls)
-    vwt = ptrauth_auth_data(
-        vwt, ptrauth_key_asda, ptrauth_blend_discriminator(slot, 0x2e3f));
-    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
     // Swift SpecialPointerAuthDiscriminators::StoreEnumTagSinglePayload = 0xa0d1.
     void (*store_tag)(void *, unsigned, unsigned, const void *) = ptrauth_auth_and_resign(
         (void *)*fn_slot, ptrauth_key_asia, ptrauth_blend_discriminator(fn_slot, 0xa0d1),
         ptrauth_key_function_pointer, 0);
 #else
-    const void *const *fn_slot = (const void *const *)((const uint8_t *)vwt + 0x38);
     void (*store_tag)(void *, unsigned, unsigned, const void *) =
         (void (*)(void *, unsigned, unsigned, const void *))*fn_slot;
 #endif
@@ -5041,7 +5012,17 @@ import AppKit
 import Darwin
 import SwiftUI
 
-let supportedOSBuilds: Set<String> = ["26C5035r", "26C5047e"]
+enum ProviderConstants {
+  // Space between a wing item (e.g. artwork / trailing accessory) and the camera housing.
+  static let notchClearance: CGFloat = 12
+  static let defaultExpandedArtworkWidth: CGFloat = 52
+}
+
+@_silgen_name("mi_is_supported_build") func rightBuild() -> Bool
+
+@_silgen_name("mi_is_writable_region") private func rawIsWritableRegion(
+  _ address: UnsafeRawPointer, _ bytes: Int
+) -> Bool
 
 @_silgen_name("mi_call_metadata_accessor") func callMetadataAccessor(
   _ rawFunction: UnsafeRawPointer, _ request: UInt
@@ -5092,13 +5073,6 @@ func stackChildren(_ value: Any) -> [Any]? {
   return fields.children.map(\.value)
 }
 
-func rightBuild() -> Bool {
-  var value = [CChar](repeating: 0, count: 64)
-  var size = value.count
-  return sysctlbyname("kern.osversion", &value, &size, nil, 0) == 0
-    && supportedOSBuilds.contains(String(cString: value))
-}
-
 func cutoutScreen(_ size: CGSize) -> NSScreen? {
   NSScreen.screens.first { screen in
     guard let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea,
@@ -5127,21 +5101,7 @@ func witnessTable(_ t: any View.Type) -> UnsafeMutablePointer<UInt> {
 }
 
 func isWritableRegion(_ p: UnsafeMutablePointer<UInt>, bytes: Int) -> Bool {
-  guard bytes > 0 else { return false }
-  var a = mach_vm_address_t(UInt(bitPattern: p))
-  var size: mach_vm_size_t = 0
-  var info = vm_region_basic_info_data_64_t()
-  let start = a
-  var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: info) / 4)
-  var obj = mach_port_t()
-  let result = withUnsafeMutablePointer(to: &info) { q in
-    q.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-      mach_vm_region(mach_task_self_, &a, &size, VM_REGION_BASIC_INFO_64, $0, &count, &obj)
-    }
-  }
-  if obj != 0 { mach_port_deallocate(mach_task_self_, obj) }
-  return result == KERN_SUCCESS && info.protection & VM_PROT_WRITE != 0 && a <= start
-    && start + mach_vm_address_t(bytes) <= a + size
+  rawIsWritableRegion(UnsafeRawPointer(p), bytes)
 }
 
 @_silgen_name("swift_reflectionMirror_recursiveCount") private func fieldCount(_ type: Any.Type)
@@ -5196,9 +5156,6 @@ import SwiftUI
 import os
 
 private let sessionMangle = "12NowPlayingUI0aB19ActivitySessionViewV"
-private let defaultExpandedArtworkWidth: CGFloat = 52
-// Space between the artwork (or trailing accessory) and the camera housing.
-private let notchClearance: CGFloat = 12
 
 // Apple's artwork carries its own fixed frame. The surface width is chosen
 // before the session lays out, so remember the latest required wing item width.
@@ -5442,9 +5399,10 @@ private func installSurface<T: View>(_ t: T.Type) -> Bool {
     // Like the iPhone layout, the artwork shares the timeline's leading edge:
     // each wing holds the content inset, the artwork and the notch clearance.
     let fallbackArt = max(
-      defaultExpandedArtworkWidth, cutout.screen.safeAreaInsets.top + notchClearance)
+      ProviderConstants.defaultExpandedArtworkWidth,
+      cutout.screen.safeAreaInsets.top + ProviderConstants.notchClearance)
     let art = wingContentWidth.withLock { $0 } ?? fallbackArt
-    let wing = art + notchClearance + max(pad.leading, pad.trailing)
+    let wing = art + ProviderConstants.notchClearance + max(pad.leading, pad.trailing)
     let originalTop = pad.top
     let reducedTop = min(pad.leading, 4)
     width.pointee = max(nativeWidth, size.width + 2 * wing)
@@ -5587,15 +5545,14 @@ import os
 // canonical notch (150pt per wing): 84x38pt dual controls in the left wing,
 // and 120pt of vertically centered digits/status in the right wing (matching
 // ClockAngel's native 119pt BaselineRow budget so multi-hour H:MM:SS timers fit).
-private let clockWingSpan: CGFloat = 150
+let clockWingSpan: CGFloat = 150
 private let clockOuterMargin: CGFloat = 18
 private let clockControlsWidth: CGFloat = 84
-private let clockNotchClearance: CGFloat = 12
 private let clockStopwatchInnerTrailing: CGFloat = 5
 // BaselineRow.placeSubviews selects centeredBaselineY only when topInset > 0.
 private let clockCenteredBaselineTopInset: CGFloat = 0.01
 
-private enum ClockActivityKind: Int {
+enum ClockActivityKind: Int {
   case timer = 0
   case alarm = 1
   case stopwatch = 2
@@ -5613,7 +5570,7 @@ private struct ClockPatchSpec {
 
 private let clockReadiness = OSAllocatedUnfairLock<Int32>(initialState: 0)
 private nonisolated(unsafe) var clockHandlers: [ClockBodyHandler?] = Array(repeating: nil, count: 7)
-private nonisolated(unsafe) var clockHostCutoutSizes: [CGSize?] = Array(repeating: nil, count: 3)
+nonisolated(unsafe) var clockHostCutoutSizes: [CGSize?] = Array(repeating: nil, count: 3)
 private nonisolated(unsafe) var clockInstalledSlots: [(UnsafeMutablePointer<UInt>, UInt, UInt)] = []
 
 private func makeModifiedViewType(
@@ -5688,6 +5645,30 @@ private func resolveDynamicPath(
   return (offset, current)
 }
 
+private func validateOptionalCGFloatOffset(_ offset: Int, totalSize: Int) -> Bool {
+  offset >= 0
+    && offset % MemoryLayout<CGFloat?>.alignment == 0
+    && offset + MemoryLayout<CGFloat?>.size <= totalSize
+}
+
+private func flexFrameFieldOffsets(
+  _ modType: Any.Type, modBase: Int, totalSize: Int
+) -> (minW: Int, idealW: Int, maxW: Int)? {
+  guard modType == _FlexFrameLayout.self,
+    let minField = fieldInfo(modType, "minWidth"), minField.1 == CGFloat?.self,
+    let idealField = fieldInfo(modType, "idealWidth"), idealField.1 == CGFloat?.self,
+    let maxField = fieldInfo(modType, "maxWidth"), maxField.1 == CGFloat?.self
+  else { return nil }
+  let minW = modBase + minField.0
+  let idealW = modBase + idealField.0
+  let maxW = modBase + maxField.0
+  guard validateOptionalCGFloatOffset(minW, totalSize: totalSize),
+    validateOptionalCGFloatOffset(idealW, totalSize: totalSize),
+    validateOptionalCGFloatOffset(maxW, totalSize: totalSize)
+  else { return nil }
+  return (minW, idealW, maxW)
+}
+
 private func findModifiedFlexFrameOffsets(
   _ root: Any.Type, baseOffset: Int, totalSize: Int
 ) -> (minW: Int, idealW: Int, maxW: Int)? {
@@ -5697,22 +5678,10 @@ private func findModifiedFlexFrameOffsets(
     guard let contentField = fieldInfo(current, "content"),
       let modField = fieldInfo(current, "modifier")
     else { return nil }
-    if modField.1 == _FlexFrameLayout.self {
-      let modBase = offset + modField.0
-      guard let minField = fieldInfo(modField.1, "minWidth"), minField.1 == CGFloat?.self,
-        let idealField = fieldInfo(modField.1, "idealWidth"), idealField.1 == CGFloat?.self,
-        let maxField = fieldInfo(modField.1, "maxWidth"), maxField.1 == CGFloat?.self
-      else { return nil }
-      let minW = modBase + minField.0
-      let idealW = modBase + idealField.0
-      let maxW = modBase + maxField.0
-      let optSize = MemoryLayout<CGFloat?>.size
-      let optAlign = MemoryLayout<CGFloat?>.alignment
-      guard minW >= 0, idealW >= 0, maxW >= 0,
-        minW % optAlign == 0, idealW % optAlign == 0, maxW % optAlign == 0,
-        max(minW, idealW, maxW) + optSize <= totalSize
-      else { return nil }
-      return (minW, idealW, maxW)
+    if let offsets = flexFrameFieldOffsets(
+      modField.1, modBase: offset + modField.0, totalSize: totalSize)
+    {
+      return offsets
     }
     offset += contentField.0
     current = contentField.1
@@ -5738,19 +5707,19 @@ private func findPaddingFields(
   return (edgesOff, insetsOff)
 }
 
-private struct OptionalPayloadGuard {
+struct OptionalPayloadGuard {
   let offset: Int
   let wrappedType: Any.Type
 }
 
-private struct HostFlexFrameSpec {
+struct HostFlexFrameSpec {
   let minW: Int
   let idealW: Int
   let maxW: Int
   let optionalGuards: [OptionalPayloadGuard]
 }
 
-private func findHostFlexFrameSpec(
+func findHostFlexFrameSpec(
   _ type: Any.Type, baseOffset: Int, totalSize: Int
 ) -> HostFlexFrameSpec? {
   let name = String(reflecting: type)
@@ -5758,22 +5727,11 @@ private func findHostFlexFrameSpec(
     guard let contentField = fieldInfo(type, "content"),
       let modField = fieldInfo(type, "modifier")
     else { return nil }
-    if modField.1 == _FlexFrameLayout.self {
-      let modBase = baseOffset + modField.0
-      guard let minField = fieldInfo(modField.1, "minWidth"), minField.1 == CGFloat?.self,
-        let idealField = fieldInfo(modField.1, "idealWidth"), idealField.1 == CGFloat?.self,
-        let maxField = fieldInfo(modField.1, "maxWidth"), maxField.1 == CGFloat?.self
-      else { return nil }
-      let minW = modBase + minField.0
-      let idealW = modBase + idealField.0
-      let maxW = modBase + maxField.0
-      let optSize = MemoryLayout<CGFloat?>.size
-      let optAlign = MemoryLayout<CGFloat?>.alignment
-      guard minW >= 0, idealW >= 0, maxW >= 0,
-        minW % optAlign == 0, idealW % optAlign == 0, maxW % optAlign == 0,
-        max(minW, idealW, maxW) + optSize <= totalSize
-      else { return nil }
-      return HostFlexFrameSpec(minW: minW, idealW: idealW, maxW: maxW, optionalGuards: [])
+    if let offsets = flexFrameFieldOffsets(
+      modField.1, modBase: baseOffset + modField.0, totalSize: totalSize)
+    {
+      return HostFlexFrameSpec(
+        minW: offsets.minW, idealW: offsets.idealW, maxW: offsets.maxW, optionalGuards: [])
     }
     return findHostFlexFrameSpec(
       contentField.1, baseOffset: baseOffset + contentField.0, totalSize: totalSize)
@@ -5797,14 +5755,14 @@ private func findHostFlexFrameSpec(
   return nil
 }
 
-private struct HostObstructionSpec {
+struct HostObstructionSpec {
   let integratedOptOffset: Int
   let integratedWrappedType: Any.Type
   let integratedRectOffset: Int
   let legacyRectOffset: Int
 }
 
-private func resolveHostObstructionSpec<T>(
+func resolveHostObstructionSpec<T>(
   _ hostType: T.Type, hostSize: Int
 ) -> HostObstructionSpec? {
   guard
@@ -5846,6 +5804,17 @@ private func resolveHostObstructionSpec<T>(
     legacyRectOffset: legacyField.offset)
 }
 
+private func installClockWitnessSlot<T: View>(
+  _ viewType: T.Type, index: UInt32, discriminator: UInt32, handler: @escaping ClockBodyHandler
+) -> ClockPatchSpec? {
+  let slot = witnessTable(viewType) + 6
+  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return nil }
+  let replacement = prepareWitnessBody(index, slot, discriminator)
+  guard replacement != 0 else { return nil }
+  return ClockPatchSpec(
+    index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
+}
+
 private func prepareHostPatch<T: View>(
   _ hostType: T.Type, kind: ClockActivityKind, index: UInt32, discriminator: UInt32
 ) -> ClockPatchSpec? {
@@ -5856,13 +5825,9 @@ private func prepareHostPatch<T: View>(
     let flex = findHostFlexFrameSpec(T.Body.self, baseOffset: 0, totalSize: bodySize)
   else { return nil }
 
-  let slot = witnessTable(hostType) + 6
-  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return nil }
-  let replacement = prepareWitnessBody(index, slot, discriminator)
-  guard replacement != 0 else { return nil }
-
   let optionalGuards = flex.optionalGuards
-  let handler: ClockBodyHandler = { native, out in
+  return installClockWitnessSlot(hostType, index: index, discriminator: discriminator) {
+    native, out in
     let obsRect: CGRect
     if isOptionalSome(native.advanced(by: obs.integratedOptOffset), obs.integratedWrappedType) {
       obsRect = native.load(fromByteOffset: obs.integratedRectOffset, as: CGRect.self)
@@ -5885,8 +5850,6 @@ private func prepareHostPatch<T: View>(
     out.advanced(by: flex.idealW).assumingMemoryBound(to: CGFloat?.self).pointee = targetWidth
     maxPtr.pointee = targetWidth
   }
-  return ClockPatchSpec(
-    index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
 }
 
 private func resolveCutoutGeometry(
@@ -5913,46 +5876,133 @@ private func resolveCutoutGeometry(
   return (notchMaxX, targetWidth)
 }
 
+private struct ExpandedWingOffsets {
+  let obsSizeEnv: Int
+  let obsEnv: Int
+  let pad: (edges: Int, insets: Int)
+  let spacingOff: Int
+  let spacerOff: Int
+  let tagOffset: Int?
+  let c2Type: Any.Type?
+  let c2Offset: Int
+}
+
+private func resolveExpandedWingOffsets<T: View>(
+  _ viewType: T.Type,
+  bodyPrefix: [String],
+  conditionalBranchIndex: Int?,
+  controlsTypeName: String,
+  resolveTrailingChild: Bool
+) -> ExpandedWingOffsets? {
+  let bodySize = MemoryLayout<T.Body>.size
+  guard
+    let obsSizeEnv = nestedFieldOffset(viewType, ["_obstructionSize"], Environment<CGSize>.self),
+    let obsEnv = nestedFieldOffset(viewType, ["_obstructionRect"], Environment<CGRect?>.self),
+    let outerMod = resolveDynamicPath(T.Body.self, bodyPrefix + ["modifier"]),
+    let pad = findPaddingFields(outerMod.type, baseOffset: outerMod.offset, totalSize: bodySize),
+    let spacingField = resolveDynamicPath(
+      T.Body.self, bodyPrefix + ["content", "_tree", "root", "spacing"]),
+    spacingField.type == CGFloat?.self,
+    validateOptionalCGFloatOffset(spacingField.offset, totalSize: bodySize),
+    let treeContent = resolveDynamicPath(
+      T.Body.self, bodyPrefix + ["content", "_tree", "content"])
+  else { return nil }
+
+  let tupleRootType: Any.Type
+  let tupleRootOffset: Int
+  let tagOffset: Int?
+  if let branchIndex = conditionalBranchIndex {
+    guard String(reflecting: treeContent.type).hasPrefix("SwiftUI._ConditionalContent<") else {
+      return nil
+    }
+    let branches = genericTypeArguments(treeContent.type, count: 2)
+    let condSize = typeLayoutSize(treeContent.type)
+    let payloadSize = max(typeLayoutSize(branches[0]), typeLayoutSize(branches[1]))
+    let tagOff = treeContent.offset + payloadSize
+    guard condSize == payloadSize + 1, tagOff >= 0, tagOff + 1 <= bodySize else { return nil }
+    guard let contentField = resolveDynamicPath(
+      branches[branchIndex], ["content"], baseOffset: treeContent.offset)
+    else { return nil }
+    tupleRootType = contentField.type
+    tupleRootOffset = contentField.offset
+    tagOffset = tagOff
+  } else {
+    guard let contentField = resolveDynamicPath(
+      treeContent.type, ["content"], baseOffset: treeContent.offset)
+    else { return nil }
+    tupleRootType = contentField.type
+    tupleRootOffset = contentField.offset
+    tagOffset = nil
+  }
+
+  guard
+    let c0 = resolveDynamicPath(tupleRootType, [".0"], baseOffset: tupleRootOffset),
+    String(reflecting: c0.type).contains(controlsTypeName),
+    let spacerMin = resolveDynamicPath(
+      tupleRootType, [".1", "minLength"], baseOffset: tupleRootOffset),
+    spacerMin.type == CGFloat?.self,
+    validateOptionalCGFloatOffset(spacerMin.offset, totalSize: bodySize)
+  else { return nil }
+
+  var c2Type: Any.Type?
+  var c2Offset = 0
+  if resolveTrailingChild {
+    guard let c2 = resolveDynamicPath(tupleRootType, [".2"], baseOffset: tupleRootOffset) else {
+      return nil
+    }
+    c2Type = c2.type
+    c2Offset = c2.offset
+  }
+
+  return ExpandedWingOffsets(
+    obsSizeEnv: obsSizeEnv,
+    obsEnv: obsEnv,
+    pad: pad,
+    spacingOff: spacingField.offset,
+    spacerOff: spacerMin.offset,
+    tagOffset: tagOffset,
+    c2Type: c2Type,
+    c2Offset: c2Offset)
+}
+
+private func computeExpandedWingSpacing(
+  notchMaxX: CGFloat, targetWidth: CGFloat, explicitGap: CGFloat
+) -> (minSpacer: CGFloat, rightWingWidth: CGFloat) {
+  let clearance = notchMaxX + ProviderConstants.notchClearance
+  let minSpacer = max(
+    8, clearance - (clockOuterMargin + clockControlsWidth) - 2 * explicitGap)
+  let rightWingWidth = max(0, targetWidth - clockOuterMargin - clearance)
+  return (minSpacer, rightWingWidth)
+}
+
+private func applyExpandedWingChrome(
+  _ out: UnsafeMutableRawPointer,
+  offsets: ExpandedWingOffsets,
+  trailingInset: CGFloat = clockOuterMargin,
+  minSpacer: CGFloat
+) {
+  out.advanced(by: offsets.pad.edges).assumingMemoryBound(to: Edge.Set.self).pointee = .horizontal
+  out.advanced(by: offsets.pad.insets).assumingMemoryBound(to: EdgeInsets?.self).pointee =
+    EdgeInsets(top: 0, leading: clockOuterMargin, bottom: 0, trailing: trailingInset)
+  out.advanced(by: offsets.spacerOff).assumingMemoryBound(to: CGFloat?.self).pointee = minSpacer
+}
+
 private func prepareTimerExpandedPatch<T: View>(
   _ viewType: T.Type, index: UInt32, discriminator: UInt32
 ) -> ClockPatchSpec? {
   let bodySize = MemoryLayout<T.Body>.size
   guard
-    let obsSizeEnv = nestedFieldOffset(viewType, ["_obstructionSize"], Environment<CGSize>.self),
-    let obsEnv = nestedFieldOffset(viewType, ["_obstructionRect"], Environment<CGRect?>.self),
-    let outerMod = resolveDynamicPath(T.Body.self, ["content", "modifier"]),
-    let pad = findPaddingFields(outerMod.type, baseOffset: outerMod.offset, totalSize: bodySize),
-    let spacingField = resolveDynamicPath(
-      T.Body.self, ["content", "content", "_tree", "root", "spacing"]),
-    spacingField.type == CGFloat?.self,
-    spacingField.offset >= 0,
-    spacingField.offset + MemoryLayout<CGFloat?>.size <= bodySize,
-    let condField = resolveDynamicPath(T.Body.self, ["content", "content", "_tree", "content"]),
-    String(reflecting: condField.type).hasPrefix("SwiftUI._ConditionalContent<")
+    let offsets = resolveExpandedWingOffsets(
+      viewType,
+      bodyPrefix: ["content"],
+      conditionalBranchIndex: 1,  // FalseContent (tag == 1): (Controls, Spacer, BaselineRow)
+      controlsTypeName: "ClockAngel.TimerControlsView",
+      resolveTrailingChild: true),
+    let tagOffset = offsets.tagOffset,
+    var baselineType = offsets.c2Type
   else { return nil }
 
-  let branches = genericTypeArguments(condField.type, count: 2)
-  let condSize = typeLayoutSize(condField.type)
-  let payloadSize = max(typeLayoutSize(branches[0]), typeLayoutSize(branches[1]))
-  let tagOffset = condField.offset + payloadSize
-  guard condSize == payloadSize + 1, tagOffset >= 0, tagOffset + 1 <= bodySize else { return nil }
-
-  // FalseContent (tag == 1) is the active countdown HStack tuple: (Controls, Spacer, BaselineRow).
-  let falseBranch = branches[1]
-  guard
-    let c0 = resolveDynamicPath(falseBranch, ["content", ".0"], baseOffset: condField.offset),
-    String(reflecting: c0.type).contains("ClockAngel.TimerControlsView"),
-    let spacerMin = resolveDynamicPath(
-      falseBranch, ["content", ".1", "minLength"], baseOffset: condField.offset),
-    spacerMin.type == CGFloat?.self,
-    spacerMin.offset >= 0,
-    spacerMin.offset % MemoryLayout<CGFloat?>.alignment == 0,
-    spacerMin.offset + MemoryLayout<CGFloat?>.size <= bodySize,
-    let c2 = resolveDynamicPath(falseBranch, ["content", ".2"], baseOffset: condField.offset)
-  else { return nil }
-
-  var baselineType = c2.type
-  var baselineOffset = c2.offset
+  var baselineOffset = offsets.c2Offset
   while String(reflecting: baselineType).hasPrefix("SwiftUI.ModifiedContent<") {
     guard let next = fieldInfo(baselineType, "content") else { return nil }
     baselineOffset += next.0
@@ -5976,110 +6026,56 @@ private func prepareTimerExpandedPatch<T: View>(
     max(topOff, limitOff) + MemoryLayout<CGFloat>.size <= bodySize
   else { return nil }
 
-  let slot = witnessTable(viewType) + 6
-  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return nil }
-  let replacement = prepareWitnessBody(index, slot, discriminator)
-  guard replacement != 0 else { return nil }
-
-  let spacingOff = spacingField.offset
-  let spacerOff = spacerMin.offset
-  let handler: ClockBodyHandler = { native, out in
+  return installClockWitnessSlot(viewType, index: index, discriminator: discriminator) {
+    native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .timer)
+        native, rectEnvOffset: offsets.obsEnv, sizeEnvOffset: offsets.obsSizeEnv, kind: .timer)
     else { return }
     // Keep tag == 0 (alerting/firing ViewThatFits) untouched below the notch.
     guard out.load(fromByteOffset: tagOffset, as: UInt8.self) == 1 else { return }
 
-    let targetWidth = geom.targetWidth
-    let notchMaxX = geom.notchMaxX
     let explicitGap = max(
-      0, out.advanced(by: spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
-    let minSpacer = max(
-      8,
-      (notchMaxX + clockNotchClearance) - (clockOuterMargin + clockControlsWidth)
-        - 2 * explicitGap)
-    let rightWingWidth = max(
-      0, targetWidth - clockOuterMargin - (notchMaxX + clockNotchClearance))
+      0, out.advanced(by: offsets.spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
+    let wing = computeExpandedWingSpacing(
+      notchMaxX: geom.notchMaxX, targetWidth: geom.targetWidth, explicitGap: explicitGap)
 
-    out.advanced(by: pad.edges).assumingMemoryBound(to: Edge.Set.self).pointee = .horizontal
-    out.advanced(by: pad.insets).assumingMemoryBound(to: EdgeInsets?.self).pointee = EdgeInsets(
-      top: 0, leading: clockOuterMargin, bottom: 0, trailing: clockOuterMargin)
-    out.advanced(by: spacerOff).assumingMemoryBound(to: CGFloat?.self).pointee = minSpacer
+    applyExpandedWingChrome(out, offsets: offsets, minSpacer: wing.minSpacer)
     out.advanced(by: topOff).assumingMemoryBound(to: CGFloat.self).pointee =
       clockCenteredBaselineTopInset
-    out.advanced(by: limitOff).assumingMemoryBound(to: CGFloat.self).pointee = rightWingWidth
+    out.advanced(by: limitOff).assumingMemoryBound(to: CGFloat.self).pointee = wing.rightWingWidth
   }
-  return ClockPatchSpec(
-    index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
 }
 
 private func prepareAlarmExpandedPatch<T: View>(
   _ viewType: T.Type, index: UInt32, discriminator: UInt32
 ) -> ClockPatchSpec? {
-  let bodySize = MemoryLayout<T.Body>.size
   guard
-    let obsSizeEnv = nestedFieldOffset(viewType, ["_obstructionSize"], Environment<CGSize>.self),
-    let obsEnv = nestedFieldOffset(viewType, ["_obstructionRect"], Environment<CGRect?>.self),
-    let outerMod = resolveDynamicPath(T.Body.self, ["modifier"]),
-    let pad = findPaddingFields(outerMod.type, baseOffset: outerMod.offset, totalSize: bodySize),
-    let spacingField = resolveDynamicPath(T.Body.self, ["content", "_tree", "root", "spacing"]),
-    spacingField.type == CGFloat?.self,
-    spacingField.offset >= 0,
-    spacingField.offset + MemoryLayout<CGFloat?>.size <= bodySize,
-    let condField = resolveDynamicPath(T.Body.self, ["content", "_tree", "content"]),
-    String(reflecting: condField.type).hasPrefix("SwiftUI._ConditionalContent<")
+    let offsets = resolveExpandedWingOffsets(
+      viewType,
+      bodyPrefix: [],
+      conditionalBranchIndex: 0,  // TrueContent (tag == 0): (AlarmControlsView, Spacer, VStack)
+      controlsTypeName: "ClockAngel.AlarmControlsView",
+      resolveTrailingChild: false),
+    let tagOffset = offsets.tagOffset
   else { return nil }
 
-  let branches = genericTypeArguments(condField.type, count: 2)
-  let condSize = typeLayoutSize(condField.type)
-  let payloadSize = max(typeLayoutSize(branches[0]), typeLayoutSize(branches[1]))
-  let tagOffset = condField.offset + payloadSize
-  guard condSize == payloadSize + 1, tagOffset >= 0, tagOffset + 1 <= bodySize else { return nil }
-
-  // TrueContent (tag == 0) is the snoozed/countdown wing layout: (AlarmControlsView, Spacer, VStack).
-  let trueBranch = branches[0]
-  guard
-    let c0 = resolveDynamicPath(trueBranch, ["content", ".0"], baseOffset: condField.offset),
-    String(reflecting: c0.type).contains("ClockAngel.AlarmControlsView"),
-    let spacerMin = resolveDynamicPath(
-      trueBranch, ["content", ".1", "minLength"], baseOffset: condField.offset),
-    spacerMin.type == CGFloat?.self,
-    spacerMin.offset >= 0,
-    spacerMin.offset % MemoryLayout<CGFloat?>.alignment == 0,
-    spacerMin.offset + MemoryLayout<CGFloat?>.size <= bodySize
-  else { return nil }
-
-  let slot = witnessTable(viewType) + 6
-  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return nil }
-  let replacement = prepareWitnessBody(index, slot, discriminator)
-  guard replacement != 0 else { return nil }
-
-  let spacingOff = spacingField.offset
-  let spacerOff = spacerMin.offset
-  let handler: ClockBodyHandler = { native, out in
+  return installClockWitnessSlot(viewType, index: index, discriminator: discriminator) {
+    native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .alarm)
+        native, rectEnvOffset: offsets.obsEnv, sizeEnvOffset: offsets.obsSizeEnv, kind: .alarm)
     else { return }
     // Keep tag == 1 (firing/ringing alarm) untouched.
     guard out.load(fromByteOffset: tagOffset, as: UInt8.self) == 0 else { return }
 
-    let notchMaxX = geom.notchMaxX
     let explicitGap = max(
-      0, out.advanced(by: spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
-    let minSpacer = max(
-      8,
-      (notchMaxX + clockNotchClearance) - (clockOuterMargin + clockControlsWidth)
-        - 2 * explicitGap)
+      0, out.advanced(by: offsets.spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
+    let wing = computeExpandedWingSpacing(
+      notchMaxX: geom.notchMaxX, targetWidth: geom.targetWidth, explicitGap: explicitGap)
 
-    out.advanced(by: pad.edges).assumingMemoryBound(to: Edge.Set.self).pointee = .horizontal
-    out.advanced(by: pad.insets).assumingMemoryBound(to: EdgeInsets?.self).pointee = EdgeInsets(
-      top: 0, leading: clockOuterMargin, bottom: 0, trailing: clockOuterMargin)
-    out.advanced(by: spacerOff).assumingMemoryBound(to: CGFloat?.self).pointee = minSpacer
+    applyExpandedWingChrome(out, offsets: offsets, minSpacer: wing.minSpacer)
   }
-  return ClockPatchSpec(
-    index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
 }
 
 private func prepareStopwatchExpandedPatch<T: View>(
@@ -6087,68 +6083,39 @@ private func prepareStopwatchExpandedPatch<T: View>(
 ) -> ClockPatchSpec? {
   let bodySize = MemoryLayout<T.Body>.size
   guard
-    let obsSizeEnv = nestedFieldOffset(viewType, ["_obstructionSize"], Environment<CGSize>.self),
-    let obsEnv = nestedFieldOffset(viewType, ["_obstructionRect"], Environment<CGRect?>.self),
-    let outerMod = resolveDynamicPath(T.Body.self, ["content", "modifier"]),
-    let pad = findPaddingFields(outerMod.type, baseOffset: outerMod.offset, totalSize: bodySize),
-    let spacingField = resolveDynamicPath(
-      T.Body.self, ["content", "content", "_tree", "root", "spacing"]),
-    spacingField.type == CGFloat?.self,
-    spacingField.offset >= 0,
-    spacingField.offset + MemoryLayout<CGFloat?>.size <= bodySize,
-    let tupleRoot = resolveDynamicPath(
-      T.Body.self, ["content", "content", "_tree", "content", "content"]),
-    let c0 = resolveDynamicPath(tupleRoot.type, [".0"], baseOffset: tupleRoot.offset),
-    String(reflecting: c0.type).contains("ClockAngel.StopwatchControlsView"),
-    let spacerMin = resolveDynamicPath(
-      tupleRoot.type, [".1", "minLength"], baseOffset: tupleRoot.offset),
-    spacerMin.type == CGFloat?.self,
-    spacerMin.offset >= 0,
-    spacerMin.offset % MemoryLayout<CGFloat?>.alignment == 0,
-    spacerMin.offset + MemoryLayout<CGFloat?>.size <= bodySize,
-    let c2 = resolveDynamicPath(tupleRoot.type, [".2"], baseOffset: tupleRoot.offset),
+    let offsets = resolveExpandedWingOffsets(
+      viewType,
+      bodyPrefix: ["content"],
+      conditionalBranchIndex: nil,
+      controlsTypeName: "ClockAngel.StopwatchControlsView",
+      resolveTrailingChild: true),
+    let c2Type = offsets.c2Type,
     let rightFlex = findModifiedFlexFrameOffsets(
-      c2.type, baseOffset: c2.offset, totalSize: bodySize)
+      c2Type, baseOffset: offsets.c2Offset, totalSize: bodySize)
   else { return nil }
 
-  let slot = witnessTable(viewType) + 6
-  guard isWritableRegion(slot, bytes: MemoryLayout<UInt>.size) else { return nil }
-  let replacement = prepareWitnessBody(index, slot, discriminator)
-  guard replacement != 0 else { return nil }
-
-  let spacingOff = spacingField.offset
-  let spacerOff = spacerMin.offset
   let rightMaxWOff = rightFlex.maxW
   let outerTrailing = max(0, clockOuterMargin - clockStopwatchInnerTrailing)
-  let handler: ClockBodyHandler = { native, out in
+  return installClockWitnessSlot(viewType, index: index, discriminator: discriminator) {
+    native, out in
     guard
       let geom = resolveCutoutGeometry(
-        native, rectEnvOffset: obsEnv, sizeEnvOffset: obsSizeEnv, kind: .stopwatch)
+        native, rectEnvOffset: offsets.obsEnv, sizeEnvOffset: offsets.obsSizeEnv, kind: .stopwatch)
     else { return }
 
-    let targetWidth = geom.targetWidth
-    let notchMaxX = geom.notchMaxX
     let explicitGap = max(
-      0, out.advanced(by: spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
-    let minSpacer = max(
-      8,
-      (notchMaxX + clockNotchClearance) - (clockOuterMargin + clockControlsWidth)
-        - 2 * explicitGap)
-    let rightWingWidth = max(
-      0, targetWidth - clockOuterMargin - (notchMaxX + clockNotchClearance))
+      0, out.advanced(by: offsets.spacingOff).assumingMemoryBound(to: CGFloat?.self).pointee ?? 0)
+    let wing = computeExpandedWingSpacing(
+      notchMaxX: geom.notchMaxX, targetWidth: geom.targetWidth, explicitGap: explicitGap)
 
-    out.advanced(by: pad.edges).assumingMemoryBound(to: Edge.Set.self).pointee = .horizontal
-    out.advanced(by: pad.insets).assumingMemoryBound(to: EdgeInsets?.self).pointee = EdgeInsets(
-      top: 0, leading: clockOuterMargin, bottom: 0, trailing: outerTrailing)
-    out.advanced(by: spacerOff).assumingMemoryBound(to: CGFloat?.self).pointee = minSpacer
+    applyExpandedWingChrome(
+      out, offsets: offsets, trailingInset: outerTrailing, minSpacer: wing.minSpacer)
     let maxWPtr = out.advanced(by: rightMaxWOff).assumingMemoryBound(to: CGFloat?.self)
-    maxWPtr.pointee = max(maxWPtr.pointee ?? 0, rightWingWidth)
+    maxWPtr.pointee = max(maxWPtr.pointee ?? 0, wing.rightWingWidth)
   }
-  return ClockPatchSpec(
-    index: index, slot: slot, original: slot.pointee, replacement: replacement, handler: handler)
 }
 
-private struct ClockResolvedTypes {
+struct ClockResolvedTypes {
   let timerView: any View.Type
   let alarmView: any View.Type
   let stopwatchView: any View.Type
@@ -6157,7 +6124,7 @@ private struct ClockResolvedTypes {
   let stopwatchHost: any View.Type
 }
 
-private func resolveClockTypes() -> (types: ClockResolvedTypes?, errorCode: Int32) {
+func resolveClockTypes() -> (types: ClockResolvedTypes?, errorCode: Int32) {
   guard
     let timerMinimal = _typeByName("10ClockAngel16TimerMinimalViewV") as? any View.Type,
     let timerCompactL = _typeByName("10ClockAngel23TimerCompactLeadingViewV") as? any View.Type,
@@ -6246,7 +6213,7 @@ private func resolveClockTypes() -> (types: ClockResolvedTypes?, errorCode: Int3
   )
 }
 
-private func installAllClockPatches() -> Int32 {
+func installAllClockPatches() -> Int32 {
   if !clockInstalledSlots.isEmpty { return 1 }
   let resolved = resolveClockTypes()
   guard let types = resolved.types else { return resolved.errorCode }
@@ -6255,38 +6222,42 @@ private func installAllClockPatches() -> Int32 {
 
   let discriminator = req.load(as: UInt32.self) >> 16
 
-  func buildHost(_ v: any View.Type, _ kind: ClockActivityKind, _ idx: UInt32) -> ClockPatchSpec? {
-    func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
-      prepareHostPatch(t, kind: kind, index: idx, discriminator: discriminator)
-    }
-    return open(v)
+  func openView(_ viewType: any View.Type, _ build: (any View.Type) -> ClockPatchSpec?) -> ClockPatchSpec? {
+    build(viewType)
   }
-  func buildTimer(_ v: any View.Type, _ idx: UInt32) -> ClockPatchSpec? {
-    func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
-      prepareTimerExpandedPatch(t, index: idx, discriminator: discriminator)
+  func hostBuilder(_ kind: ClockActivityKind, _ idx: UInt32) -> (any View.Type) -> ClockPatchSpec? {
+    { viewType in
+      func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
+        prepareHostPatch(t, kind: kind, index: idx, discriminator: discriminator)
+      }
+      return open(viewType)
     }
-    return open(v)
   }
-  func buildAlarm(_ v: any View.Type, _ idx: UInt32) -> ClockPatchSpec? {
-    func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
-      prepareAlarmExpandedPatch(t, index: idx, discriminator: discriminator)
+  func expandedBuilder(
+    _ kind: ClockActivityKind, _ idx: UInt32
+  ) -> (any View.Type) -> ClockPatchSpec? {
+    { viewType in
+      func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
+        switch kind {
+        case .timer:
+          return prepareTimerExpandedPatch(t, index: idx, discriminator: discriminator)
+        case .alarm:
+          return prepareAlarmExpandedPatch(t, index: idx, discriminator: discriminator)
+        case .stopwatch:
+          return prepareStopwatchExpandedPatch(t, index: idx, discriminator: discriminator)
+        }
+      }
+      return open(viewType)
     }
-    return open(v)
-  }
-  func buildStopwatch(_ v: any View.Type, _ idx: UInt32) -> ClockPatchSpec? {
-    func open<V: View>(_ t: V.Type) -> ClockPatchSpec? {
-      prepareStopwatchExpandedPatch(t, index: idx, discriminator: discriminator)
-    }
-    return open(v)
   }
 
   guard
-    let p1 = buildHost(types.timerHost, .timer, 1),
-    let p2 = buildHost(types.alarmHost, .alarm, 2),
-    let p3 = buildHost(types.stopwatchHost, .stopwatch, 3),
-    let p4 = buildTimer(types.timerView, 4),
-    let p5 = buildAlarm(types.alarmView, 5),
-    let p6 = buildStopwatch(types.stopwatchView, 6)
+    let p1 = openView(types.timerHost, hostBuilder(.timer, 1)),
+    let p2 = openView(types.alarmHost, hostBuilder(.alarm, 2)),
+    let p3 = openView(types.stopwatchHost, hostBuilder(.stopwatch, 3)),
+    let p4 = openView(types.timerView, expandedBuilder(.timer, 4)),
+    let p5 = openView(types.alarmView, expandedBuilder(.alarm, 5)),
+    let p6 = openView(types.stopwatchView, expandedBuilder(.stopwatch, 6))
   else { return -4 }
 
   let specs = [p1, p2, p3, p4, p5, p6]
@@ -6319,188 +6290,19 @@ private func installAllClockPatches() -> Int32 {
   guard index >= 1, Int(index) < clockHandlers.count else { return }
   clockHandlers[Int(index)]?(native, out)
 }
-
-#if MACISLAND_TESTING
-@_silgen_name("mi_store_optional_tag") private func rawStoreOptionalTag(
-  _ enumAddr: UnsafeMutableRawPointer, _ whichCase: UInt32, _ wrappedMetadata: UnsafeRawPointer
-)
-
-@_silgen_name("mi_get_type_by_mangled_name") private func rawGetTypeByMangledName(
-  _ start: UnsafePointer<UInt8>, _ length: Int
-) -> UnsafeRawPointer?
-
-private func clockBinaryHostSpecializations() -> [String: Any.Type] {
-  var hosts: [String: Any.Type] = [:]
-  for imageIndex in 0..<_dyld_image_count() {
-    guard let imageName = _dyld_get_image_name(imageIndex),
-      String(cString: imageName).hasSuffix("/ClockAngel"),
-      let header = _dyld_get_image_header(imageIndex)
-    else { continue }
-    let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
-    var constSize: UInt = 0
-    var typerefSize: UInt = 0
-    guard
-      let constSec = getsectiondata(header64, "__TEXT", "__const", &constSize),
-      let typerefSec = getsectiondata(header64, "__TEXT", "__swift5_typeref", &typerefSize)
-    else { break }
-    let constBase = Int(bitPattern: constSec)
-    let typerefStart = Int(bitPattern: typerefSec)
-    let typerefEnd = typerefStart + Int(typerefSize)
-    var off = 0
-    while off + 8 <= Int(constSize) {
-      let entry = UnsafeRawPointer(constSec).advanced(by: off)
-      let rel = Int(entry.load(as: Int32.self))
-      let rawLen = Int(entry.advanced(by: 4).load(as: Int32.self))
-      let length = abs(rawLen)
-      let target = constBase + off + rel
-      if length > 6, length < 512, target >= typerefStart, target + length < typerefEnd,
-        let ptr = UnsafePointer<UInt8>(bitPattern: target),
-        ptr[length] == 0,
-        (ptr[0] == 0x01 || ptr[0] == 0x02),
-        ptr[5] == 0x79,
-        ptr[length - 1] == 0x47,
-        let meta = rawGetTypeByMangledName(ptr, length)
-      {
-        let resolved = unsafeBitCast(meta, to: Any.Type.self)
-        let reflected = String(reflecting: resolved)
-        for prefix in [
-          "ClockAngel.TimerHost<", "ClockAngel.AlarmHost<", "ClockAngel.StopwatchHost<",
-        ] where reflected.hasPrefix(prefix) {
-          hosts[prefix] = resolved
-        }
-      }
-      off += 4
-    }
-    break
-  }
-  return hosts
-}
-
-@_cdecl("mi_clock_self_test") public func clockSelfTest() -> Int32 {
-  guard installAllClockPatches() == 1, installAllClockPatches() == 1 else { return -10 }
-  guard let types = resolveClockTypes().types else { return -11 }
-
-  let binaryHosts = clockBinaryHostSpecializations()
-  guard
-    let binTimer = binaryHosts["ClockAngel.TimerHost<"],
-    let binAlarm = binaryHosts["ClockAngel.AlarmHost<"],
-    let binStopwatch = binaryHosts["ClockAngel.StopwatchHost<"],
-    binTimer == (types.timerHost as Any.Type),
-    binAlarm == (types.alarmHost as Any.Type),
-    binStopwatch == (types.stopwatchHost as Any.Type)
-  else { return -12 }
-
-  guard
-    let notched = NSScreen.screens.first(where: {
-      $0.auxiliaryTopLeftArea != nil && $0.auxiliaryTopRightArea != nil && $0.safeAreaInsets.top > 0
-    }),
-    let left = notched.auxiliaryTopLeftArea,
-    let right = notched.auxiliaryTopRightArea
-  else {
-    // Non-notched machine: patch installation succeeded; skip screen-dependent assertion.
-    return 1
-  }
-  let canonicalSize = CGSize(
-    width: (right.minX - left.maxX) + 2, height: notched.safeAreaInsets.top + 2)
-
-  func verifyHost(_ viewType: any View.Type, index: UInt32, kind: ClockActivityKind) -> Int32 {
-    func open<H: View>(_: H.Type) -> Int32 {
-      let hostSize = MemoryLayout<H>.size
-      let bodySize = MemoryLayout<H.Body>.size
-      guard
-        let obs = resolveHostObstructionSpec(H.self, hostSize: hostSize),
-        let flex = findHostFlexFrameSpec(H.Body.self, baseOffset: 0, totalSize: bodySize)
-      else { return -13 }
-
-      let nativeBuf = UnsafeMutableRawPointer.allocate(
-        byteCount: max(hostSize, 16), alignment: 16)
-      let outBuf = UnsafeMutableRawPointer.allocate(
-        byteCount: max(bodySize, 16), alignment: 16)
-      defer {
-        nativeBuf.deallocate()
-        outBuf.deallocate()
-      }
-      nativeBuf.initializeMemory(as: UInt8.self, repeating: 0, count: max(hostSize, 16))
-      // Non-zero fill ensures pointer/reference extra inhabitants inside H.Body (e.g. LazyState.Storage)
-      // do not encode Optional.none before the target _FlexFrameLayout fields are initialized.
-      outBuf.initializeMemory(as: UInt8.self, repeating: 1, count: max(bodySize, 16))
-
-      // Mark any Optional payloads in H.Body as .some, and initialize stock maxWidth = 260.
-      for optGuard in flex.optionalGuards {
-        rawStoreOptionalTag(
-          outBuf.advanced(by: optGuard.offset), 0,
-          unsafeBitCast(optGuard.wrappedType, to: UnsafeRawPointer.self))
-      }
-      outBuf.advanced(by: flex.minW).assumingMemoryBound(to: CGFloat?.self).initialize(to: nil)
-      outBuf.advanced(by: flex.idealW).assumingMemoryBound(to: CGFloat?.self).initialize(to: nil)
-      outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self).initialize(to: 260.0)
-
-      // 1. Element scene state: legacy obstructionRect == .zero, integrated obstruction == .some(canonicalSize).
-      nativeBuf.storeBytes(of: CGRect.zero, toByteOffset: obs.legacyRectOffset, as: CGRect.self)
-      nativeBuf.storeBytes(
-        of: CGRect(origin: CGPoint(x: 81, y: 0), size: canonicalSize),
-        toByteOffset: obs.integratedRectOffset, as: CGRect.self)
-      rawStoreOptionalTag(
-        nativeBuf.advanced(by: obs.integratedOptOffset), 0,
-        unsafeBitCast(obs.integratedWrappedType, to: UnsafeRawPointer.self))
-
-      adjustClockBody(index, UnsafeRawPointer(nativeBuf), outBuf)
-
-      let expectedWidth = canonicalSize.width + 2 * clockWingSpan
-      guard
-        let patchedMin = outBuf.advanced(by: flex.minW).assumingMemoryBound(to: CGFloat?.self)
-          .pointee,
-        let patchedIdeal = outBuf.advanced(by: flex.idealW).assumingMemoryBound(to: CGFloat?.self)
-          .pointee,
-        let patchedMax = outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self)
-          .pointee,
-        abs(patchedMin - expectedWidth) < 0.001,
-        abs(patchedIdeal - expectedWidth) < 0.001,
-        abs(patchedMax - expectedWidth) < 0.001,
-        clockHostCutoutSizes[kind.rawValue] == canonicalSize
-      else { return -14 }
-
-      // 2. Non-notched / detached state: integrated obstruction == .none, legacy == .zero -> stays 260pt and clears cache.
-      outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self).pointee = 260.0
-      rawStoreOptionalTag(
-        nativeBuf.advanced(by: obs.integratedOptOffset), 1,
-        unsafeBitCast(obs.integratedWrappedType, to: UnsafeRawPointer.self))
-      adjustClockBody(index, UnsafeRawPointer(nativeBuf), outBuf)
-      guard
-        let untouchedMax = outBuf.advanced(by: flex.maxW).assumingMemoryBound(to: CGFloat?.self)
-          .pointee,
-        abs(untouchedMax - 260.0) < 0.001,
-        clockHostCutoutSizes[kind.rawValue] == nil
-      else { return -15 }
-
-      return 2
-    }
-    return open(viewType)
-  }
-
-  for (host, idx, kind) in [
-    (types.timerHost, UInt32(1), ClockActivityKind.timer),
-    (types.alarmHost, UInt32(2), ClockActivityKind.alarm),
-    (types.stopwatchHost, UInt32(3), ClockActivityKind.stopwatch),
-  ] {
-    let rc = verifyHost(host, index: idx, kind: kind)
-    if rc != 2 { return rc }
-  }
-  return 2
-}
-#endif
 MACISLAND_CLOCK_SWIFT
 
   cat > "$SCRATCH/spotlight.m" <<'MACISLAND_SPOTLIGHT_M'
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
-#import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <ptrauth.h>
 #import <stdatomic.h>
+#import <stdbool.h>
+#import <stddef.h>
 #import <stdint.h>
-#import <string.h>
-#import <sys/sysctl.h>
+
+extern bool mi_is_supported_build(void);
+extern bool mi_is_writable_region(const void *address, size_t bytes);
 
 // Spotlight's island is gated per device, not per display. On hardware Apple
 // ships with a CenterHUD aperture, CampoDeviceSupportsCenterHUD() is true and
@@ -6523,19 +6325,6 @@ static uintptr_t adrpPage(uint32_t insn, uintptr_t pc) {
     return (pc & ~(uintptr_t)0xfff) + (uintptr_t)offset;
 }
 
-static bool isWritableByte(uintptr_t address) {
-    mach_vm_address_t region = address;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &count, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    return kr == KERN_SUCCESS && (info.protection & VM_PROT_WRITE) != 0 &&
-           region <= address && address + 1 <= region + size;
-}
-
 int mi_spotlight_patch(void) {
     void *symbol = dlsym(RTLD_DEFAULT, "CampoDeviceSupportsCenterHUD");
     if (!symbol) return -2;
@@ -6552,7 +6341,7 @@ int mi_spotlight_patch(void) {
         code[6] != 0xd65f03c0)                       // ret
         return -3;
     uintptr_t address = adrpPage(code[4], pc + 16) + ((code[5] >> 10) & 0xfff);
-    if (!isWritableByte(address)) return -6;
+    if (!mi_is_writable_region((const void *)address, 1)) return -6;
     volatile uint8_t *cached = (volatile uint8_t *)address;
     if (*cached != (uint8_t)original) return -4;
     *cached = 1;
@@ -6560,9 +6349,7 @@ int mi_spotlight_patch(void) {
 }
 
 int mi_spotlight_enable(void) {
-    char build[64] = {0};
-    size_t size = sizeof(build);
-    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || (strcmp(build, "26C5035r") && strcmp(build, "26C5047e")) ||
+    if (!mi_is_supported_build() ||
         ![NSBundle.mainBundle.executablePath isEqualToString:@"/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"])
         return -1;
     atomic_store(&state, mi_spotlight_patch());
@@ -6575,16 +6362,18 @@ MACISLAND_SPOTLIGHT_M
   echo "Building native notch patch from embedded source..."
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -dynamiclib -fobjc-arc -Wall -Wextra -Werror \
     -I"$SCRATCH" \
-    -o "$SCRATCH/island.dylib" "$SCRATCH/island.c" "$SCRATCH/notch.m" \
-    "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" "$SCRATCH/mask.m" \
+    -o "$SCRATCH/island.dylib" \
+    "$SCRATCH/island.c" "$SCRATCH/notch.m" "$SCRATCH/scene-audit.m" \
+    "$SCRATCH/activity-metrics.m" "$SCRATCH/safearea.m" "$SCRATCH/short-host.m" \
+    "$SCRATCH/mask-geometry.m" "$SCRATCH/mask-modifiers.m" "$SCRATCH/mask.m" \
     -framework AppKit -framework QuartzCore -F/System/Library/PrivateFrameworks \
     -framework CoreUtils -undefined dynamic_lookup
   /usr/bin/codesign -f -s - "$SCRATCH/island.dylib"
   /usr/bin/codesign --verify --strict "$SCRATCH/island.dylib"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -fobjc-arc -Wall -Wextra -Werror \
-    -c "$SCRATCH/spotlight.m" -o "$SCRATCH/spotlight.o"
+    -I"$SCRATCH" -c "$SCRATCH/spotlight.m" -o "$SCRATCH/spotlight.o"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 -Wall -Wextra -Werror \
-    -c "$SCRATCH/provider-abi.c" -o "$SCRATCH/provider-abi.o"
+    -I"$SCRATCH" -c "$SCRATCH/provider-abi.c" -o "$SCRATCH/provider-abi.o"
   /usr/bin/xcrun clang -target arm64e-apple-macos27.2 \
     -c "$SCRATCH/provider-body.S" -o "$SCRATCH/provider-body.o"
   /usr/bin/xcrun swiftc -target arm64e-apple-macos27.2 -module-name MacIslandMusic \

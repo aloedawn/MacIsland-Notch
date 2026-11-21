@@ -8,13 +8,14 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from helpers import SUPPORTED_BUILDS, current_build, macosx_sdk_path, write_supported_builds_header
+
 ROOT = HERE.parent
-MODULAR_SPOTLIGHT = ROOT / "src/providers/spotlight.m"
-
-
-def current_build():
-    return subprocess.run(["/usr/sbin/sysctl", "-n", "kern.osversion"],
-                          capture_output=True, text=True).stdout.strip()
+PROVIDERS = ROOT / "src/providers"
+MODULAR_SPOTLIGHT = PROVIDERS / "spotlight.m"
 
 
 class SpotlightSourceParityTests(unittest.TestCase):
@@ -24,18 +25,28 @@ class SpotlightSourceParityTests(unittest.TestCase):
         self.assertEqual(MODULAR_SPOTLIGHT.read_text(encoding="utf-8").rstrip("\n"), embedded.rstrip("\n"))
 
 
-@unittest.skipUnless(sys.platform == "darwin" and platform.machine() == "arm64"
-                     and current_build() in ("26C5035r", "26C5047e"), "requires macOS 27.3 beta 26C5035r or 26C5047e")
+@unittest.skipUnless(
+    sys.platform == "darwin" and platform.machine() == "arm64"
+    and current_build() in SUPPORTED_BUILDS,
+    f"requires macOS 27.3 beta {' or '.join(SUPPORTED_BUILDS)}",
+)
 class SpotlightSupportTests(unittest.TestCase):
     def test_patch_selects_the_hardware_cutout_path_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp:
-            executable = Path(temp) / "test-support"
+            tmp = Path(temp)
+            write_supported_builds_header(tmp)
+            sdk = macosx_sdk_path()
+            executable = tmp / "test-support"
             subprocess.run(
                 [
                     "/usr/bin/xcrun", "clang", "-target", "arm64e-apple-macos27.2",
                     "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
-                    "-I", str(MODULAR_SPOTLIGHT.parent),
+                    "-I", str(tmp),
+                    "-I", str(PROVIDERS),
+                    "-L", f"{sdk}/usr/lib/swift",
+                    "-lswiftCore",
                     "-framework", "Foundation",
+                    str(PROVIDERS / "provider-abi.c"),
                     str(HERE / "spotlight-support.m"),
                     "-o", str(executable),
                 ],

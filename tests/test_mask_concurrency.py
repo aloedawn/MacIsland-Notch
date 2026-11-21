@@ -23,6 +23,8 @@ class MaskConcurrencyTests(unittest.TestCase):
                     "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
                     "-DMACISLAND_TESTING",
                     "-I", str(ISLAND_DIR),
+                    str(ISLAND_DIR / "mask-geometry.m"),
+                    str(ISLAND_DIR / "mask-modifiers.m"),
                     str(ISLAND_DIR / "mask.m"),
                     str(HERE / "mask-concurrency-probe.m"),
                     "-framework", "AppKit",

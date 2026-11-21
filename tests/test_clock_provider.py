@@ -8,29 +8,27 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from helpers import SUPPORTED_BUILDS, current_build, write_supported_builds_header
+
 ROOT = HERE.parent
 PROVIDERS = ROOT / "src/providers"
 CLOCK_EXE = "/System/Library/CoreServices/ClockAngel.app/Contents/MacOS/ClockAngel"
 
 
-def current_build():
-    return subprocess.run(
-        ["/usr/sbin/sysctl", "-n", "kern.osversion"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
 @unittest.skipUnless(
     sys.platform == "darwin"
     and platform.machine() == "arm64"
-    and current_build() in ("26C5035r", "26C5047e"),
-    "requires macOS 27.3 beta 26C5035r or 26C5047e",
+    and current_build() in SUPPORTED_BUILDS,
+    f"requires macOS 27.3 beta {' or '.join(SUPPORTED_BUILDS)}",
 )
 class ClockProviderTests(unittest.TestCase):
     def test_clock_host_widens_from_integrated_obstruction_v1_when_legacy_rect_is_zero(self):
         with tempfile.TemporaryDirectory() as temp:
             tmp = Path(temp)
+            write_supported_builds_header(tmp)
             abi_o = tmp / "provider-abi.o"
             body_o = tmp / "provider-body.o"
             dylib = tmp / "clock-test.dylib"
@@ -41,6 +39,7 @@ class ClockProviderTests(unittest.TestCase):
                 [
                     "/usr/bin/xcrun", "clang", "-target", "arm64e-apple-macos27.2",
                     "-Wall", "-Wextra", "-Werror", "-DMACISLAND_TESTING",
+                    "-I", str(tmp),
                     "-c", str(PROVIDERS / "provider-abi.c"), "-o", str(abi_o),
                 ],
                 check=True,
@@ -62,6 +61,7 @@ class ClockProviderTests(unittest.TestCase):
                     str(PROVIDERS / "music.swift"),
                     str(PROVIDERS / "music-layout.swift"),
                     str(PROVIDERS / "clock.swift"),
+                    str(HERE / "clock-self-test.swift"),
                     str(abi_o), str(body_o),
                     "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup",
                     "-o", str(dylib),

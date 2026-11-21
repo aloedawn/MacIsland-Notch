@@ -170,6 +170,44 @@ int main(void) {
             return 3;
         }
 
+        // Verify restored stock two-activity animation behavior:
+        // 1. Secondary merge input and its fallback keep Apple's native opacity/visibility inside merge radius.
+        secLeaf.position = CGPointMake(1008, 19);
+        fallbackLeaf.position = secLeaf.position;
+        fallbackLeaf.hidden = YES;
+        [CATransaction flush];
+        if (secLeaf.opacity != 1.0f || !fallbackLeaf.hidden) {
+            fprintf(stderr, "secondary circle was altered during merge (opacity=%f fallbackHidden=%d)\n",
+                    secLeaf.opacity, fallbackLeaf.hidden);
+            CGColorRelease(black);
+            return 6;
+        }
+
+        // 2. Hardened contour peer hold keeps crisp outer shoulder visible while blur is active,
+        //    and releases back to Apple's requested hidden state once merge blur clears.
+        peer.hidden = YES;
+        [CATransaction flush];
+        if (peer.hidden) {
+            fprintf(stderr, "contour peer was not held visible during active merge blur\n");
+            CGColorRelease(black);
+            return 7;
+        }
+        if (blur) {
+            [blur setValue:@(0.0) forKey:@"inputRadius"];
+            [CATransaction flush];
+            if (!peer.hidden) {
+                fprintf(stderr, "contour peer did not restore native hidden state after blur cleared\n");
+                CGColorRelease(black);
+                return 8;
+            }
+            [blur setValue:@(6.6667) forKey:@"inputRadius"];
+        }
+        peer.hidden = NO;
+        fallbackLeaf.hidden = NO;
+        secLeaf.position = CGPointMake(1032, 19);
+        fallbackLeaf.position = secLeaf.position;
+        [CATransaction flush];
+
         static atomic_bool running = true;
         atomic_store(&running, true);
         dispatch_semaphore_t bgDone = dispatch_semaphore_create(0);

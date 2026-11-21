@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import json
 import os
@@ -12,14 +13,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional
 
 
 LAUNCHCTL = "/bin/launchctl"
 SERVICE = f"gui/{os.getuid()}/com.apple.MenuBarAgent"
 ENVIRONMENT_KEY = "DYLD_INSERT_LIBRARIES"
 LIBRARY = str(Path.home() / "Library/MacIsland/island.dylib")
-# macOS 27.3 beta 1 and beta 2. Every native hook resolves symbols and verifies
-# layouts at runtime; this list only gates builds that have been checked.
+ALLOW_UNVERIFIED_ENV = "MACISLAND_ALLOW_UNVERIFIED_BUILD"
+# Single source of truth for verified OS builds. Every native hook resolves
+# symbols and verifies layouts at runtime; this list gates checked builds.
 SUPPORTED_BUILDS = ("26C5035r", "26C5047e")
 SUPPORTED_BUILD = SUPPORTED_BUILDS[0]
 MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
@@ -33,7 +36,34 @@ MUSIC_READY_DELAYS = PROVIDER_READY_DELAYS
 # crash repeatedly must not turn into an endless restart loop.
 REAPPLY_LIMIT = 3
 REAPPLY_WINDOW = 15 * 60
-MANAGED_COMPONENTS = ("menubar", "music", "clock", "spotlight")
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    name: str
+    executable: str
+    bundle: str
+    pid_getter_name: str
+    launch_on_install: bool = False
+    restart_on_stop: bool = False
+    stop_notice: Optional[str] = None
+
+
+PROVIDERS = (
+    ProviderSpec(
+        "music", MUSIC_EXE, "com.apple.MediaRemoteUIService", "music_pid",
+        launch_on_install=True,
+    ),
+    ProviderSpec(
+        "clock", CLOCK_EXE, "com.apple.ClockAngel", "clock_pid",
+        restart_on_stop=True,
+    ),
+    ProviderSpec(
+        "spotlight", SPOTLIGHT_EXE, "com.apple.campo", "spotlight_pid",
+        stop_notice="Stopped patched Spotlight",
+    ),
+)
+MANAGED_COMPONENTS = ("menubar", *(spec.name for spec in PROVIDERS))
 
 
 def log(message, *, error=False):
@@ -64,12 +94,31 @@ def current_build():
     return subprocess.check_output(["/usr/bin/sw_vers", "-buildVersion"], text=True).strip()
 
 
+def allow_unverified_build(env=None):
+    source = os.environ if env is None else env
+    return source.get(ALLOW_UNVERIFIED_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def is_supported_build(build=None):
+    return (current_build() if build is None else build) in SUPPORTED_BUILDS
+
+
+def format_supported_builds_header():
+    builds = ", ".join(json.dumps(build) for build in SUPPORTED_BUILDS)
+    return f"#pragma once\n#define MACISLAND_SUPPORTED_BUILDS_LIST {builds}\n"
+
+
 def require_supported_build():
     build = current_build()
-    if build not in SUPPORTED_BUILDS:
-        raise RuntimeError(
-            f"Unsupported OS build {build} (supported: {', '.join(SUPPORTED_BUILDS)}); services left unchanged")
-    return build
+    if is_supported_build(build):
+        return build
+    if allow_unverified_build():
+        log(f"OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled",
+            error=True)
+        return build
+    raise RuntimeError(
+        f"Unsupported OS build {build} (supported: {', '.join(SUPPORTED_BUILDS)}); "
+        f"services left unchanged (set {ALLOW_UNVERIFIED_ENV}=1 to try an unverified build)")
 
 
 def require_trusted_library(library):
@@ -285,6 +334,10 @@ def spotlight_pid():
     return provider_pid(SPOTLIGHT_EXE)
 
 
+def provider_pid_getter(spec):
+    return globals()[spec.pid_getter_name]
+
+
 def available_provider_pid(pid, get_pid):
     if get_pid() != pid:
         raise RuntimeError("The UI provider restarted")
@@ -325,6 +378,20 @@ def stop_managed_music(library):
     return stop_managed_provider(library, music_pid)
 
 
+def stop_all_providers(library):
+    stopped = []
+    for spec in PROVIDERS:
+        get_pid = provider_pid_getter(spec)
+        was_stopped = (stop_managed_music(library) if spec.name == "music"
+                       else stop_managed_provider(library, get_pid))
+        if was_stopped:
+            stopped.append(spec.name)
+            if spec.restart_on_stop:
+                subprocess.run(["/usr/bin/open", "-gj", "-b", spec.bundle],
+                               check=False, timeout=15)
+    return stopped
+
+
 def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch):
     """Install an optional native layout and verify its witness hook."""
     if not library.is_file():
@@ -347,6 +414,7 @@ def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch)
     if not lldb:
         raise RuntimeError(f"LLDB is required for the native {name} layout")
 
+    allow_unverified = allow_unverified_build()
     # Encode the filesystem bytes, including spaces and quotes, as a C literal.
     path = '"' + ''.join(f'\\x{byte:02x}' for byte in os.fsencode(library)) + '"'
     with tempfile.TemporaryDirectory(prefix=f"macisland-{name}-") as scratch:
@@ -355,6 +423,11 @@ def prepare_provider(library, lldb, get_pid, check_pid, bundle, name, *, launch)
             expr = f'void *h = dlopen({path}, RTLD_NOLOAD | RTLD_NOW); bool resident = h != 0; '
             if load:
                 expr += f'if (!h) h = dlopen({path}, RTLD_NOW | RTLD_LOCAL); '
+                if allow_unverified:
+                    expr += (
+                        'void (*allow_fn)(int) = h ? (void(*)(int))dlsym(h, "mi_set_allow_unverified_build") : 0; '
+                        'if (allow_fn) allow_fn(1); '
+                    )
             expr += (f'int (*fn)(void) = h ? (int(*)(void))dlsym(h, "{symbol}") : 0; '
                      'int rc = !h ? -101 : (fn ? fn() : -100); if (resident) dlclose(h); (int)rc')
             result = subprocess.run(
@@ -399,8 +472,10 @@ def prepare_music(library, lldb, *, launch=True):
 
 
 def background_providers():
-    return (("clock", clock_pid, "com.apple.ClockAngel"),
-            ("spotlight", spotlight_pid, "com.apple.campo"))
+    return tuple(
+        (spec.name, provider_pid_getter(spec), spec.bundle)
+        for spec in PROVIDERS if spec.name != "music"
+    )
 
 
 def prepare_background_safely(library, lldb, name, get_pid, bundle):
@@ -420,6 +495,14 @@ def prepare_music_safely(library, lldb, *, launch=True):
     except Exception as error:
         log(f"Native music layout skipped: {error}", error=True)
         return None
+
+
+def _prepare_spec_safely(spec, provider_lib, lldb, *, launch):
+    if spec.name == "music":
+        return prepare_music_safely(provider_lib, lldb, launch=launch)
+    return prepare_background_safely(
+        provider_lib, lldb, spec.name, provider_pid_getter(spec), spec.bundle
+    )
 
 
 def inject(state, *, force_debugger=False, only_unpatched_providers=False, launch_music=True):
@@ -443,20 +526,15 @@ def inject(state, *, force_debugger=False, only_unpatched_providers=False, launc
         raise RuntimeError("MenuBarAgent is being debugged; leave it unchanged")
 
     provider_lib = library_path.with_name("notch-music.dylib")
-    current_music = process_identity(music_pid()) if only_unpatched_providers else None
-    if only_unpatched_providers and current_music and current_music == state.get("music"):
-        state["music"] = current_music
-    else:
-        music = prepare_music_safely(provider_lib, lldb, launch=launch_music)
-        state["music"] = process_identity(music)
-
-    for name, get_pid, bundle in background_providers():
+    for spec in PROVIDERS:
+        get_pid = provider_pid_getter(spec)
         current_id = process_identity(get_pid()) if only_unpatched_providers else None
-        if only_unpatched_providers and current_id and current_id == state.get(name):
-            state[name] = current_id
+        if only_unpatched_providers and current_id and current_id == state.get(spec.name):
+            state[spec.name] = current_id
         else:
-            patched = prepare_background_safely(provider_lib, lldb, name, get_pid, bundle)
-            state[name] = process_identity(patched)
+            launch = launch_music if spec.launch_on_install else False
+            patched = _prepare_spec_safely(spec, provider_lib, lldb, launch=launch)
+            state[spec.name] = process_identity(patched)
 
     if legacy:
         new_pid = legacy_main(library_path)
@@ -516,12 +594,21 @@ def ensure(*, wait=False):
 
 def ensure_locked(library_path, state):
     build = current_build()
-    if build not in SUPPORTED_BUILDS:
-        if state.get("unsupported_build") != build:
-            log(f"Unsupported OS build {build}; automatic patching paused", error=True)
-            state["unsupported_build"] = build
-        return
-    state.pop("unsupported_build", None)
+    if not is_supported_build(build):
+        if not allow_unverified_build():
+            if state.get("unsupported_build") != build:
+                log(f"Unsupported OS build {build}; automatic patching paused", error=True)
+                state["unsupported_build"] = build
+            return
+        state.pop("unsupported_build", None)
+        if state.get("unverified_build") != build:
+            log(f"OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled",
+                error=True)
+            state["unverified_build"] = build
+    else:
+        state.pop("unsupported_build", None)
+        state.pop("unverified_build", None)
+
     now = time.time()
     for component in MANAGED_COMPONENTS:
         prune_expired_attempts(state, component, now=now)
@@ -537,19 +624,18 @@ def ensure_locked(library_path, state):
     library = library_path.with_name("notch-music.dylib")
     if not library.is_file():
         return
-    for name, get_pid, bundle in (("music", music_pid, None), *background_providers()):
+    for spec in PROVIDERS:
         try:
-            identity = process_identity(get_pid())
+            identity = process_identity(provider_pid_getter(spec)())
         except Exception:
             continue
         # Optional providers start on demand; do not launch them here.
-        if not identity or identity == state.get(name) or not take_attempt(state, name, now=now):
+        if not identity or identity == state.get(spec.name) or not take_attempt(state, spec.name, now=now):
             continue
-        log(f"{name.capitalize()} UI provider {identity} is not patched; applying")
+        log(f"{spec.name.capitalize()} UI provider {identity} is not patched; applying")
         lldb = find_lldb(required=False)
-        pid = (prepare_music_safely(library, lldb, launch=False) if name == "music"
-               else prepare_background_safely(library, lldb, name, get_pid, bundle))
-        state[name] = process_identity(pid)
+        pid = _prepare_spec_safely(spec, library, lldb, launch=False)
+        state[spec.name] = process_identity(pid)
 
 
 def print_status(force_debugger):
@@ -557,20 +643,26 @@ def print_status(force_debugger):
     now = time.time()
     build = current_build()
     globally_disabled = amfi_globally_disabled()
-    print(f"OS build: {build} ({'supported' if build in SUPPORTED_BUILDS else 'unsupported'})")
+    if is_supported_build(build):
+        build_status = "supported"
+    elif allow_unverified_build():
+        build_status = f"unverified; allowed by {ALLOW_UNVERIFIED_ENV}"
+    else:
+        build_status = "unsupported"
+    print(f"OS build: {build} ({build_status})")
     print(f"AMFI-disable boot flag active: {globally_disabled}")
     print(f"Selected loader: {'legacy' if globally_disabled and not force_debugger else 'debugger'}")
     print(f"Debugger: {find_lldb(required=False) or 'not found'}")
     menubar = process_identity(menu_bar_agent_pid())
     print(f"MenuBarAgent: {menubar or 'not running'}; matches last recorded instance: "
           f"{bool(menubar) and menubar == state.get('menubar')}")
-    for name, get_pid, _ in (("music", music_pid, None), *background_providers()):
+    for spec in PROVIDERS:
         try:
-            identity = process_identity(get_pid())
+            identity = process_identity(provider_pid_getter(spec)())
         except Exception:
             identity = None
-        print(f"{name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
-              f"{bool(identity) and identity == state.get(name)}")
+        print(f"{spec.name.capitalize()} UI provider: {identity or 'not running'}; matches last recorded instance: "
+              f"{bool(identity) and identity == state.get(spec.name)}")
     for name in MANAGED_COMPONENTS:
         recent = [t for t in state.get(f"{name}_attempts", [])
                   if isinstance(t, (int, float)) and 0 <= now - t < REAPPLY_WINDOW]
@@ -588,11 +680,36 @@ def main():
                        help="Reapply the native music layout without restarting MenuBarAgent")
     group.add_argument("--stop-music", "--stop-providers", dest="stop_music", action="store_true",
                        help="Detach the installed native provider layouts")
+    group.add_argument("--check-build", action="store_true",
+                       help="Verify the current OS build is supported or explicitly allowed")
+    group.add_argument("--emit-builds-header", action="store_true",
+                       help="Print a C preprocessor header defining MACISLAND_SUPPORTED_BUILDS_LIST")
     parser.add_argument("--wait", action="store_true",
                         help="Wait for loader.lock when used with --ensure")
     parser.add_argument("--debugger", action="store_true",
                         help="Force the process-scoped debugger loader")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON output where supported")
     args = parser.parse_args()
+    if args.emit_builds_header:
+        sys.stdout.write(format_supported_builds_header())
+        return
+    if args.check_build:
+        build = current_build()
+        if is_supported_build(build):
+            return
+        if allow_unverified_build():
+            print(
+                f"Warning: OS build {build} is unverified; continuing because {ALLOW_UNVERIFIED_ENV} is enabled.",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"Supported builds: {', '.join(SUPPORTED_BUILDS)} (current: {build}). "
+            f"Set {ALLOW_UNVERIFIED_ENV}=1 to try an unverified build.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     if args.status:
         print_status(args.debugger)
         return
@@ -606,22 +723,26 @@ def main():
         try:
             if args.stop_music:
                 library = library_path.with_name("notch-music.dylib")
-                stop_managed_music(library)
-                if stop_managed_provider(library, clock_pid):
-                    subprocess.run(["/usr/bin/open", "-gj", "-b", "com.apple.ClockAngel"],
-                                   check=False, timeout=15)
-                if stop_managed_provider(library, spotlight_pid):
-                    print("Stopped patched Spotlight", flush=True)
-                for name in ("music", "clock", "spotlight"):
-                    state.pop(name, None)
+                stopped = stop_all_providers(library)
+                for spec in PROVIDERS:
+                    state.pop(spec.name, None)
+                if args.json:
+                    print(json.dumps({"stopped": stopped}), flush=True)
+                else:
+                    for spec in PROVIDERS:
+                        if spec.stop_notice and spec.name in stopped:
+                            print(spec.stop_notice, flush=True)
             elif args.music_only:
                 provider_lib = library_path.with_name("notch-music.dylib")
                 lldb = find_lldb()
-                pid = prepare_music(provider_lib, lldb)
-                state["music"] = process_identity(pid)
-                for name, get_pid, bundle in background_providers():
-                    patched = prepare_background_safely(provider_lib, lldb, name, get_pid, bundle)
-                    state[name] = process_identity(patched)
+                for spec in PROVIDERS:
+                    if spec.name == "music":
+                        pid = prepare_music(provider_lib, lldb)
+                    else:
+                        pid = prepare_background_safely(
+                            provider_lib, lldb, spec.name, provider_pid_getter(spec), spec.bundle
+                        )
+                    state[spec.name] = process_identity(pid)
             else:
                 inject(state, force_debugger=args.debugger)
                 for name in MANAGED_COMPONENTS:

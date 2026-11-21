@@ -4,9 +4,6 @@ import SwiftUI
 import os
 
 private let sessionMangle = "12NowPlayingUI0aB19ActivitySessionViewV"
-private let defaultExpandedArtworkWidth: CGFloat = 52
-// Space between the artwork (or trailing accessory) and the camera housing.
-private let notchClearance: CGFloat = 12
 
 // Apple's artwork carries its own fixed frame. The surface width is chosen
 // before the session lays out, so remember the latest required wing item width.
@@ -250,9 +247,10 @@ private func installSurface<T: View>(_ t: T.Type) -> Bool {
     // Like the iPhone layout, the artwork shares the timeline's leading edge:
     // each wing holds the content inset, the artwork and the notch clearance.
     let fallbackArt = max(
-      defaultExpandedArtworkWidth, cutout.screen.safeAreaInsets.top + notchClearance)
+      ProviderConstants.defaultExpandedArtworkWidth,
+      cutout.screen.safeAreaInsets.top + ProviderConstants.notchClearance)
     let art = wingContentWidth.withLock { $0 } ?? fallbackArt
-    let wing = art + notchClearance + max(pad.leading, pad.trailing)
+    let wing = art + ProviderConstants.notchClearance + max(pad.leading, pad.trailing)
     let originalTop = pad.top
     let reducedTop = min(pad.leading, 4)
     width.pointee = max(nativeWidth, size.width + 2 * wing)

@@ -1,12 +1,13 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
-#import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <ptrauth.h>
 #import <stdatomic.h>
+#import <stdbool.h>
+#import <stddef.h>
 #import <stdint.h>
-#import <string.h>
-#import <sys/sysctl.h>
+
+extern bool mi_is_supported_build(void);
+extern bool mi_is_writable_region(const void *address, size_t bytes);
 
 // Spotlight's island is gated per device, not per display. On hardware Apple
 // ships with a CenterHUD aperture, CampoDeviceSupportsCenterHUD() is true and
@@ -29,19 +30,6 @@ static uintptr_t adrpPage(uint32_t insn, uintptr_t pc) {
     return (pc & ~(uintptr_t)0xfff) + (uintptr_t)offset;
 }
 
-static bool isWritableByte(uintptr_t address) {
-    mach_vm_address_t region = address;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &count, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    return kr == KERN_SUCCESS && (info.protection & VM_PROT_WRITE) != 0 &&
-           region <= address && address + 1 <= region + size;
-}
-
 int mi_spotlight_patch(void) {
     void *symbol = dlsym(RTLD_DEFAULT, "CampoDeviceSupportsCenterHUD");
     if (!symbol) return -2;
@@ -58,7 +46,7 @@ int mi_spotlight_patch(void) {
         code[6] != 0xd65f03c0)                       // ret
         return -3;
     uintptr_t address = adrpPage(code[4], pc + 16) + ((code[5] >> 10) & 0xfff);
-    if (!isWritableByte(address)) return -6;
+    if (!mi_is_writable_region((const void *)address, 1)) return -6;
     volatile uint8_t *cached = (volatile uint8_t *)address;
     if (*cached != (uint8_t)original) return -4;
     *cached = 1;
@@ -66,9 +54,7 @@ int mi_spotlight_patch(void) {
 }
 
 int mi_spotlight_enable(void) {
-    char build[64] = {0};
-    size_t size = sizeof(build);
-    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || (strcmp(build, "26C5035r") && strcmp(build, "26C5047e")) ||
+    if (!mi_is_supported_build() ||
         ![NSBundle.mainBundle.executablePath isEqualToString:@"/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"])
         return -1;
     atomic_store(&state, mi_spotlight_patch());

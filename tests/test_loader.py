@@ -154,10 +154,12 @@ class MusicProviderTests(unittest.TestCase):
         ):
             self.assertFalse(loader.is_traced(999))
 
-    def prepare(self, statuses, *, enable_rc="0"):
+    def prepare(self, statuses, *, enable_rc="0", build=None, env=None):
         statuses = iter(statuses)
+        lldb_commands = []
 
         def execute(argv, **kwargs):
+            lldb_commands.append(argv)
             joined = " ".join(argv)
             value = next(statuses) if "mi_music_status" in joined else enable_rc
             return subprocess.CompletedProcess(argv, 0, f"(int) $0 = {value}\n", "")
@@ -165,13 +167,17 @@ class MusicProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             library = Path(tmp) / "notch-music.dylib"
             library.touch()
-            with patch.object(loader, "music_pid", return_value="123"), \
+            with patch.dict(os.environ, env or {}, clear=False), \
+                 patch.object(loader, "music_pid", return_value="123"), \
                  patch.object(loader, "available_music_pid"), \
-                 patch.object(loader.subprocess, "check_output", return_value=loader.SUPPORTED_BUILD), \
+                 patch.object(loader.subprocess, "check_output", return_value=build or loader.SUPPORTED_BUILD), \
                  patch.object(loader.subprocess, "run", side_effect=execute), \
                  patch.object(loader.time, "sleep"), \
-                 patch("sys.stdout", new=io.StringIO()):
-                return loader.prepare_music(library, "/test/lldb")
+                 patch("sys.stdout", new=io.StringIO()), \
+                 patch("sys.stderr", new=io.StringIO()):
+                pid = loader.prepare_music(library, "/test/lldb")
+                self.last_lldb_commands = lldb_commands
+                return pid
 
     def test_dlopen_failure_and_missing_symbol_have_distinct_diagnostics(self):
         with self.assertRaisesRegex(RuntimeError, "Could not load notch-music.dylib"):
@@ -196,9 +202,26 @@ class MusicProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             library = Path(tmp) / "notch-music.dylib"
             library.touch()
-            with patch.object(loader.subprocess, "check_output", return_value="99A999"), \
+            with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: ""}, clear=False), \
+                 patch.object(loader.subprocess, "check_output", return_value="99A999"), \
                  self.assertRaisesRegex(RuntimeError, "Unsupported OS build"):
                 loader.prepare_music(library, "/test/lldb")
+
+    def test_all_supported_builds_and_opt_in_unverified_build_pass_native_flag(self):
+        for build in loader.SUPPORTED_BUILDS:
+            with self.subTest(build=build):
+                with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: ""}, clear=False):
+                    self.assertEqual(self.prepare(["1"], build=build), "123")
+                    self.assertFalse(
+                        any("mi_set_allow_unverified_build" in " ".join(cmd) for cmd in self.last_lldb_commands)
+                    )
+        self.assertEqual(
+            self.prepare(["1"], build="99A999", env={loader.ALLOW_UNVERIFIED_ENV: "1"}),
+            "123",
+        )
+        self.assertTrue(
+            any("mi_set_allow_unverified_build" in " ".join(cmd) for cmd in self.last_lldb_commands)
+        )
 
     def test_redirected_music_library_is_rejected_before_contacting_the_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +247,15 @@ class StrategyTests(unittest.TestCase):
         self.check_strategy("", traced=True, expected="blocked")
 
     def test_unsupported_build_leaves_service_unchanged(self):
-        self.check_strategy("", traced=False, expected="unsupported", build="99A999")
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: ""}, clear=False):
+            self.check_strategy("", traced=False, expected="unsupported", build="99A999")
+
+    def test_all_supported_builds_and_opt_in_unverified_build_use_debugger_strategy(self):
+        for build in loader.SUPPORTED_BUILDS:
+            with self.subTest(build=build):
+                self.check_strategy("", traced=False, expected="debugger", build=build)
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: "1"}, clear=False):
+            self.check_strategy("", traced=False, expected="debugger", build="99A999")
 
     def test_music_failure_does_not_block_the_island(self):
         self.check_strategy("", traced=False, expected="debugger", music_error=True)
@@ -401,9 +432,72 @@ class EnsureTests(unittest.TestCase):
         self.background.assert_not_called()
 
     def test_unsupported_build_pauses_quietly(self):
-        state, inject, _ = self.run_ensure({"menubar": "9@old"}, build="99A999")
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: ""}, clear=False):
+            state, inject, _ = self.run_ensure({"menubar": "9@old"}, build="99A999")
         inject.assert_not_called()
         self.assertEqual(state["unsupported_build"], "99A999")
+
+    def test_unverified_build_allowed_by_env_continues_and_clears_when_verified(self):
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: "1"}, clear=False):
+            state, inject, _ = self.run_ensure(
+                {"menubar": "9@old", "unsupported_build": "99A999"}, build="99A999"
+            )
+            inject.assert_called_once()
+            self.assertNotIn("unsupported_build", state)
+            self.assertEqual(state["unverified_build"], "99A999")
+
+            state, inject2, _ = self.run_ensure(
+                {**state, "menubar": "10@a"}, build=loader.SUPPORTED_BUILDS[-1]
+            )
+            inject2.assert_not_called()
+            self.assertNotIn("unverified_build", state)
+
+    def test_print_status_and_build_cli_flags(self):
+        for build in loader.SUPPORTED_BUILDS:
+            with patch.object(loader, "current_build", return_value=build), \
+                 patch.object(loader, "amfi_globally_disabled", return_value=False), \
+                 patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+                 patch.object(loader, "menu_bar_agent_pid", return_value=None), \
+                 patch.object(loader, "music_pid", return_value=None), \
+                 patch.object(loader, "clock_pid", return_value=None), \
+                 patch.object(loader, "spotlight_pid", return_value=None), \
+                 patch("sys.stdout", new=io.StringIO()) as out:
+                loader.print_status(False)
+            self.assertIn(f"OS build: {build} (supported)", out.getvalue())
+
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: "yes"}, clear=False), \
+             patch.object(loader, "current_build", return_value="99A999"), \
+             patch.object(loader, "amfi_globally_disabled", return_value=False), \
+             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+             patch.object(loader, "menu_bar_agent_pid", return_value=None), \
+             patch.object(loader, "music_pid", return_value=None), \
+             patch.object(loader, "clock_pid", return_value=None), \
+             patch.object(loader, "spotlight_pid", return_value=None), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            loader.print_status(False)
+        self.assertIn("OS build: 99A999 (unverified; allowed by MACISLAND_ALLOW_UNVERIFIED_BUILD)", out.getvalue())
+
+        with patch("sys.argv", ["loader.py", "--emit-builds-header"]), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            loader.main()
+        for build in loader.SUPPORTED_BUILDS:
+            self.assertIn(f'"{build}"', out.getvalue())
+
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: ""}, clear=False), \
+             patch("sys.argv", ["loader.py", "--check-build"]), \
+             patch.object(loader, "current_build", return_value="99A999"), \
+             patch("sys.stderr", new=io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                loader.main()
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("MACISLAND_ALLOW_UNVERIFIED_BUILD=1", err.getvalue())
+
+        with patch.dict(os.environ, {loader.ALLOW_UNVERIFIED_ENV: "1"}, clear=False), \
+             patch("sys.argv", ["loader.py", "--check-build"]), \
+             patch.object(loader, "current_build", return_value="99A999"), \
+             patch("sys.stderr", new=io.StringIO()) as err:
+            loader.main()
+            self.assertIn("unverified", err.getvalue())
 
     def test_busy_lock_skips_the_check(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -573,19 +667,45 @@ class ManagerTests(unittest.TestCase):
         m = self.manager
         original_run = m.run
 
-        def fail_stop_music(*args, **kwargs):
+        def fail_stop_providers(*args, **kwargs):
             self.calls.append(args)
-            if args[-1] == "--stop-music":
+            if "--stop-providers" in args:
                 self.assertFalse(kwargs.get("required", True))
                 return subprocess.CompletedProcess(args, 1, b"", b"stop failed")
             return original_run(*args, **kwargs)
 
-        with patch.object(m, "run", side_effect=fail_stop_music):
+        with patch.object(m, "run", side_effect=fail_stop_providers):
             state = plistlib.loads(m.STATE.read_bytes())
             m.restore_original(state)
         self.assertEqual(self.calls[0], ("/bin/launchctl", "bootout", m.DOMAIN, str(m.AGENT)))
-        self.assertIn(("/usr/bin/python3", str(self.source / "loader.py"), "--stop-music"), self.calls)
+        self.assertIn(("/usr/bin/python3", str(self.source / "loader.py"), "--stop-providers", "--json"), self.calls)
         self.assertFalse(m.BACKUP.exists())
+
+    def test_stop_installed_providers_parses_json_and_legacy_fallback(self):
+        self.existing_install()
+        m = self.manager
+        with patch.object(
+            m, "run", return_value=subprocess.CompletedProcess([], 0, b'{"stopped": ["music", "spotlight"]}\n', b"")
+        ):
+            self.assertTrue(m._stop_installed_providers(required=False))
+        with patch.object(
+            m, "run", return_value=subprocess.CompletedProcess([], 0, b'{"stopped": ["music"]}\n', b"")
+        ):
+            self.assertFalse(m._stop_installed_providers(required=False))
+        with patch.object(
+            m, "run", return_value=subprocess.CompletedProcess([], 0, b"Stopped patched Spotlight\n", b"")
+        ):
+            self.assertTrue(m._stop_installed_providers(required=False))
+
+    def test_agent_definition_propagates_allow_unverified_build_only_when_enabled(self):
+        m = self.manager
+        with patch.dict(os.environ, {m.ALLOW_UNVERIFIED_ENV: ""}, clear=False):
+            self.assertNotIn("EnvironmentVariables", m.agent_definition())
+        with patch.dict(os.environ, {m.ALLOW_UNVERIFIED_ENV: "1"}, clear=False):
+            self.assertEqual(
+                m.agent_definition().get("EnvironmentVariables"),
+                {m.ALLOW_UNVERIFIED_ENV: "1"},
+            )
 
     def test_backup_and_restore_preserve_preexisting_symlinks(self):
         m = self.manager
