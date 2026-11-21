@@ -31,6 +31,7 @@ extern void MacIslandTopHitStatsForTesting(NSUInteger *coveredOut, NSUInteger *s
 
 @interface TopHitTestView : NSView
 @property(nonatomic) NSUInteger receivedClicks;
+@property(nonatomic) NSUInteger gestureTriggers;
 @property(nonatomic) CGPoint lastClickPoint;
 @end
 @implementation TopHitTestView
@@ -40,6 +41,10 @@ extern void MacIslandTopHitStatsForTesting(NSUInteger *coveredOut, NSUInteger *s
 - (BOOL)acceptsFirstMouse:(NSEvent *)event {
     (void)event;
     return YES;
+}
+- (void)handleTap:(NSGestureRecognizer *)sender {
+    _gestureTriggers++;
+    _lastClickPoint = [sender locationInView:nil];
 }
 - (void)mouseDown:(NSEvent *)event {
     _receivedClicks++;
@@ -150,6 +155,19 @@ int main(void) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(notchedHit, NSSelectorFromString(@"setHitTestsAsOpaque:"), YES);
         [notchedContainer addSublayer:notchedHit];
 
+        // 3. Detached circular pill (38x38, cr=19) touching top edge
+        CALayer *circleContainer = [CALayer layer];
+        circleContainer.masksToBounds = YES;
+        circleContainer.cornerRadius = 19.0;
+        circleContainer.bounds = CGRectMake(0, 0, 38, 38);
+        circleContainer.position = CGPointMake(1037, 19);
+        [root addSublayer:circleContainer];
+
+        CALayer *circleHit = [CALayer layer];
+        circleHit.frame = circleContainer.bounds;
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(circleHit, NSSelectorFromString(@"setHitTestsAsOpaque:"), YES);
+        [circleContainer addSublayer:circleHit];
+
         MacIslandSetTopHitTestWindows(@[islandWindow]);
         MacIslandSetTopHitInvertColorsForTesting(NO);
         [CATransaction flush];
@@ -158,35 +176,22 @@ int main(void) {
         CGPoint lastPt = CGPointZero;
         MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
 
-        if (covered != 2 || strips != 2) {
-            fprintf(stderr, "expected covered=2 strips=2, got covered=%lu strips=%lu\n",
+        if (covered != 3 || strips != 0) {
+            fprintf(stderr, "expected covered=3 strips=0, got covered=%lu strips=%lu\n",
                     (unsigned long)covered, (unsigned long)strips);
             return 2;
         }
         if (!layerHasChildNamed(roundedHit, @"MacIslandTopHitUnderlay") ||
-            !layerHasChildNamed(notchedHit, @"MacIslandTopHitUnderlay")) {
+            !layerHasChildNamed(notchedHit, @"MacIslandTopHitUnderlay") ||
+            !layerHasChildNamed(circleHit, @"MacIslandTopHitUnderlay")) {
             fprintf(stderr, "missing underlay on hit layer\n");
             return 3;
         }
         CALayer *stripHost = islandWindow.contentView.superview.layer ?: root;
-        if (!layerHasChildNamed(stripHost, @"MacIslandTopHitStrip") &&
-            !layerHasChildNamed(root, @"MacIslandTopHitStrip")) {
-            fprintf(stderr, "missing top strip on root\n");
+        if (layerHasChildNamed(stripHost, @"MacIslandTopHitStrip") ||
+            layerHasChildNamed(root, @"MacIslandTopHitStrip")) {
+            fprintf(stderr, "unexpected top strip on root or superview layer\n");
             return 4;
-        }
-        // Check that notchedContainer's strip stays strictly inside the 300pt solid body (inset by 6pt flare + 1pt = 298pt)
-        CGFloat maxStripW = 0;
-        NSArray<CALayer *> *hosts = (stripHost != root) ? @[stripHost, root] : @[root];
-        for (CALayer *host in hosts) {
-            for (CALayer *child in host.sublayers) {
-                if ([child.name isEqualToString:@"MacIslandTopHitStrip"]) {
-                    maxStripW = MAX(maxStripW, child.frame.size.width);
-                }
-            }
-        }
-        if (maxStripW < 296.0 || maxStripW > 300.0) {
-            fprintf(stderr, "expected notched flat strip in [296, 300], got %.1f\n", maxStripW);
-            return 5;
         }
         if (invertFilter && (roundedContainer.filters.count != (blurFilter ? 1u : 0u) ||
                              notchedContainer.filters.count != 0)) {
@@ -214,10 +219,24 @@ int main(void) {
         MacIslandSetTopHitInvertColorsForTesting(NO);
         notchedContainer.hidden = YES;
         MacIslandScanTopHitForTesting();
+        NSEvent *hiddenTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                location:NSMakePoint(900, 38)
+                                           modifierFlags:0
+                                               timestamp:0.8
+                                            windowNumber:menuBarWindow.windowNumber
+                                                 context:nil
+                                             eventNumber:0
+                                              clickCount:1
+                                                pressure:1.0];
+        [menuBarWindow sendEvent:hiddenTop];
         MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
-        if (strips != 1) {
-            fprintf(stderr, "expected strips=1 when notchedContainer hidden, got %lu\n",
-                    (unsigned long)strips);
+        if (strips != 0 || menuBarView.receivedClicks != 1 ||
+            islandView.receivedClicks != 0 || redirects != 0) {
+            fprintf(stderr, "hidden container top click did not stay on menuBar (strips=%lu menuBar=%lu island=%lu redirects=%lu)\n",
+                    (unsigned long)strips,
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)islandView.receivedClicks,
+                    (unsigned long)redirects);
             return 13;
         }
         notchedContainer.hidden = NO;
@@ -256,20 +275,20 @@ int main(void) {
         [menuBarWindow sendEvent:upTop];
 
         MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
-        if (islandView.receivedClicks != 3 || menuBarView.receivedClicks != 0 || redirects != 3) {
+        if (islandView.receivedClicks != 3 || menuBarView.receivedClicks != 1 || redirects != 3) {
             fprintf(stderr, "top-edge redirect failed (island=%lu menuBar=%lu redirects=%lu)\n",
                     (unsigned long)islandView.receivedClicks,
                     (unsigned long)menuBarView.receivedClicks,
                     (unsigned long)redirects);
             return 9;
         }
-        if (islandView.lastClickPoint.y > 1168.501) {
-            fprintf(stderr, "top-edge event y was not clamped to <= height - 0.5 (got %.2f)\n",
+        if (islandView.lastClickPoint.y > 1167.501) {
+            fprintf(stderr, "top-edge event y was not clamped to <= height - 1.5 (got %.2f)\n",
                     islandView.lastClickPoint.y);
             return 10;
         }
 
-        // Direct top-edge click on islandWindow at (900, 1169.0) -> clamped to <= height - 0.5
+        // Direct top-edge click on islandWindow at (900, 1169.0) -> clamped to <= height - 1.5
         NSEvent *directTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
                                                 location:NSMakePoint(900, 1169.0)
                                            modifierFlags:0
@@ -281,12 +300,34 @@ int main(void) {
                                                 pressure:1.0];
         [islandWindow sendEvent:directTop];
         MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
-        if (islandView.receivedClicks != 4 || redirects != 3 || islandView.lastClickPoint.y > 1168.501) {
+        if (islandView.receivedClicks != 4 || redirects != 3 || islandView.lastClickPoint.y > 1167.501) {
             fprintf(stderr, "direct top-edge clamp failed (island=%lu redirects=%lu y=%.2f)\n",
                     (unsigned long)islandView.receivedClicks,
                     (unsigned long)redirects,
                     islandView.lastClickPoint.y);
             return 11;
+        }
+
+        // Click on menuBarWindow at top row inside detached circular pill (x=1037, screen y=1169 => menuBar y=38)
+        NSEvent *circleTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                location:NSMakePoint(1037, 38)
+                                           modifierFlags:0
+                                               timestamp:1.8
+                                            windowNumber:menuBarWindow.windowNumber
+                                                 context:nil
+                                             eventNumber:5
+                                              clickCount:1
+                                                pressure:1.0];
+        [menuBarWindow sendEvent:circleTop];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (islandView.receivedClicks != 5 || menuBarView.receivedClicks != 1 ||
+            redirects != 4 || islandView.lastClickPoint.y > 1167.501) {
+            fprintf(stderr, "detached circle top-edge redirect failed (island=%lu menuBar=%lu redirects=%lu y=%.2f)\n",
+                    (unsigned long)islandView.receivedClicks,
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    islandView.lastClickPoint.y);
+            return 14;
         }
 
         // Click outside island horizontal span (x=200, y=37.5) -> stays on menuBarWindow
@@ -296,20 +337,167 @@ int main(void) {
                                              timestamp:2.0
                                           windowNumber:menuBarWindow.windowNumber
                                                context:nil
-                                           eventNumber:5
+                                           eventNumber:6
                                             clickCount:1
                                               pressure:1.0];
         [menuBarWindow sendEvent:outside];
-        if (menuBarView.receivedClicks != 1 || islandView.receivedClicks != 4) {
+        if (menuBarView.receivedClicks != 2 || islandView.receivedClicks != 5) {
             fprintf(stderr, "outside top click was erroneously redirected (menuBar=%lu island=%lu)\n",
                     (unsigned long)menuBarView.receivedClicks,
                     (unsigned long)islandView.receivedClicks);
             return 12;
         }
 
+        // Click on outer edge of detached circular pill (x=1020, y=38) -> redirects to islandWindow
+        NSEvent *circleEdgeTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                    location:NSMakePoint(1020, 38)
+                                               modifierFlags:0
+                                                   timestamp:2.2
+                                                windowNumber:menuBarWindow.windowNumber
+                                                     context:nil
+                                                 eventNumber:7
+                                                  clickCount:1
+                                                    pressure:1.0];
+        [menuBarWindow sendEvent:circleEdgeTop];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (islandView.receivedClicks != 6 || menuBarView.receivedClicks != 2 ||
+            redirects != 5 || islandView.lastClickPoint.y > 1167.501) {
+            fprintf(stderr, "circle outer-edge redirect failed (island=%lu menuBar=%lu redirects=%lu y=%.2f)\n",
+                    (unsigned long)islandView.receivedClicks,
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    islandView.lastClickPoint.y);
+            return 15;
+        }
+
+        // Hover/spring overshoot (notchedContainer shifted up by 0.8pt so minY=-0.8) -> strips=0 & click redirects
+        notchedContainer.position = CGPointMake(900, 18.2);
+        [CATransaction flush];
+        MacIslandScanTopHitForTesting();
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (strips != 0 || layerHasChildNamed(stripHost, @"MacIslandTopHitStrip") ||
+            layerHasChildNamed(root, @"MacIslandTopHitStrip")) {
+            fprintf(stderr, "unexpected top strip during top overshoot (strips=%lu)\n",
+                    (unsigned long)strips);
+            return 16;
+        }
+        NSEvent *overshootTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                   location:NSMakePoint(900, 38)
+                                              modifierFlags:0
+                                                  timestamp:2.4
+                                               windowNumber:menuBarWindow.windowNumber
+                                                    context:nil
+                                                eventNumber:8
+                                                 clickCount:1
+                                                   pressure:1.0];
+        [menuBarWindow sendEvent:overshootTop];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (islandView.receivedClicks != 7 || menuBarView.receivedClicks != 2 ||
+            redirects != 6 || islandView.lastClickPoint.y > 1167.501) {
+            fprintf(stderr, "overshoot top-edge redirect failed (island=%lu menuBar=%lu redirects=%lu y=%.2f)\n",
+                    (unsigned long)islandView.receivedClicks,
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    islandView.lastClickPoint.y);
+            return 17;
+        }
+        notchedContainer.position = CGPointMake(900, 19.0);
+        [CATransaction flush];
+        MacIslandScanTopHitForTesting();
+
+        // [NSApp sendEvent:] routing with interactive NSView carrying NSClickGestureRecognizer
+        // at x=1100..1180, y=0..38 (flipped inside islandView, NO coveredIslands layer entry)
+        TopHitTestView *interactiveView = [[TopHitTestView alloc] initWithFrame:NSMakeRect(1100, 0, 80, 38)];
+        NSClickGestureRecognizer *tap =
+            [[NSClickGestureRecognizer alloc] initWithTarget:interactiveView action:@selector(handleTap:)];
+        [interactiveView addGestureRecognizer:tap];
+        [islandView addSubview:interactiveView];
+
+        NSEvent *appDown = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                              location:NSMakePoint(1140, 38)
+                                         modifierFlags:0
+                                             timestamp:2.6
+                                          windowNumber:menuBarWindow.windowNumber
+                                               context:nil
+                                           eventNumber:9
+                                            clickCount:1
+                                              pressure:1.0];
+        NSEvent *appDrag = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+                                              location:NSMakePoint(1142, 38)
+                                         modifierFlags:0
+                                             timestamp:2.7
+                                          windowNumber:menuBarWindow.windowNumber
+                                               context:nil
+                                           eventNumber:10
+                                            clickCount:1
+                                              pressure:1.0];
+        NSEvent *appUp = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                            location:NSMakePoint(1142, 38)
+                                       modifierFlags:0
+                                           timestamp:2.8
+                                        windowNumber:menuBarWindow.windowNumber
+                                             context:nil
+                                         eventNumber:11
+                                          clickCount:1
+                                            pressure:0.0];
+        [NSApp sendEvent:appDown];
+        [NSApp sendEvent:appDrag];
+        [NSApp sendEvent:appUp];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (interactiveView.gestureTriggers != 1 || menuBarView.receivedClicks != 2 ||
+            redirects != 9 || lastPt.y > 1167.501 || interactiveView.lastClickPoint.y > 1167.501) {
+            fprintf(stderr, "NSApp sendEvent interactive redirect failed (gest=%lu menuBar=%lu redirects=%lu gestPt=(%.1f,%.1f) lastPt=(%.1f,%.1f))\n",
+                    (unsigned long)interactiveView.gestureTriggers,
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    interactiveView.lastClickPoint.x, interactiveView.lastClickPoint.y,
+                    lastPt.x, lastPt.y);
+            return 18;
+        }
+
+        // Empty gap x=1075 (between circle 1018..1056 and interactiveView 1100..1180) via [NSApp sendEvent:]
+        NSEvent *appGap = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                             location:NSMakePoint(1075, 38)
+                                        modifierFlags:0
+                                            timestamp:3.0
+                                         windowNumber:menuBarWindow.windowNumber
+                                              context:nil
+                                          eventNumber:12
+                                           clickCount:1
+                                             pressure:1.0];
+        [NSApp sendEvent:appGap];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (menuBarView.receivedClicks != 3 || redirects != 9 || interactiveView.gestureTriggers != 1) {
+            fprintf(stderr, "gap click via NSApp was erroneously redirected (menuBar=%lu redirects=%lu gest=%lu)\n",
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    (unsigned long)interactiveView.gestureTriggers);
+            return 19;
+        }
+
+        // Click in 6pt shoulder flare outside notchedContainer native body (750..1050, flared 744..1056)
+        NSEvent *flareMargin = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                  location:NSMakePoint(746, 38)
+                                             modifierFlags:0
+                                                 timestamp:3.2
+                                              windowNumber:menuBarWindow.windowNumber
+                                                   context:nil
+                                               eventNumber:13
+                                                clickCount:1
+                                                  pressure:1.0];
+        [NSApp sendEvent:flareMargin];
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (menuBarView.receivedClicks != 4 || redirects != 9 || interactiveView.gestureTriggers != 1) {
+            fprintf(stderr, "flare-margin click was erroneously redirected (menuBar=%lu redirects=%lu gest=%lu)\n",
+                    (unsigned long)menuBarView.receivedClicks,
+                    (unsigned long)redirects,
+                    (unsigned long)interactiveView.gestureTriggers);
+            return 20;
+        }
+
         printf("top_hit=ok covered=%lu strips=%lu redirects=%lu clamped_y=%.1f\n",
                (unsigned long)covered, (unsigned long)strips, (unsigned long)redirects,
-               islandView.lastClickPoint.y);
+               interactiveView.lastClickPoint.y);
         return 0;
     }
 }

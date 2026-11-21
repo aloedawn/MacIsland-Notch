@@ -37,7 +37,8 @@ class TopHitTests(unittest.TestCase):
             result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("top_hit=ok", result.stdout)
-            self.assertIn("redirects=3", result.stdout)
+            self.assertIn("strips=0", result.stdout)
+            self.assertIn("redirects=9", result.stdout)
 
 
 if __name__ == "__main__":
