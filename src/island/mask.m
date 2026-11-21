@@ -1,5 +1,13 @@
 #import "mask-internal.h"
 #import <objc/runtime.h>
+#include <stdatomic.h>
+
+typedef void (*MacIslandTopHitCallbackFn)(void);
+static _Atomic(MacIslandTopHitCallbackFn) MacIslandTopHitNotifyCallback;
+
+void MacIslandSetTopHitNotifyCallback(void (*callback)(void)) {
+    atomic_store(&MacIslandTopHitNotifyCallback, callback);
+}
 
 os_unfair_lock MacIslandMaskStateLock = OS_UNFAIR_LOCK_INIT;
 _Thread_local const void *MacIslandActiveModelWriteObserver;
@@ -330,6 +338,8 @@ static BOOL hasOpaqueContourPeer(MacIslandNativeMaskObserver *input) {
         // Re-evaluate immediately if the native material is hidden or removed.
         [MacIslandObserverMergeInput(self) refreshMask];
         [CATransaction commit];
+        MacIslandTopHitCallbackFn topHitNotify = atomic_load(&MacIslandTopHitNotifyCallback);
+        if (topHitNotify) topHitNotify();
 
         os_unfair_lock_lock(&MacIslandMaskStateLock);
         if (!_refreshDirty) {

@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 
 // Full-screen notched island windows sit behind MenuBarAgent's menu bar.
@@ -29,7 +30,7 @@ static IMP origSetFilters;
 static IMP origSendEvent;
 
 static BOOL topHitInitialized;
-static BOOL topHitScanQueued;
+static _Atomic(bool) topHitScanQueued;
 static BOOL writingTopHitFilters;
 static BOOL forwardingTopHitEvent;
 static NSMutableArray<NSArray *> *coveredIslands;   // @[window, container, hitLayer]
@@ -93,20 +94,66 @@ static CGRect rectInWindowCoordinates(NSWindow *window, CALayer *root, CALayer *
     return lr;
 }
 
+static BOOL layerTreeVisibleToRoot(CALayer *layer, CALayer *root) {
+    for (CALayer *cur = layer; cur; cur = cur.superlayer) {
+        if (cur.hidden || cur.opacity < 0.95) return NO;
+        CALayer *pres = cur.presentationLayer;
+        if (pres && pres != cur && (pres.hidden || pres.opacity < 0.95)) return NO;
+        if (cur == root) break;
+    }
+    return YES;
+}
+
+static CGRect opaqueFlatTopBodyRect(CALayer *container, CGRect sourceBounds,
+                                    BOOL maskedByNotch, MacIslandPaintExtensions ext) {
+    CGFloat insetX = maskedByNotch ? (ext.horizontalFlare + 1.0) : (container.cornerRadius + 1.0);
+    CGFloat topOffset = maskedByNotch ? ext.topExtension : 0.0;
+    CGFloat x = CGRectGetMinX(sourceBounds) + insetX;
+    CGFloat y = CGRectGetMinY(sourceBounds) + topOffset;
+    CGFloat w = sourceBounds.size.width - 2.0 * insetX;
+    CGFloat h = sourceBounds.size.height - topOffset;
+    if (w < 2.0 || h <= 0.0) return CGRectZero;
+    return CGRectMake(x, y, w, h);
+}
+
 static void resolvedTopSpanInRoot(CALayer *container, CALayer *root, BOOL *atTopOut,
                                   CGFloat *flatWidthOut, CGFloat *centerXOut) {
-    CGRect lr = [container convertRect:container.bounds toLayer:root];
+    *atTopOut = NO;
+    *flatWidthOut = 0;
+    *centerXOut = 0;
+    if (!layerTreeVisibleToRoot(container, root)) return;
+
+    MacIslandNativeMaskObserver *observer = MacIslandModelMaskObserver(container);
+    BOOL maskedByNotch = (observer != nil && observer.applied);
+    MacIslandPaintExtensions ext = maskedByNotch
+        ? MacIslandObserverPaintExtensions(observer)
+        : (MacIslandPaintExtensions){0, 0, 0, 0};
+    CGRect body = opaqueFlatTopBodyRect(container, container.bounds, maskedByNotch, ext);
+    if (CGRectIsEmpty(body)) return;
+
+    CGRect lr = [container convertRect:body toLayer:root];
     BOOL atTop = root.isGeometryFlipped
         ? fabs(CGRectGetMinY(lr)) <= 0.5
         : fabs(CGRectGetMaxY(lr) - root.bounds.size.height) <= 0.5;
-    MacIslandNativeMaskObserver *observer = MacIslandModelMaskObserver(container);
-    BOOL maskedByNotch = (observer != nil && observer.applied);
-    CGFloat flat = maskedByNotch
-        ? lr.size.width
-        : (lr.size.width - 2.0 * container.cornerRadius);
-    *atTopOut = atTop && flat >= 2.0;
+    if (!atTop) return;
+
+    CGFloat left = CGRectGetMinX(lr);
+    CGFloat right = CGRectGetMaxX(lr);
+    CALayer *pres = container.presentationLayer;
+    if (pres && pres != container && pres.superlayer) {
+        CGRect presBody = opaqueFlatTopBodyRect(container, pres.bounds, maskedByNotch, ext);
+        if (!CGRectIsEmpty(presBody)) {
+            CGRect pr = [pres convertRect:presBody toLayer:(root.presentationLayer ?: root)];
+            left = MAX(left, CGRectGetMinX(pr));
+            right = MIN(right, CGRectGetMaxX(pr));
+        }
+    }
+    CGFloat flat = right - left;
+    if (flat < 2.0) return;
+
+    *atTopOut = YES;
     *flatWidthOut = flat;
-    *centerXOut = CGRectGetMidX(lr);
+    *centerXOut = (left + right) / 2.0;
 }
 
 static BOOL isHitTestOpaqueLayer(CALayer *layer) {
@@ -241,7 +288,9 @@ static void walkIslandHierarchy(NSWindow *window, CALayer *container, BOOL apply
                 } else if (!CGRectEqualToRect(underlay.frame, child.bounds)) {
                     underlay.frame = child.bounds;
                 }
-                ensureTopStripForContainer(window, container);
+                if (!child.hidden && child.opacity >= 0.95) {
+                    ensureTopStripForContainer(window, container);
+                }
                 [coveredIslands addObject:@[window, container, child]];
             } else {
                 [underlay removeFromSuperlayer];
@@ -283,10 +332,9 @@ static void scanTopHitWindows(void) {
 }
 
 static void scheduleTopHitScan(void) {
-    if (topHitScanQueued) return;
-    topHitScanQueued = YES;
+    if (atomic_exchange(&topHitScanQueued, true)) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        topHitScanQueued = NO;
+        atomic_store(&topHitScanQueued, false);
         scanTopHitWindows();
     });
 }
@@ -499,6 +547,7 @@ static void installTopHitHooks(void) {
     method_setImplementation(hitMethod, (IMP)hookedSetHitTestsAsOpaque);
     method_setImplementation(filterMethod, (IMP)hookedSetFilters);
     method_setImplementation(sendEventMethod, (IMP)hookedSendEvent);
+    MacIslandSetTopHitNotifyCallback(scheduleTopHitScan);
 
     [NSWorkspace.sharedWorkspace.notificationCenter
         addObserverForName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification

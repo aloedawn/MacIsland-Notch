@@ -143,3 +143,4 @@ __attribute__((visibility("hidden"))) MacIslandNativeMaskObserver *MacIslandMode
 __attribute__((visibility("hidden"))) void MacIslandSynchronizeNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
 __attribute__((visibility("hidden"))) void MacIslandRemoveNativeMaskGeometry(MacIslandNativeMaskObserver *observer);
 __attribute__((visibility("hidden"))) void MacIslandInstallNativeCornerModifierHooks(void);
+__attribute__((visibility("hidden"))) void MacIslandSetTopHitNotifyCallback(void (*callback)(void));

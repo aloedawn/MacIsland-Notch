@@ -174,7 +174,7 @@ int main(void) {
             fprintf(stderr, "missing top strip on root\n");
             return 4;
         }
-        // Check that notchedContainer's strip spans the full flat width (>= 300pt, not narrowed by cornerRadius)
+        // Check that notchedContainer's strip stays strictly inside the 300pt solid body (inset by 6pt flare + 1pt = 298pt)
         CGFloat maxStripW = 0;
         NSArray<CALayer *> *hosts = (stripHost != root) ? @[stripHost, root] : @[root];
         for (CALayer *host in hosts) {
@@ -184,8 +184,8 @@ int main(void) {
                 }
             }
         }
-        if (maxStripW < 300.0) {
-            fprintf(stderr, "expected notched flat strip >= 300pt, got %.1f\n", maxStripW);
+        if (maxStripW < 296.0 || maxStripW > 300.0) {
+            fprintf(stderr, "expected notched flat strip in [296, 300], got %.1f\n", maxStripW);
             return 5;
         }
         if (invertFilter && (roundedContainer.filters.count != (blurFilter ? 1u : 0u) ||
@@ -210,8 +210,18 @@ int main(void) {
             return 8;
         }
 
-        // Re-enable top-hit and test mouse forwarding + y clamping
+        // Re-enable top-hit and check visibility gating when notchedContainer hides
         MacIslandSetTopHitInvertColorsForTesting(NO);
+        notchedContainer.hidden = YES;
+        MacIslandScanTopHitForTesting();
+        MacIslandTopHitStatsForTesting(&covered, &strips, &redirects, &lastPt);
+        if (strips != 1) {
+            fprintf(stderr, "expected strips=1 when notchedContainer hidden, got %lu\n",
+                    (unsigned long)strips);
+            return 13;
+        }
+        notchedContainer.hidden = NO;
+        MacIslandScanTopHitForTesting();
 
         // Click on menuBarWindow at top row inside notchedContainer (x=900, screen y=1169 => menuBar y=38)
         NSEvent *downTop = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
