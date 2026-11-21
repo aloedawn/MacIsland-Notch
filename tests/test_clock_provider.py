@@ -24,8 +24,8 @@ def current_build():
 @unittest.skipUnless(
     sys.platform == "darwin"
     and platform.machine() == "arm64"
-    and current_build() == "26C5035r",
-    "requires macOS 27.3 beta 26C5035r",
+    and current_build() in ("26C5035r", "26C5047e"),
+    "requires macOS 27.3 beta 26C5035r or 26C5047e",
 )
 class ClockProviderTests(unittest.TestCase):
     def test_clock_host_widens_from_integrated_obstruction_v1_when_legacy_rect_is_zero(self):

@@ -133,7 +133,10 @@ LAUNCHCTL = "/bin/launchctl"
 SERVICE = f"gui/{os.getuid()}/com.apple.MenuBarAgent"
 ENVIRONMENT_KEY = "DYLD_INSERT_LIBRARIES"
 LIBRARY = str(Path.home() / "Library/MacIsland/island.dylib")
-SUPPORTED_BUILD = "26C5035r"
+# macOS 27.3 beta 1 and beta 2. Every native hook resolves symbols and verifies
+# layouts at runtime; this list only gates builds that have been checked.
+SUPPORTED_BUILDS = ("26C5035r", "26C5047e")
+SUPPORTED_BUILD = SUPPORTED_BUILDS[0]
 MUSIC_EXE = "/System/Library/CoreServices/MediaRemoteUIService.app/Contents/MacOS/MediaRemoteUIService"
 CLOCK_EXE = "/System/Library/CoreServices/ClockAngel.app/Contents/MacOS/ClockAngel"
 SPOTLIGHT_EXE = "/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"
@@ -178,9 +181,9 @@ def current_build():
 
 def require_supported_build():
     build = current_build()
-    if build != SUPPORTED_BUILD:
+    if build not in SUPPORTED_BUILDS:
         raise RuntimeError(
-            f"Unsupported OS build {build} (supported: {SUPPORTED_BUILD}); services left unchanged")
+            f"Unsupported OS build {build} (supported: {', '.join(SUPPORTED_BUILDS)}); services left unchanged")
     return build
 
 
@@ -628,7 +631,7 @@ def ensure(*, wait=False):
 
 def ensure_locked(library_path, state):
     build = current_build()
-    if build != SUPPORTED_BUILD:
+    if build not in SUPPORTED_BUILDS:
         if state.get("unsupported_build") != build:
             log(f"Unsupported OS build {build}; automatic patching paused", error=True)
             state["unsupported_build"] = build
@@ -669,7 +672,7 @@ def print_status(force_debugger):
     now = time.time()
     build = current_build()
     globally_disabled = amfi_globally_disabled()
-    print(f"OS build: {build} ({'supported' if build == SUPPORTED_BUILD else 'unsupported'})")
+    print(f"OS build: {build} ({'supported' if build in SUPPORTED_BUILDS else 'unsupported'})")
     print(f"AMFI-disable boot flag active: {globally_disabled}")
     print(f"Selected loader: {'legacy' if globally_disabled and not force_debugger else 'debugger'}")
     print(f"Debugger: {find_lldb(required=False) or 'not found'}")
@@ -1047,9 +1050,10 @@ MACISLAND_MANAGER
 
 if [[ "$MODE" != --uninstall ]]; then
   [[ "$(uname -m)" == arm64 ]] || { echo "Apple Silicon only" >&2; exit 1; }
-  [[ "$(sw_vers -buildVersion)" == 26C5035r ]] || {
-    echo "Supported build: macOS 27.3 beta 26C5035r only." >&2; exit 1;
-  }
+  case "$(sw_vers -buildVersion)" in
+    26C5035r|26C5047e) ;;
+    *) echo "Supported builds: macOS 27.3 beta 26C5035r and 26C5047e only." >&2; exit 1 ;;
+  esac
   xcode-select -p >/dev/null 2>&1 || {
     echo "Install Apple developer tools first (Xcode or: xcode-select --install)." >&2; exit 1;
   }
@@ -5037,7 +5041,7 @@ import AppKit
 import Darwin
 import SwiftUI
 
-let supportedOSBuild = "26C5035r"
+let supportedOSBuilds: Set<String> = ["26C5035r", "26C5047e"]
 
 @_silgen_name("mi_call_metadata_accessor") func callMetadataAccessor(
   _ rawFunction: UnsafeRawPointer, _ request: UInt
@@ -5092,7 +5096,7 @@ func rightBuild() -> Bool {
   var value = [CChar](repeating: 0, count: 64)
   var size = value.count
   return sysctlbyname("kern.osversion", &value, &size, nil, 0) == 0
-    && String(cString: value) == supportedOSBuild
+    && supportedOSBuilds.contains(String(cString: value))
 }
 
 func cutoutScreen(_ size: CGSize) -> NSScreen? {
@@ -6508,7 +6512,7 @@ MACISLAND_CLOCK_SWIFT
 // inside Siri AI selects Apple's hardware path without changing global
 // MobileGestalt answers or hooking any method.
 //
-// On 26C5035r the cached fast path is:
+// On 26C5035r and 26C5047e the cached fast path is:
 //   adrp x8, sOnce@PAGE;  ldr x8, [x8, sOnce@PAGEOFF]; cmn x8, #1; b.ne slow
 //   adrp x8, sSupports@PAGE; ldrb w0, [x8, sSupports@PAGEOFF]; ret
 static atomic_int state;
@@ -6558,7 +6562,7 @@ int mi_spotlight_patch(void) {
 int mi_spotlight_enable(void) {
     char build[64] = {0};
     size_t size = sizeof(build);
-    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || strcmp(build, "26C5035r") ||
+    if (sysctlbyname("kern.osversion", build, &size, NULL, 0) || (strcmp(build, "26C5035r") && strcmp(build, "26C5047e")) ||
         ![NSBundle.mainBundle.executablePath isEqualToString:@"/System/Applications/Siri AI.app/Contents/MacOS/Siri AI"])
         return -1;
     atomic_store(&state, mi_spotlight_patch());
