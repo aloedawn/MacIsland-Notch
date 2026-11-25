@@ -1192,6 +1192,15 @@ def print_doctor(*, force_debugger=False, as_json=False, probe_lldb=True):
         print(f"Automatic {name} reapplication paused after repeated attempts")
 
 
+def _debug_access_remediation_cmds(access):
+    cmds = []
+    if not access["dev_tools_enabled"]:
+        cmds.append("sudo DevToolsSecurity -enable")
+    if not access["developer_group"]:
+        cmds.append('sudo dseditgroup -o edit -a "$USER" -t user _developer')
+    return cmds
+
+
 def check_install_env():
     sip = parse_sip_status()
     if not sip["allows_debugging"]:
@@ -1208,21 +1217,24 @@ def check_install_env():
         print(str(error), file=sys.stderr)
         raise SystemExit(1)
     access = check_debug_access()
-    if not access["ready"]:
-        cmds = []
-        if not access["dev_tools_enabled"]:
-            cmds.append("sudo DevToolsSecurity -enable")
-        if not access["developer_group"]:
-            cmds.append('sudo dseditgroup -o edit -a "$USER" -t user _developer')
+    if sip["mode"] == "partial_debug" and not access["ready"]:
+        cmds = _debug_access_remediation_cmds(access)
         print(
-            "Password-free debugging is required for LLDB attach. Run:\n  "
+            "Partial SIP requires password-free debugging for LLDB attach. Run:\n  "
             + "\n  ".join(cmds),
             file=sys.stderr,
         )
         raise SystemExit(1)
     ok, detail = probe_lldb_attach(lldb)
     if not ok:
-        print(f"LLDB preflight attach probe failed: {detail}", file=sys.stderr)
+        message = f"LLDB preflight attach probe failed: {detail}"
+        if not access["ready"]:
+            cmds = _debug_access_remediation_cmds(access)
+            message += (
+                "\nIf LLDB attach is blocked by developer debugging permissions, run:\n  "
+                + "\n  ".join(cmds)
+            )
+        print(message, file=sys.stderr)
         raise SystemExit(1)
 
 
