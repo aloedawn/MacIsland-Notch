@@ -38,9 +38,9 @@ Upgrades shrunken floating-pill Live Activities to full notched width (`470pt` a
   <img src="docs/images/live-activity.png" width="620" alt="Expanded iPhone Continuity Live Activity rendered at full notched wing width" />
 </p>
 
-### System HUDs, Battery Banners, AirDrop & Hosted Notifications
+### System HUDs, Battery Banners, Screen Recording & Hosted Notifications
 
-Preserves native widths for Volume/Brightness HUDs (`309pt`), widens `ControlCenter` charging (`220pt`) and low-battery (`300pt`) banners to wrap cleanly around the camera housing, fixes hosted AirPods notification geometry, and keeps `AirDropUI` incoming share cards snug (`274pt`) with top previews pushed below the camera cutout.
+Preserves native widths for Volume/Brightness HUDs (`309pt`), widens `ControlCenter` charging (`220pt`) and low-battery (`300pt`) banners to wrap cleanly around the camera housing, expands Screen Recording (`screencaptureui`) Live Activities to `420pt` at native height so elapsed time and Stop fit cleanly on opposite sides of the notch, lifts `HostedSceneMetricsMaximumContentWidth` to Apple's full wing budget (`569pt` on a `220pt` notch) for wide compact/expanded banners such as AirPods, and keeps `AirDropUI` incoming share cards snug (`274pt`) with top previews pushed below the camera cutout.
 
 <p align="center">
   <img src="docs/images/system-hud.png" width="620" alt="Native macOS Brightness HUD inside the Dynamic Notch" />
@@ -107,4 +107,4 @@ python3 -m unittest discover -s tests
 
 ## Credits
 
-Based on [MakrSas/MacIsland](https://github.com/MakrSas/MacIsland/tree/a54047f69eceb4eaabd4f80034166fe23c8a0e7e) (`a54047f69eceb4eaabd4f80034166fe23c8a0e7e`) with upstream native discovery credited to [@itspdfu](https://x.com/itspdfu). Not affiliated with Apple. Loader safety and NSScreen signature checks were informed by [mtaipan/MacIsland](https://github.com/mtaipan/MacIsland/commit/918774cd924bd8192346932299e1b96b66a177ab) and [lovefromrimu/Notch2Island](https://github.com/lovefromrimu/Notch2Island).
+Based on [MakrSas/MacIsland](https://github.com/MakrSas/MacIsland/tree/a54047f69eceb4eaabd4f80034166fe23c8a0e7e) (`a54047f69eceb4eaabd4f80034166fe23c8a0e7e`) with upstream native discovery credited to [@itspdfu](https://x.com/itspdfu). Not affiliated with Apple. Loader safety and NSScreen signature checks were informed by [mtaipan/MacIsland](https://github.com/mtaipan/MacIsland/commit/918774cd924bd8192346932299e1b96b66a177ab), [lovefromrimu/Notch2Island](https://github.com/lovefromrimu/Notch2Island), and [ljmng7/DynamicEnabler](https://github.com/ljmng7/DynamicEnabler).

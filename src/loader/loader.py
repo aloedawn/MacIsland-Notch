@@ -1089,20 +1089,19 @@ def check_install_env():
     except RuntimeError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1)
-    if sip["mode"] == "partial_debug":
-        access = check_debug_access()
-        if not access["ready"]:
-            cmds = []
-            if not access["dev_tools_enabled"]:
-                cmds.append("sudo DevToolsSecurity -enable")
-            if not access["developer_group"]:
-                cmds.append('sudo dseditgroup -o edit -a "$USER" -t user _developer')
-            print(
-                "Partial SIP requires password-free debugging for LLDB attach. Run:\n  "
-                + "\n  ".join(cmds),
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
+    access = check_debug_access()
+    if not access["ready"]:
+        cmds = []
+        if not access["dev_tools_enabled"]:
+            cmds.append("sudo DevToolsSecurity -enable")
+        if not access["developer_group"]:
+            cmds.append('sudo dseditgroup -o edit -a "$USER" -t user _developer')
+        print(
+            "Password-free debugging is required for LLDB attach. Run:\n  "
+            + "\n  ".join(cmds),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     ok, detail = probe_lldb_attach(lldb)
     if not ok:
         print(f"LLDB preflight attach probe failed: {detail}", file=sys.stderr)

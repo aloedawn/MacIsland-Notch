@@ -825,22 +825,23 @@ class DiagnosticsAndWatcherTests(unittest.TestCase):
         self.assertIn("signal 4", detail)
 
     def test_check_install_env_partial_sip_guidance(self):
-        partial_sip = {"mode": "partial_debug", "allows_debugging": True, "filesystem_protected": True, "raw": ""}
-        with patch.object(loader, "parse_sip_status", return_value=partial_sip), \
-             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
-             patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": False, "developer_group": False, "ready": False}), \
-             patch("sys.stderr", new=io.StringIO()) as err:
-            with self.assertRaises(SystemExit) as ctx:
-                loader.check_install_env()
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("DevToolsSecurity -enable", err.getvalue())
-        self.assertIn("_developer", err.getvalue())
+        for mode in ("partial_debug", "disabled"):
+            sip = {"mode": mode, "allows_debugging": True, "filesystem_protected": mode == "partial_debug", "raw": ""}
+            with patch.object(loader, "parse_sip_status", return_value=sip), \
+                 patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+                 patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": False, "developer_group": False, "ready": False}), \
+                 patch("sys.stderr", new=io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as ctx:
+                    loader.check_install_env()
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("DevToolsSecurity -enable", err.getvalue())
+            self.assertIn("_developer", err.getvalue())
 
-        with patch.object(loader, "parse_sip_status", return_value=partial_sip), \
-             patch.object(loader, "find_lldb", return_value="/test/lldb"), \
-             patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": True, "developer_group": True, "ready": True}), \
-             patch.object(loader, "probe_lldb_attach", return_value=(True, "ok")):
-            loader.check_install_env()
+            with patch.object(loader, "parse_sip_status", return_value=sip), \
+                 patch.object(loader, "find_lldb", return_value="/test/lldb"), \
+                 patch.object(loader, "check_debug_access", return_value={"dev_tools_enabled": True, "developer_group": True, "ready": True}), \
+                 patch.object(loader, "probe_lldb_attach", return_value=(True, "ok")):
+                loader.check_install_env()
 
     def test_doctor_json_and_text_report(self):
         fake_displays = [{"id": 1, "builtin": True, "width": 1800, "height": 1169, "scale": 2.0, "notch": [220, 38]}]

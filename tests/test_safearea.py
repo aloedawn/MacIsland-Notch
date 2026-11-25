@@ -38,7 +38,7 @@ class SafeAreaSettingsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("safearea=ok", result.stdout)
             self.assertIn("activity_expanded=430@1.0x", result.stdout)
-            self.assertIn("max_content_220=540", result.stdout)
+            self.assertIn("max_content_220=569", result.stdout)
             self.assertIn("restored_corners=nil", result.stdout)
 
             audit_log = Path(temp) / "scene-audit.jsonl"
@@ -78,9 +78,18 @@ class SafeAreaSettingsTests(unittest.TestCase):
                 and r.get("elementKind") == "AirDropActivityAttributes"
                 and r.get("layoutMode") == "expanded"
                 and ((r.get("patched") or {}).get("min") or {}).get("w") == 274
-                and ((r.get("patched") or {}).get("max") or {}).get("w") == 540
+                and ((r.get("patched") or {}).get("max") or {}).get("w") == 569
                 and ((r.get("patched") or {}).get("canonicalObstructionRect") or {}).get("h") == 40
                 and ((r.get("patched") or {}).get("publishedObstructionRect") or {}).get("h") == 56
+                for r in records
+            ))
+            self.assertTrue(any(
+                r.get("client") == "com.apple.screencaptureui"
+                and r.get("elementKind") == "ScreenRecordingActivityAttributes"
+                and r.get("layoutMode") == "expanded"
+                and ((r.get("patched") or {}).get("min") or {}).get("w") == 420
+                and ((r.get("patched") or {}).get("min") or {}).get("h") == 60
+                and ((r.get("patched") or {}).get("max") or {}).get("w") == 569
                 for r in records
             ))
             self.assertTrue(any(

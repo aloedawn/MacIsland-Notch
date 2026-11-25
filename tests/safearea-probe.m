@@ -257,8 +257,8 @@ int main(void) {
         }
         NSSize patchedMin = [[m1 elementViewMinimumSize] sizeValue];
         NSSize patchedMax = [[m1 elementViewMaximumSize] sizeValue];
-        if (fabs(patchedMin.width - 344.0) > 0.001 || fabs(patchedMax.width - 500.0) > 0.001) {
-            fprintf(stderr, "expected B안 min.w=344 and exact max.w=500, got min=%.1f max=%.1f\n",
+        if (fabs(patchedMin.width - 344.0) > 0.001 || fabs(patchedMax.width - 529.0) > 0.001) {
+            fprintf(stderr, "expected B안 min.w=344 and exact max.w=529, got min=%.1f max=%.1f\n",
                     patchedMin.width, patchedMax.width);
             return 1;
         }
@@ -513,7 +513,7 @@ int main(void) {
         NSSize laMin = [[m10 elementViewMinimumSize] sizeValue];
         NSSize laMax = [[m10 elementViewMaximumSize] sizeValue];
         if (fabs(laMin.width - 430.0) > 0.001 || fabs(laMin.height - 42.0) > 0.001 ||
-            fabs(laMax.width - 500.0) > 0.001 || fabs(laMax.height - 960.0) > 0.001) {
+            fabs(laMax.width - 529.0) > 0.001 || fabs(laMax.height - 960.0) > 0.001) {
             fprintf(stderr, "unexpected Live Activity scene min/max: min=(%.1f,%.1f) max=(%.1f,%.1f)\n",
                     laMin.width, laMin.height, laMax.width, laMax.height);
             return 1;
@@ -593,10 +593,10 @@ int main(void) {
         NSUserDefaults *stdDefaults = NSUserDefaults.standardUserDefaults;
         [stdDefaults registerDefaults:@{@"MacIslandProbeUnrelatedKey": @42}];
 
-        // 180pt notch -> 500pt
+        // 180pt notch -> 529pt
         MacIslandSyncHostedSceneMaximumContentWidthForTesting(stdDefaults);
-        if (kvo.changeCount != 1 || fabs([suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey] - 500.0) > 0.001) {
-            fprintf(stderr, "expected KVO=1 and maxContentWidth=500.0 on 180pt notch, got KVO=%lu val=%.1f\n",
+        if (kvo.changeCount != 1 || fabs([suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey] - 529.0) > 0.001) {
+            fprintf(stderr, "expected KVO=1 and maxContentWidth=529.0 on 180pt notch, got KVO=%lu val=%.1f\n",
                     (unsigned long)kvo.changeCount, [suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey]);
             return 1;
         }
@@ -607,11 +607,11 @@ int main(void) {
             return 1;
         }
 
-        // 220pt notch -> 540pt, matching both ClockAngel (522pt <= 540pt) and Live Activities (470pt <= 540pt)
+        // 220pt notch -> 569pt, matching ClockAngel (522pt <= 569pt), Live Activities (470pt <= 569pt), and wide banners
         fakeScreens = @[notched, notched220, external];
         MacIslandSyncHostedSceneMaximumContentWidthForTesting(stdDefaults);
-        if (kvo.changeCount != 2 || fabs([suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey] - 540.0) > 0.001) {
-            fprintf(stderr, "expected KVO=2 and maxContentWidth=540.0 on 220pt notch, got KVO=%lu val=%.1f\n",
+        if (kvo.changeCount != 2 || fabs([suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey] - 569.0) > 0.001) {
+            fprintf(stderr, "expected KVO=2 and maxContentWidth=569.0 on 220pt notch, got KVO=%lu val=%.1f\n",
                     (unsigned long)kvo.changeCount, [suiteDefaults doubleForKey:MacIslandHostedMaxContentWidthKey]);
             return 1;
         }
@@ -623,18 +623,18 @@ int main(void) {
         [m15 setMetrics:nativeMetricsData];
         [m15 setElementViewLayoutMargins:zeroMargins];
         [m15 setElementViewMinimumSize:[NSValue valueWithSize:NSMakeSize(299.2, 34.0)]];
-        [m15 setElementViewMaximumSize:[NSValue valueWithSize:NSMakeSize(540.0, 768.0)]];
+        [m15 setElementViewMaximumSize:[NSValue valueWithSize:NSMakeSize(569.0, 768.0)]];
         [m15 setIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(59.6, 0, 220, 38)]];
         NSSize la220Min = [[m15 elementViewMinimumSize] sizeValue];
         NSSize la220Max = [[m15 elementViewMaximumSize] sizeValue];
-        if (fabs(la220Min.width - 470.0) > 0.001 || fabs(la220Max.width - 540.0) > 0.001) {
-            fprintf(stderr, "expected 220pt Live Activity min=470 max=540, got min=%.1f max=%.1f\n",
+        if (fabs(la220Min.width - 470.0) > 0.001 || fabs(la220Max.width - 569.0) > 0.001) {
+            fprintf(stderr, "expected 220pt Live Activity min=470 max=569, got min=%.1f max=%.1f\n",
                     la220Min.width, la220Max.width);
             return 1;
         }
 
         // AirDropUI (com.apple.Sharing.AirDropUI / AirDropActivityAttributes) on 220x38 notch:
-        // snug 274pt card floor (no 384pt dead black wings), 540pt ceiling for horizontal progress,
+        // snug 274pt card floor (no 384pt dead black wings), 569pt ceiling for horizontal progress,
         // +16pt published obstruction clearance (56pt total -> content at 47pt, 9pt clear of 38pt notch),
         // late identifier hook re-evaluation, compact return to 40pt, and external-display restoration.
         NSData *airdropMargins = encodeJSON(@{
@@ -661,7 +661,7 @@ int main(void) {
         NSRect adObs = [[m16 integratedObstructionRect] rectValue];
         id<MacIslandTestCornerRadii> adCorners = [m16 integratedObstructionCornerRadii];
         if (fabs(adMin.width - 274.0) > 0.001 || fabs(adMin.height - 64.0) > 0.001 ||
-            fabs(adMax.width - 540.0) > 0.001 ||
+            fabs(adMax.width - 569.0) > 0.001 ||
             fabs(adObs.origin.x - 26.0) > 0.001 || fabs(adObs.size.width - 222.0) > 0.001 ||
             fabs(adObs.size.height - 56.0) > 0.001 ||
             !adCorners || fabs([adCorners topLeft]) > 0.001) {
@@ -715,8 +715,8 @@ int main(void) {
         [ccCharge setHostedMaximumSize:[NSValue valueWithSize:NSMakeSize(220, 50)]];
         [ccCharge setHostedIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(0, 0, 220, 38)]];
         if (fabs([[ccCharge hostedMinimumSize] sizeValue].width - 382.0) > 0.001 ||
-            fabs([[ccCharge hostedMaximumSize] sizeValue].width - 540.0) > 0.001) {
-            fprintf(stderr, "expected ControlCenter charging banner 382..540 on 220pt notch, got %.1f..%.1f\n",
+            fabs([[ccCharge hostedMaximumSize] sizeValue].width - 569.0) > 0.001) {
+            fprintf(stderr, "expected ControlCenter charging banner 382..569 on 220pt notch, got %.1f..%.1f\n",
                     [[ccCharge hostedMinimumSize] sizeValue].width,
                     [[ccCharge hostedMaximumSize] sizeValue].width);
             return 1;
@@ -737,8 +737,8 @@ int main(void) {
         [ccWarn setHostedMaximumSize:[NSValue valueWithSize:NSMakeSize(300, 60)]];
         [ccWarn setHostedIntegratedObstructionRect:[NSValue valueWithRect:NSMakeRect(40, 0, 220, 38)]];
         if (fabs([[ccWarn hostedMinimumSize] sizeValue].width - 462.0) > 0.001 ||
-            fabs([[ccWarn hostedMaximumSize] sizeValue].width - 540.0) > 0.001) {
-            fprintf(stderr, "expected ControlCenter warning banner 462..540 on 220pt notch, got %.1f..%.1f\n",
+            fabs([[ccWarn hostedMaximumSize] sizeValue].width - 569.0) > 0.001) {
+            fprintf(stderr, "expected ControlCenter warning banner 462..569 on 220pt notch, got %.1f..%.1f\n",
                     [[ccWarn hostedMinimumSize] sizeValue].width,
                     [[ccWarn hostedMaximumSize] sizeValue].width);
             return 1;
@@ -756,6 +756,79 @@ int main(void) {
             fprintf(stderr, "ControlCenter volume HUD 309x60 must stay 309pt, got %.1f..%.1f\n",
                     [[ccVolume hostedMinimumSize] sizeValue].width,
                     [[ccVolume hostedMaximumSize] sizeValue].width);
+            return 1;
+        }
+
+        // Screen Recording (com.apple.screencaptureui / ScreenRecordingActivityAttributes) on 220x38 notch:
+        // widens to 420pt (220 + 200) without extraY height inflation so timer and StopButton flank the notch cleanly,
+        // supports late identifier arrival, stays compact in layoutMode=2, and restores 260x60 on external displays.
+        NSData *srMargins = encodeJSON(@{@"top": @12, @"leading": @12, @"bottom": @12, @"trailing": @12});
+        NSValue *srMinValue = [NSValue valueWithSize:NSMakeSize(260, 60)];
+        NSValue *srMaxValue = [NSValue valueWithSize:NSMakeSize(408, 768)];
+        NSValue *srSpace = [NSValue valueWithSize:NSMakeSize(420, 60)];
+        NSValue *srObs = [NSValue valueWithRect:NSMakeRect(20, 0, 220, 38)];
+
+        NSObject<MacIslandTestSettings> *sr220 = [mutableClass new];
+        [sr220 setClientIdentifier:@"com.apple.screencaptureui"];
+        [sr220 setElementKindIdentifier:[@"\"ScreenRecordingActivityAttributes\"" dataUsingEncoding:NSUTF8StringEncoding]];
+        [sr220 setIntegratedLayoutMode:@3];
+        [sr220 setDisplayConfiguration:displayConfigWithID(303)];
+        [sr220 setElementViewLayoutMargins:srMargins];
+        [sr220 setElementViewMinimumSize:srMinValue];
+        [sr220 setElementViewMaximumSize:srMaxValue];
+        [sr220 setIntegratedObstructionRectCoordinateSpace:srSpace];
+        [sr220 setIntegratedObstructionRect:srObs];
+        NSSize srPatchedMin = [[sr220 elementViewMinimumSize] sizeValue];
+        NSSize srPatchedMax = [[sr220 elementViewMaximumSize] sizeValue];
+        if (fabs(srPatchedMin.width - 420.0) > 0.001 || fabs(srPatchedMin.height - 60.0) > 0.001 ||
+            fabs(srPatchedMax.width - 569.0) > 0.001) {
+            fprintf(stderr, "unexpected ScreenRecording 220pt geometry: min=(%.1f,%.1f) max=(%.1f,%.1f)\n",
+                    srPatchedMin.width, srPatchedMin.height, srPatchedMax.width, srPatchedMax.height);
+            return 1;
+        }
+
+        NSObject<MacIslandTestSettings> *srLate = [mutableClass new];
+        [srLate setIntegratedLayoutMode:@3];
+        [srLate setDisplayConfiguration:displayConfigWithID(303)];
+        [srLate setElementViewLayoutMargins:srMargins];
+        [srLate setElementViewMinimumSize:srMinValue];
+        [srLate setElementViewMaximumSize:srMaxValue];
+        [srLate setIntegratedObstructionRectCoordinateSpace:srSpace];
+        [srLate setIntegratedObstructionRect:srObs];
+        if (fabs([[srLate elementViewMinimumSize] sizeValue].width - 384.0) > 0.001 ||
+            fabs([[srLate elementViewMinimumSize] sizeValue].height - 94.0) > 0.001) {
+            fprintf(stderr, "expected generic 384x94 geometry before ScreenRecording identifier arrives, got %.1fx%.1f\n",
+                    [[srLate elementViewMinimumSize] sizeValue].width,
+                    [[srLate elementViewMinimumSize] sizeValue].height);
+            return 1;
+        }
+        [srLate setClientIdentifier:@"com.apple.screencaptureui"];
+        [srLate setElementKindIdentifier:[@"\"ScreenRecordingActivityAttributes\"" dataUsingEncoding:NSUTF8StringEncoding]];
+        if (fabs([[srLate elementViewMinimumSize] sizeValue].width - 420.0) > 0.001 ||
+            fabs([[srLate elementViewMinimumSize] sizeValue].height - 60.0) > 0.001) {
+            fprintf(stderr, "late ScreenRecording identifier failed to switch to 420x60, got %.1fx%.1f\n",
+                    [[srLate elementViewMinimumSize] sizeValue].width,
+                    [[srLate elementViewMinimumSize] sizeValue].height);
+            return 1;
+        }
+
+        NSObject *frozenSR = [sr220 copy];
+        NSObject<MacIslandTestSettings> *srCompact = [frozenSR mutableCopy];
+        [srCompact setIntegratedLayoutMode:@2];
+        [srCompact setElementViewMinimumSize:[NSValue valueWithSize:NSMakeSize(260, 38)]];
+        [srCompact setElementViewMaximumSize:[NSValue valueWithSize:NSMakeSize(340, 38)]];
+        [srCompact setIntegratedObstructionRectCoordinateSpace:[NSValue valueWithSize:NSMakeSize(340, 38)]];
+        if (fabs([[srCompact elementViewMinimumSize] sizeValue].height - 38.0) > 0.001 ||
+            fabs([[srCompact integratedObstructionRect] rectValue].size.height - 40.0) > 0.001) {
+            fprintf(stderr, "compact ScreenRecording failed to keep compact 38/40 height\n");
+            return 1;
+        }
+
+        NSObject<MacIslandTestSettings> *srExt = [frozenSR mutableCopy];
+        [srExt setDisplayConfiguration:displayConfigWithID(202)];
+        if (!NSEqualSizes([[srExt elementViewMinimumSize] sizeValue], srMinValue.sizeValue) ||
+            !NSEqualSizes([[srExt elementViewMaximumSize] sizeValue], srMaxValue.sizeValue)) {
+            fprintf(stderr, "ScreenRecording scene failed native restoration on external display\n");
             return 1;
         }
 
@@ -810,7 +883,7 @@ int main(void) {
         [stdDefaults removeVolatileDomainForName:NSRegistrationDomain];
         if (cleanReg.count > 0) [stdDefaults setVolatileDomain:cleanReg forName:NSRegistrationDomain];
 
-        printf("safearea=ok canonical=(%.1f,%.1f,%.0fx%.0f) activity_expanded=%.0f@%.1fx max_content_220=540 restored_corners=nil\n",
+        printf("safearea=ok canonical=(%.1f,%.1f,%.0fx%.0f) activity_expanded=%.0f@%.1fx max_content_220=569 restored_corners=nil\n",
                publishedObs.origin.x, publishedObs.origin.y, publishedObs.size.width, publishedObs.size.height,
                [[patchedExp widthRequest] maximum], [patchedExp scaleFactor]);
         return 0;

@@ -19,8 +19,13 @@ static const CGFloat MacIslandShortPanelClearance = 6;
 static const CGFloat MacIslandAirDropCardWidth = 274;
 static const CGFloat MacIslandAirDropShoulderSpan = 54;
 static const CGFloat MacIslandAirDropObstructionClearance = 16;
+// screencaptureui places elapsed time and its square StopButton on opposite sides of the
+// camera cutout; 100pt per wing gives each side room without inflating expanded height.
+static const CGFloat MacIslandScreenRecordingWingSpan = 200;
 // MenuBarAgent's CenterHUD clamps expanded hosted/element containers to 408pt
-// (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden.
+// (Settings.hostedSceneMetrics.maximumContentWidth) unless overridden. Apple's stock
+// 59pt pill leaves a 349pt total wing budget (408 - 59) across both sides of the notch.
+static const CGFloat MacIslandStockMaxWidthWingSpan = 349.0;
 #define MacIslandHostedMaxContentWidthKey @"HostedSceneMetricsMaximumContentWidth"
 
 static inline BOOL MacIslandScreenNotchCutout(NSScreen *screen, NSRect *cutoutOut) {
@@ -47,7 +52,7 @@ static inline CGFloat MacIslandCenteredDisplayWidth(NSScreen *screen, NSRect cut
 
 static inline CGFloat MacIslandExpandedMaxWidth(CGFloat notchWidth, CGFloat centeredDisplayWidth) {
     if (notchWidth <= 0 || centeredDisplayWidth <= 0) return 0;
-    return MIN(MAX(notchWidth + 320.0, 408.0), centeredDisplayWidth);
+    return MIN(MAX(notchWidth + MacIslandStockMaxWidthWingSpan, 408.0), centeredDisplayWidth);
 }
 
 static inline CGFloat MacIslandScreenExpandedMaxWidth(NSScreen *screen) {

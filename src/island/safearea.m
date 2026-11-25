@@ -148,6 +148,14 @@ static BOOL isAirDropScene(id settings) {
            containsToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"), @"airdrop") ||
            containsToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"), @"airdrop");
 }
+static BOOL isScreenRecordingScene(id settings) {
+    return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"screencaptureui") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"screenrecording") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"), @"screenrecording") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"elementKindIdentifier"), @"screencaptureui") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"), @"screenrecording") ||
+           containsToken(MacIslandExistingObjectSetting(settings, @"persistenceIdentifier"), @"screencaptureui");
+}
 static BOOL isControlCenterScene(id settings) {
     return containsToken(MacIslandExistingObjectSetting(settings, @"clientIdentifier"), @"controlcenter");
 }
@@ -358,6 +366,7 @@ static MacIslandFamilyAuditSnapshot applyFamilyLayout(
     NSUInteger family,
     BOOL physicalDisplay,
     BOOL airDropScene,
+    BOOL screenRecordingScene,
     NSArray<NSScreen *> *candidates,
     const NSRect rects[2],
     const BOOL detached[2],
@@ -449,7 +458,7 @@ static MacIslandFamilyAuditSnapshot applyFamilyLayout(
             // and failure cards to 274pt (224pt content + 25pt horizontal margins), so
             // forcing the generic 384pt wing-activity floor leaves 55pt of empty black
             // platter per side. Keep a snug 274pt floor (with >=27pt shoulders outside
-            // the notch) while preserving the 540pt ceiling for horizontal progress views.
+            // the notch) while preserving the 569pt ceiling for horizontal progress views.
             CGFloat width = MAX(MacIslandAirDropCardWidth,
                                 policy.notchWidth + MacIslandAirDropShoulderSpan);
             CGFloat floor = MAX(minimum.width + extraX, MIN(width, policy.centeredDisplayWidth));
@@ -463,17 +472,34 @@ static MacIslandFamilyAuditSnapshot applyFamilyLayout(
             if (isfinite(maximum.height)) {
                 maximum.height = MAX(maximum.height, minimum.height);
             }
+        } else if (policy.extendsBelow && family == 0 && screenRecordingScene) {
+            // screencaptureui frames IntegratedContentView from minimumSize directly
+            // (max(min.width, 260) x max(min.height, 60)) and sizes its StopButton as a
+            // square expandedHeight() x expandedHeight(). Reserve 100pt per wing beside
+            // the notch and keep native expanded height (no extraY) so controls fit cleanly.
+            CGFloat width = policy.notchWidth + MacIslandScreenRecordingWingSpan;
+            CGFloat floor = MAX(minimum.width, MIN(width, policy.centeredDisplayWidth));
+            CGFloat ceiling = MacIslandExpandedMaxWidth(policy.notchWidth, policy.centeredDisplayWidth);
+            minimum.width = floor;
+            if (isfinite(maximum.width)) {
+                maximum.width = MAX(maximum.width, MAX(minimum.width, ceiling));
+            }
+            CGFloat minExpandedH = rect.size.height + 8.0;
+            minimum.height = MAX(minimum.height, MAX(minExpandedH, shortHeight));
+            if (isfinite(maximum.height)) {
+                maximum.height = MAX(maximum.height, minimum.height);
+            }
         } else {
             minimum.width += extraX;
             minimum.height = MAX(minimum.height + extraY, shortHeight);
-            // Hosted system banners (volume, brightness, AirPods) size their
-            // own content below the cutout; their native width stays.
+            // Hosted system banners (volume, brightness, AirPods) keep their own
+            // native minimum width while receiving the lifted CenterHUD ceiling.
             if (policy.extendsBelow && family == 0) {
                 // Element activities place wing or body content around the cutout.
                 // Reserve at least 57pt per wing outside the 12pt shoulder margin
                 // and 12pt camera clearance (384pt on a 220pt notch for 52pt artwork
                 // or icons), while aligning the ceiling with MenuBarAgent's overridden
-                // HostedSceneMetricsMaximumContentWidth (540pt on a 220pt notch) so
+                // HostedSceneMetricsMaximumContentWidth (569pt on a 220pt notch) so
                 // wider providers such as ClockAngel (522pt) and NowPlaying (~390pt)
                 // negotiate freely without CenterHUD outer-platter clipping.
                 CGFloat width = policy.notchWidth + 164;
@@ -584,6 +610,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     NSArray<NSScreen *> *candidates = displayKnown ? (resolvedScreen ? @[resolvedScreen] : @[]) : NSScreen.screens;
     BOOL physicalDisplay = MacIslandScreenHasNotch(targetScreen);
     BOOL airDropScene = isAirDropScene(settings);
+    BOOL screenRecordingScene = isScreenRecordingScene(settings);
     NSRect rects[2] = {NSZeroRect, NSZeroRect};
     NSRect publishedRects[2] = {NSZeroRect, NSZeroRect};
     BOOL detached[2] = {NO, NO};
@@ -595,7 +622,7 @@ static void refreshSceneInsets(id settings, MacIslandSceneInsets *state) {
     collectObstructionSnapshots(settings, state, targetScreen, rects, detached);
     for (NSUInteger family = 0; family < state.layouts.count; family++) {
         snapshots[family] = applyFamilyLayout(
-            settings, state, family, physicalDisplay, airDropScene,
+            settings, state, family, physicalDisplay, airDropScene, screenRecordingScene,
             candidates, rects, detached, activitySummary);
     }
     publishObstructionUpdates(
